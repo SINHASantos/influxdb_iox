@@ -19,24 +19,12 @@
 //!                      ║  │    Validation    │ ─║─ ─ ─ ─ ─ ─
 //!                      ║  └──────────────────┘  ║
 //!                      ║            │           ║
-//!                      ║            ▼           ║
-//!         ┌───────┐    ║  ┌──────────────────┐  ║
-//!         │Sharder│◀ ─ ─ ▶│ShardedWriteBuffer│  ║
-//!         └───────┘    ║  └──────────────────┘  ║
-//!                      ║            │           ║
 //!                      ╚════════════│═══════════╝
 //!                                   │
 //!                                   ▼
 //!                           ┌──────────────┐
-//!                           │ Write Buffer │
+//!                           │ Ingesters │
 //!                           └──────────────┘
-//!                                   │
-//!                                   │
-//!                          ┌────────▼─────┐
-//!                          │  Ingester2   ├┐
-//!                          └┬─────────────┘├┐
-//!                           └┬─────────────┘│
-//!                            └──────────────┘
 //! ```
 //!
 //! The HTTP API decodes the request and funnels the resulting operation through
@@ -51,9 +39,7 @@
 //! to the catalog and populates the [`NamespaceCache`], converging it to match
 //! the set of [`NamespaceSchema`] in the global catalog.
 //!
-//! The [`ShardedWriteBuffer`] uses a sharder implementation to direct the DML
-//! operations into a fixed set of shards.
-//!
+//! [`SchemaValidator`]: crate::schema_validator::SchemaValidator
 //! [`NamespaceCache`]: crate::namespace_cache::NamespaceCache
 //! [`NamespaceSchema`]: data_types::NamespaceSchema
 
@@ -61,12 +47,8 @@ mod r#trait;
 pub use r#trait::*;
 
 mod schema_validation;
-pub use schema_validation::*;
 
 pub mod nop;
-
-mod sharded_write_buffer;
-pub use sharded_write_buffer::*;
 
 mod retention_validation;
 pub use retention_validation::*;
@@ -85,9 +67,6 @@ pub use fan_out::*;
 
 mod rpc_write;
 pub use rpc_write::*;
-
-mod write_summary;
-pub use self::write_summary::*;
 
 #[cfg(test)]
 pub mod mock;

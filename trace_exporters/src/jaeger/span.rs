@@ -13,8 +13,10 @@ fn split_trace_id(trace_id: TraceId) -> (i64, i64) {
     (trace_id_high, trace_id_low)
 }
 
-impl From<Span> for jaeger::Span {
-    fn from(mut s: Span) -> Self {
+impl TryFrom<Span> for jaeger::Span {
+    type Error = String;
+
+    fn try_from(mut s: Span) -> Result<Self, Self::Error> {
         let (trace_id_high, trace_id_low) = split_trace_id(s.ctx.trace_id);
 
         // A parent span id of 0 indicates no parent span ID (span IDs are non-zero)
@@ -22,10 +24,17 @@ impl From<Span> for jaeger::Span {
 
         let (start_time, duration) = match (s.start, s.end) {
             (Some(start), Some(end)) => (
-                start.timestamp_nanos() / 1000,
+                start.timestamp_nanos_opt().ok_or_else(|| {
+                    format!("start timestamp cannot be represented as nanos: {start}")
+                })? / 1000,
                 (end - start).num_microseconds().expect("no overflow"),
             ),
-            (Some(start), _) => (start.timestamp_nanos() / 1000, 0),
+            (Some(start), _) => (
+                start.timestamp_nanos_opt().ok_or_else(|| {
+                    format!("start timestamp cannot be represented as nanos: {start}")
+                })? / 1000,
+                0,
+            ),
             _ => (0, 0),
         };
 
@@ -47,17 +56,25 @@ impl From<Span> for jaeger::Span {
 
         let tags = match s.metadata.is_empty() {
             true => None,
-            false => Some(
-                s.metadata
-                    .into_iter()
-                    .map(|(name, value)| tag_from_meta(name.to_string(), value))
-                    .collect(),
-            ),
+            false => {
+                let mut md = s.metadata.into_iter().collect::<Vec<_>>();
+                md.sort_by(|(k1, _v1), (k2, _v2)| k1.cmp(k2));
+                Some(
+                    md.into_iter()
+                        .map(|(name, value)| tag_from_meta(name.to_string(), value))
+                        .collect(),
+                )
+            }
         };
 
         let logs = match s.events.is_empty() {
             true => None,
-            false => Some(s.events.into_iter().map(Into::into).collect()),
+            false => Some(
+                s.events
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()?,
+            ),
         };
 
         let references = if s.ctx.links.is_empty() {
@@ -81,7 +98,7 @@ impl From<Span> for jaeger::Span {
             )
         };
 
-        Self {
+        Ok(Self {
             trace_id_low,
             trace_id_high,
             span_id: s.ctx.span_id.get() as i64,
@@ -93,15 +110,22 @@ impl From<Span> for jaeger::Span {
             duration,
             tags,
             logs,
-        }
+        })
     }
 }
 
-impl From<SpanEvent> for jaeger::Log {
-    fn from(event: SpanEvent) -> Self {
-        Self {
-            timestamp: event.time.timestamp_nanos() / 1000,
-            fields: vec![jaeger::Tag {
+impl TryFrom<SpanEvent> for jaeger::Log {
+    type Error = String;
+
+    fn try_from(event: SpanEvent) -> Result<Self, Self::Error> {
+        let mut md = event.metadata.into_iter().collect::<Vec<_>>();
+        md.sort_by(|(k1, _v1), (k2, _v2)| k1.cmp(k2));
+
+        Ok(Self {
+            timestamp: event.time.timestamp_nanos_opt().ok_or_else(|| {
+                format!("timestamp cannot be represented as nanos: {}", event.time)
+            })? / 1000,
+            fields: std::iter::once(jaeger::Tag {
                 key: "event".to_string(),
                 v_type: jaeger::TagType::String,
                 v_str: Some(event.msg.to_string()),
@@ -109,8 +133,10 @@ impl From<SpanEvent> for jaeger::Log {
                 v_bool: None,
                 v_long: None,
                 v_binary: None,
-            }],
-        }
+            })
+            .chain(md.into_iter().map(|(k, v)| tag_from_meta(k.to_string(), v)))
+            .collect(),
+        })
     }
 }
 

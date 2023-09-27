@@ -5,6 +5,7 @@ use generated_types::{
     node::Logical, read_response::frame::Data, storage_client::StorageClient, ReadFilterRequest,
 };
 use influxdb_iox_client::connection::GrpcConnection;
+use itertools::Itertools;
 use std::sync::Arc;
 use test_helpers_end_to_end::{
     maybe_skip_integration, DataGenerator, GrpcRequestBuilder, MiniCluster, Step, StepTest,
@@ -306,6 +307,55 @@ pub async fn read_filter_periods_multi_field_predicate2() {
     .await
 }
 
+// Test for https://github.com/influxdata/influxdb_iox/issues/7663
+#[tokio::test]
+pub async fn read_filter_multi_data_frame() {
+    // there will be 1000 points per frame, so
+    // this number of points will return 3 frames
+    // with the last containing just one point.
+    let num_points: i64 = 2001;
+    let input_lines: Vec<String> = (0..num_points)
+        .map(|i| {
+            format!(
+                "h2o,tagk0=tagv0 f0={} {}",
+                i,
+                1_000_000_000 + i * 1_000_000_000
+            )
+        })
+        .collect();
+    let input_lines: Vec<&str> = input_lines.iter().map(String::as_ref).collect();
+
+    let mut expected = vec!["SeriesFrame, tags: _field=f0,_measurement=h2o,tagk0=tagv0, type: 0"];
+    let ts_vec = (0..num_points)
+        .map(|i| 1_000_000_000 + i * 1_000_000_000)
+        .collect::<Vec<_>>();
+    let values_vec = (0..num_points).collect::<Vec<_>>();
+    let mut data_frames: Vec<String> = vec![];
+    for (ts_chunk, v_chunk) in ts_vec.chunks(1000).zip(values_vec.chunks(1000)) {
+        let ts_str = ts_chunk.iter().map(|ts| ts.to_string()).join(", ");
+        let v_str = v_chunk.iter().map(|v| v.to_string()).join(",");
+        data_frames.push(format!(
+            "FloatPointsFrame, timestamps: [{}], values: \"{}\"",
+            ts_str, v_str
+        ));
+    }
+    data_frames
+        .iter()
+        .for_each(|line| expected.push(line.as_ref()));
+
+    // response should be broken into three frames
+    assert_eq!(3, data_frames.len());
+
+    do_read_filter_test(
+        input_lines,
+        GrpcRequestBuilder::new()
+            .field_predicate("f0")
+            .timestamp_range(0, num_points * 1_000_000_000_000),
+        expected,
+    )
+    .await
+}
+
 /// Sends the specified line protocol to a server with the timestamp/ predicate
 /// predicate, and compares it against expected frames
 async fn do_read_filter_test(
@@ -318,7 +368,7 @@ async fn do_read_filter_test(
     let expected_frames: Vec<String> = expected_frames.into_iter().map(|s| s.to_string()).collect();
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_shared(database_url).await;
 
     let line_protocol = input_lines.join("\n");
     StepTest::new(
@@ -730,7 +780,7 @@ async fn tag_regex_escaped_predicates() {
             // FROM db0.rp0.status_code
             // WHERE url =~ /https\:\/\/influxdb\.com/
             // ```
-            .regex_match_predicate("url", r#"https\://influxdb\.com"#),
+            .regex_match_predicate("url", r"https\://influxdb\.com"),
         expected_results: vec![
             // expect one series with influxdb.com
             "SeriesFrame, tags: _field=value,_measurement=status_code,url=https://influxdb.com, \
@@ -754,7 +804,7 @@ async fn tag_not_match_regex_escaped_predicates() {
             // FROM db0.rp0.status_code
             // WHERE url !~ /https\:\/\/influxdb\.com/
             // ```
-            .not_regex_match_predicate("url", r#"https\://influxdb\.com"#),
+            .not_regex_match_predicate("url", r"https\://influxdb\.com"),
         expected_results: vec![
             // expect one series with example.com
             "SeriesFrame, tags: _field=value,_measurement=status_code,url=http://www.example.com, \
@@ -929,6 +979,71 @@ async fn periods_in_predicates() {
     })
     .run()
     .await;
+}
+
+/// See https://github.com/influxdata/influxdb_iox/issues/7848
+#[tokio::test]
+async fn retention() {
+    test_helpers::maybe_start_logging();
+
+    let database_url = maybe_skip_integration!();
+
+    let table_name = "the_table";
+    let ts_max = i64::MAX;
+
+    // Set up the cluster  ====================================
+    let mut cluster = MiniCluster::create_shared_never_persist(database_url).await;
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::WriteLineProtocol(format!(
+                "{table_name},tag=A val=42i 0\n\
+                 {table_name},tag=A val=43i {ts_max}"
+            )),
+            Step::SetRetention(Some(1)),
+            Step::Custom(Box::new(move |state: &mut StepTestState| {
+                async move {
+                    let mut storage_client = state.cluster().querier_storage_client();
+
+                    let read_filter_request = GrpcRequestBuilder::new()
+                        .source(state.cluster())
+                        .tag_predicate("tag", "A")
+                        .build_read_filter();
+
+                    let read_response = storage_client
+                        .read_filter(read_filter_request)
+                        .await
+                        .unwrap();
+
+                    let responses: Vec<_> = read_response.into_inner().try_collect().await.unwrap();
+                    let frames: Vec<Data> = responses
+                        .into_iter()
+                        .flat_map(|r| r.frames)
+                        .flat_map(|f| f.data)
+                        .collect();
+
+                    let actual_frames = dump_data_frames(&frames);
+
+                    let expected_frames = vec![
+                        "SeriesFrame, tags: _field=val,_measurement=the_table,tag=A, type: 1",
+                        "IntegerPointsFrame, timestamps: [9223372036854775807], values: \"43\"",
+                    ];
+
+                    assert_eq!(
+                        expected_frames,
+                        actual_frames,
+                        "Expected:\n{}\nActual:\n{}",
+                        expected_frames.join("\n"),
+                        actual_frames.join("\n")
+                    )
+                }
+                .boxed()
+            })),
+        ],
+    )
+    .run()
+    .await
 }
 
 #[derive(Debug)]

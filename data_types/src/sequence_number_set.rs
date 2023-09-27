@@ -2,8 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use croaring::treemap::NativeSerializer;
-
 use crate::SequenceNumber;
 
 /// A space-efficient encoded set of [`SequenceNumber`].
@@ -41,17 +39,6 @@ impl SequenceNumberSet {
         self.0.run_optimize();
     }
 
-    /// Serialise `self` into an array of bytes.
-    ///
-    /// [This document][spec] describes the serialised format.
-    ///
-    /// [spec]: https://github.com/RoaringBitmap/RoaringFormatSpec/
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.0
-            .serialize()
-            .expect("failed to serialise sequence number set")
-    }
-
     /// Return true if the specified [`SequenceNumber`] has been added to
     /// `self`.
     pub fn contains(&self, n: SequenceNumber) -> bool {
@@ -77,25 +64,22 @@ impl SequenceNumberSet {
     /// to `n` elements without reallocating.
     pub fn with_capacity(n: u32) -> Self {
         let mut map = BTreeMap::new();
-        map.insert(0, croaring::Bitmap::create_with_capacity(n));
+        map.insert(0, croaring::Bitmap::with_container_capacity(n));
         Self(croaring::Treemap { map })
-    }
-}
-
-/// Deserialisation method.
-impl TryFrom<&[u8]> for SequenceNumberSet {
-    type Error = String;
-
-    fn try_from(buffer: &[u8]) -> Result<Self, Self::Error> {
-        croaring::Treemap::deserialize(buffer)
-            .map(SequenceNumberSet)
-            .map_err(|e| format!("failed to deserialise sequence number set: {e}"))
     }
 }
 
 impl Extend<SequenceNumber> for SequenceNumberSet {
     fn extend<T: IntoIterator<Item = SequenceNumber>>(&mut self, iter: T) {
         self.0.extend(iter.into_iter().map(|v| v.get() as _))
+    }
+}
+
+impl Extend<SequenceNumberSet> for SequenceNumberSet {
+    fn extend<T: IntoIterator<Item = SequenceNumberSet>>(&mut self, iter: T) {
+        for new_set in iter {
+            self.add_set(&new_set);
+        }
     }
 }
 
@@ -175,6 +159,29 @@ mod tests {
     }
 
     #[test]
+    fn test_extend_multiple_sets() {
+        let mut a = SequenceNumberSet::default();
+        a.add(SequenceNumber::new(7));
+
+        let b = [SequenceNumber::new(13), SequenceNumber::new(76)];
+        let c = [SequenceNumber::new(42), SequenceNumber::new(64)];
+
+        assert!(a.contains(SequenceNumber::new(7)));
+        for &num in [b, c].iter().flatten() {
+            assert!(!a.contains(num));
+        }
+
+        a.extend([
+            SequenceNumberSet::from_iter(b),
+            SequenceNumberSet::from_iter(c),
+        ]);
+        assert!(a.contains(SequenceNumber::new(7)));
+        for &num in [b, c].iter().flatten() {
+            assert!(a.contains(num));
+        }
+    }
+
+    #[test]
     fn test_collect() {
         let collect_set = [SequenceNumber::new(4), SequenceNumber::new(2)];
 
@@ -207,18 +214,18 @@ mod tests {
 
     #[test]
     fn test_intersect() {
-        let a = [0, i64::MAX, 40, 41, 42, 43, 44, 45]
+        let a = [0, u64::MAX, 40, 41, 42, 43, 44, 45]
             .into_iter()
             .map(SequenceNumber::new)
             .collect::<SequenceNumberSet>();
 
-        let b = [1, 5, i64::MAX, 42]
+        let b = [1, 5, u64::MAX, 42]
             .into_iter()
             .map(SequenceNumber::new)
             .collect::<SequenceNumberSet>();
 
         let intersection = intersect(&a, &b);
-        let want = [i64::MAX, 42]
+        let want = [u64::MAX, 42]
             .into_iter()
             .map(SequenceNumber::new)
             .collect::<SequenceNumberSet>();
@@ -226,21 +233,17 @@ mod tests {
         assert_eq!(intersection, want);
     }
 
-    /// Yield vec's of [`SequenceNumber`] derived from u64 values and cast to
-    /// i64.
+    /// Yield vec's of [`SequenceNumber`] derived from u64 values.
     ///
     /// This matches how the ingester allocates [`SequenceNumber`] - from a u64
     /// source.
     fn sequence_number_vec() -> impl Strategy<Value = Vec<SequenceNumber>> {
-        prop::collection::vec(0..u64::MAX, 0..1024).prop_map(|vec| {
-            vec.into_iter()
-                .map(|v| SequenceNumber::new(v as i64))
-                .collect()
-        })
+        prop::collection::vec(0..u64::MAX, 0..1024)
+            .prop_map(|vec| vec.into_iter().map(SequenceNumber::new).collect())
     }
 
     // The following tests compare to an order-independent HashSet, as the
-    // SequenceNumber uses the PartialOrd impl of the inner i64 for ordering,
+    // SequenceNumber uses the PartialOrd impl of the inner u64 for ordering,
     // resulting in incorrect output when compared to an ordered set of cast as
     // u64.
     //
@@ -317,20 +320,6 @@ mod tests {
 
             // The sets should be equal.
             assert_eq!(set_a, known_a);
-        }
-
-        /// Assert that a SequenceNumberSet deserialised from its serialised
-        /// representation is equal (round-trippable).
-        #[test]
-        fn prop_serialise_deserialise(
-            a in sequence_number_vec()
-        ) {
-            let orig = a.iter().cloned().collect::<SequenceNumberSet>();
-
-            let serialised = orig.to_bytes();
-            let got = SequenceNumberSet::try_from(&*serialised).expect("failed to deserialise valid set");
-
-            assert_eq!(got, orig);
         }
     }
 }

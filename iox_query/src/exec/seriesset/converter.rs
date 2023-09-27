@@ -4,7 +4,7 @@
 
 use arrow::{
     self,
-    array::{Array, BooleanArray, DictionaryArray, StringArray},
+    array::{downcast_array, Array, BooleanArray, DictionaryArray, StringArray},
     compute,
     datatypes::{DataType, Int32Type, SchemaRef},
     record_batch::RecordBatch,
@@ -183,14 +183,15 @@ impl SeriesSetConverter {
                 b.append_value(false);
                 b.finish()
             },
-            &compute::neq_dyn(&col.slice(0, col.len() - 1), &col.slice(1, col.len() - 1))
-                .expect("cmp"),
+            &arrow::compute::kernels::cmp::neq(
+                &col.slice(0, col.len() - 1),
+                &col.slice(1, col.len() - 1),
+            )
+            .expect("cmp"),
         ])
         .expect("concat");
 
-        // until https://github.com/apache/arrow-rs/issues/2901 is done, use a workaround
-        // to get a `BooleanArray`
-        BooleanArray::from(arr.data().clone())
+        downcast_array(&arr)
     }
 
     /// Creates (column_name, column_value) pairs for each column
@@ -853,7 +854,7 @@ mod tests {
     use itertools::Itertools;
     use test_helpers::str_vec_to_arc_vec;
 
-    use crate::exec::seriesset::series::{Data, Tag};
+    use crate::exec::seriesset::series::{Batch, Data, Tag};
 
     use super::*;
 
@@ -1235,22 +1236,11 @@ mod tests {
             return RecordBatch::new_empty(schema);
         }
 
-        let has_header = false;
-        let delimiter = Some(b',');
         let batch_size = 1000;
-        let bounds = None;
-        let projection = None;
-        let datetime_format = None;
-        let mut reader = csv::Reader::new(
-            data.as_bytes(),
-            schema,
-            has_header,
-            delimiter,
-            batch_size,
-            bounds,
-            projection,
-            datetime_format,
-        );
+        let mut reader = csv::ReaderBuilder::new(schema)
+            .with_batch_size(batch_size)
+            .build_buffered(data.as_bytes())
+            .unwrap();
 
         let first_batch = reader.next().expect("Reading first batch");
         assert!(
@@ -1283,7 +1273,7 @@ mod tests {
             .map(|batches| {
                 let batches = batches
                     .into_iter()
-                    .map(|chunk| Arc::new(parse_to_record_batch(Arc::clone(&schema), &chunk)))
+                    .map(|chunk| parse_to_record_batch(Arc::clone(&schema), &chunk))
                     .collect::<Vec<_>>();
 
                 stream_from_batches(Arc::clone(&schema), batches)
@@ -1614,10 +1604,10 @@ mod tests {
                 key: Arc::from("g"),
                 value: Arc::from("x"),
             }],
-            data: Data::FloatPoints {
+            data: Data::FloatPoints(vec![Batch {
                 timestamps: vec![],
                 values: vec![],
-            },
+            }]),
         })]);
         let err = match ggen.group(input).await {
             Ok(stream) => stream.try_collect::<Vec<_>>().await.unwrap_err(),
@@ -1637,40 +1627,40 @@ mod tests {
                     key: Arc::from("g"),
                     value: Arc::from("x"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![1],
                     values: vec![1],
-                },
+                }]),
             }),
             Ok(Series {
                 tags: vec![Tag {
                     key: Arc::from("g"),
                     value: Arc::from("y"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![2],
                     values: vec![2],
-                },
+                }]),
             }),
             Ok(Series {
                 tags: vec![Tag {
                     key: Arc::from("g"),
                     value: Arc::from("x"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![3],
                     values: vec![3],
-                },
+                }]),
             }),
             Ok(Series {
                 tags: vec![Tag {
                     key: Arc::from("g"),
                     value: Arc::from("x"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![4],
                     values: vec![4],
-                },
+                }]),
             }),
         ]);
         let actual = ggen
@@ -1690,30 +1680,30 @@ mod tests {
                     key: Arc::from("g"),
                     value: Arc::from("x"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![1],
                     values: vec![1],
-                },
+                }]),
             }),
             Either::Series(Series {
                 tags: vec![Tag {
                     key: Arc::from("g"),
                     value: Arc::from("x"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![3],
                     values: vec![3],
-                },
+                }]),
             }),
             Either::Series(Series {
                 tags: vec![Tag {
                     key: Arc::from("g"),
                     value: Arc::from("x"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![4],
                     values: vec![4],
-                },
+                }]),
             }),
             Either::Group(Group {
                 tag_keys: vec![Arc::from("g")],
@@ -1724,10 +1714,10 @@ mod tests {
                     key: Arc::from("g"),
                     value: Arc::from("y"),
                 }],
-                data: Data::IntegerPoints {
+                data: Data::IntegerPoints(vec![Batch {
                     timestamps: vec![2],
                     values: vec![2],
-                },
+                }]),
             }),
         ];
         assert_eq!(actual, expected);

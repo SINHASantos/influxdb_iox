@@ -330,7 +330,7 @@ mod tests {
     }
 
     fn make_rng() -> StdRng {
-        let seed = OsRng::default().next_u64();
+        let seed = OsRng.next_u64();
         println!("Seed: {seed}");
         StdRng::seed_from_u64(seed)
     }
@@ -495,8 +495,8 @@ mod tests {
         mask.append_bits(bools.len(), &collected);
         let mask_buffer = mask.to_arrow();
 
-        assert_eq!(collected.as_slice(), buffer.as_slice());
-        assert_eq!(buffer.as_slice(), mask_buffer.into_inner().as_slice());
+        assert_eq!(collected.as_slice(), buffer.values());
+        assert_eq!(buffer.values(), mask_buffer.into_inner().as_slice());
     }
 
     #[test]

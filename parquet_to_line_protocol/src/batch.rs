@@ -10,7 +10,7 @@ use influxdb_line_protocol::{builder::FieldValue, FieldValue as LPFieldValue};
 use schema::{InfluxColumnType, InfluxFieldType, Schema};
 
 /// Converts a [`RecordBatch`] into line protocol lines.
-pub(crate) fn convert_to_lines(
+pub fn convert_to_lines(
     measurement_name: &str,
     iox_schema: &Schema,
     batch: &RecordBatch,
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "Error parsing line protocol: LineProtocol { source: FieldSetMissing, line: 1 }"]
+    #[should_panic = "Error parsing line protocol: PerLine { lines: [LineProtocol { source: FieldSetMissing, line: 1 }] }"]
     fn no_fields() {
         round_trip("my_no_tag_measurement_name,tag=4 1000");
     }

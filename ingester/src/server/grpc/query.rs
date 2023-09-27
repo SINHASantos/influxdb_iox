@@ -1,152 +1,160 @@
-use std::{
-    pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{pin::Pin, sync::Arc};
 
-use arrow::error::ArrowError;
 use arrow_flight::{
+    encode::FlightDataEncoderBuilder, error::FlightError,
     flight_service_server::FlightService as Flight, Action, ActionType, Criteria, Empty,
     FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PutResult,
     SchemaResult, Ticket,
 };
-use data_types::{NamespaceId, TableId};
-use futures::{Stream, TryStreamExt};
-use generated_types::influxdata::iox::ingester::v1::{self as proto};
+use data_types::{NamespaceId, TableId, TransitionPartitionId};
+use flatbuffers::FlatBufferBuilder;
+use futures::{Stream, StreamExt, TryStreamExt};
+use ingester_query_grpc::influxdata::iox::ingester::v1 as proto;
+use metric::{DurationHistogram, U64Counter};
 use observability_deps::tracing::*;
+use predicate::Predicate;
 use prost::Message;
-use snafu::{ResultExt, Snafu};
+use thiserror::Error;
+use tokio::sync::{Semaphore, TryAcquireError};
 use tonic::{Request, Response, Streaming};
-use trace::{ctx::SpanContext, span::SpanExt};
+use trace::{
+    ctx::SpanContext,
+    span::{Span, SpanExt, SpanRecorder},
+};
 
-use crate::handler::IngestHandler;
+mod instrumentation;
+use instrumentation::FlightFrameEncodeInstrumentation;
 
-#[derive(Debug, Snafu)]
-#[allow(missing_docs)]
-pub enum Error {
-    #[snafu(display("Invalid ticket. Error: {:?} Ticket: {:?}", source, ticket))]
-    InvalidTicket {
-        source: prost::DecodeError,
-        ticket: Vec<u8>,
-    },
+use crate::{
+    ingester_id::IngesterId,
+    query::{projection::OwnedProjection, response::QueryResponse, QueryError, QueryExec},
+};
 
-    #[snafu(display("Invalid query, could not convert protobuf: {}", source))]
-    InvalidQuery {
-        source: generated_types::google::FieldViolation,
-    },
+/// Error states for the query RPC handler.
+///
+/// Note that this DOES NOT include any query-time error states - those are
+/// mapped directly from the [`QueryError`] itself.
+///
+/// Note that this isn't strictly necessary as the [`FlightService`] trait
+/// expects a [`tonic::Status`] error value, but by defining the errors here
+/// they serve as documentation of the potential error states (which are then
+/// converted into [`tonic::Status`] for the handler).
+#[derive(Debug, Error)]
+enum Error {
+    /// The payload within the Flight ticket cannot be deserialised into a
+    /// [`proto::IngesterQueryRequest`].
+    #[error("invalid flight ticket: {0}")]
+    InvalidTicket(#[from] prost::DecodeError),
 
-    #[snafu(display("Error while performing query: {}", source))]
-    Query {
-        source: Box<crate::querier_handler::Error>,
-    },
+    /// The number of simultaneous queries being executed has been reached.
+    #[error("simultaneous query limit exceeded")]
+    RequestLimit,
 
-    #[snafu(display("No Namespace Data found for the given namespace ID {}", namespace_id,))]
-    NamespaceNotFound { namespace_id: NamespaceId },
-
-    #[snafu(display(
-        "No Table Data found for the given namespace ID {}, table ID {}",
-        namespace_id,
-        table_id
-    ))]
-    TableNotFound {
-        namespace_id: NamespaceId,
-        table_id: TableId,
-    },
-
-    #[snafu(display("Error while streaming query results: {}", source))]
-    QueryStream { source: ArrowError },
-
-    #[snafu(display("Error during protobuf serialization: {}", source))]
-    Serialization { source: prost::EncodeError },
+    /// The payload within the request has an invalid field value.
+    #[error("field violation: {0}")]
+    FieldViolation(#[from] ingester_query_grpc::FieldViolation),
 }
 
-impl From<Error> for tonic::Status {
-    /// Logs and converts a result from the business logic into the appropriate tonic status
-    fn from(err: Error) -> Self {
-        // An explicit match on the Error enum will ensure appropriate logging is handled for any
-        // new error variants.
-        let msg = "Error handling Flight gRPC request";
-        match err {
-            Error::InvalidTicket { .. }
-            | Error::InvalidQuery { .. }
-            | Error::Query { .. }
-            | Error::NamespaceNotFound { .. }
-            | Error::TableNotFound { .. } => {
-                debug!(e=%err, msg)
-            }
-            Error::QueryStream { .. } | Error::Serialization { .. } => {
-                warn!(e=%err, msg)
-            }
-        }
-        err.to_status()
+/// Map a query-execution error into a [`tonic::Status`].
+impl From<QueryError> for tonic::Status {
+    fn from(e: QueryError) -> Self {
+        use tonic::Code;
+
+        let code = match e {
+            QueryError::TableNotFound(_, _) | QueryError::NamespaceNotFound(_) => Code::NotFound,
+        };
+
+        Self::new(code, e.to_string())
     }
 }
 
-impl Error {
-    /// Converts a result from the business logic into the appropriate tonic status
-    fn to_status(&self) -> tonic::Status {
-        use tonic::Status;
-        match self {
-            Self::InvalidTicket { .. } | Self::InvalidQuery { .. } => {
-                Status::invalid_argument(self.to_string())
+/// Map a gRPC handler error to a [`tonic::Status`].
+impl From<Error> for tonic::Status {
+    fn from(e: Error) -> Self {
+        use tonic::Code;
+
+        let code = match e {
+            Error::InvalidTicket(_) => {
+                debug!(error=%e, "invalid flight query ticket");
+                Code::InvalidArgument
             }
-            Self::Query { .. } | Self::QueryStream { .. } | Self::Serialization { .. } => {
-                Status::internal(self.to_string())
+            Error::RequestLimit => {
+                warn!("simultaneous query limit exceeded");
+                Code::ResourceExhausted
             }
-            Self::NamespaceNotFound { .. } | Self::TableNotFound { .. } => {
-                Status::not_found(self.to_string())
+            Error::FieldViolation(_) => {
+                debug!(error=%e, "request contains field violation");
+                Code::InvalidArgument
             }
-        }
+        };
+
+        Self::new(code, e.to_string())
     }
 }
 
 /// Concrete implementation of the gRPC Arrow Flight Service API
 #[derive(Debug)]
-pub(super) struct FlightService<I: IngestHandler + Send + Sync + 'static> {
-    ingest_handler: Arc<I>,
+pub(crate) struct FlightService<Q> {
+    query_handler: Q,
 
-    /// How many `do_get` flight requests should panic for testing purposes.
+    /// A request limiter to restrict the number of simultaneous requests this
+    /// ingester services.
     ///
-    /// Every panic will decrease the counter until it reaches zero. At zero, no panics will occur.
-    test_flight_do_get_panic: Arc<AtomicU64>,
+    /// This allows the ingester to drop a portion of requests when experiencing
+    /// an unusual flood of requests
+    request_sem: Semaphore,
+
+    /// Number of queries rejected due to lack of available `request_sem`
+    /// permit.
+    query_request_limit_rejected: U64Counter,
+
+    /// Collected durations of data frame encoding time.
+    /// Duration per partition, per request.
+    query_request_frame_encoding_duration: Arc<DurationHistogram>,
+
+    ingester_id: IngesterId,
 }
 
-impl<I> FlightService<I>
-where
-    I: IngestHandler + Send + Sync + 'static,
-{
-    pub(super) fn new(ingest_handler: Arc<I>, test_flight_do_get_panic: Arc<AtomicU64>) -> Self {
+impl<Q> FlightService<Q> {
+    pub(super) fn new(
+        query_handler: Q,
+        ingester_id: IngesterId,
+        max_simultaneous_requests: usize,
+        metrics: &metric::Registry,
+    ) -> Self {
+        let query_request_limit_rejected = metrics
+            .register_metric::<U64Counter>(
+                "query_request_limit_rejected",
+                "number of query requests rejected due to exceeding parallel request limit",
+            )
+            .recorder(&[]);
+
+        let query_request_frame_encoding_duration = Arc::new(
+            metrics
+                .register_metric::<DurationHistogram>(
+                    "ingester_query_request_frame_encoding_duration",
+                    "cumulative duration of frame encoding time, per partition per request",
+                )
+                .recorder(&[]),
+        );
+
         Self {
-            ingest_handler,
-            test_flight_do_get_panic,
+            query_handler,
+            request_sem: Semaphore::new(max_simultaneous_requests),
+            query_request_limit_rejected,
+            query_request_frame_encoding_duration,
+            ingester_id,
         }
-    }
-
-    fn maybe_panic_in_flight_do_get(&self) {
-        loop {
-            let current = self.test_flight_do_get_panic.load(Ordering::SeqCst);
-            if current == 0 {
-                return;
-            }
-            if self
-                .test_flight_do_get_panic
-                .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        panic!("Panicking in `do_get` for testing purposes.");
     }
 }
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
-impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
+impl<Q> Flight for FlightService<Q>
+where
+    Q: QueryExec<Response = QueryResponse> + 'static,
+{
     type HandshakeStream = TonicStream<HandshakeResponse>;
     type ListFlightsStream = TonicStream<FlightInfo>;
     type DoGetStream = TonicStream<FlightData>;
@@ -167,41 +175,73 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, tonic::Status> {
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
+        let mut query_recorder = SpanRecorder::new(span_ctx.child_span("ingester query"));
+
+        // Acquire and hold a permit for the duration of this request, or return
+        // an error if the existing requests have already exhausted the
+        // allocation.
+        //
+        // Our goal is to limit the number of concurrently executing queries as
+        // a rough way of ensuring we don't explode memory by trying to do too
+        // much at the same time.
+        let _permit = match self.request_sem.try_acquire() {
+            Ok(p) => p,
+            Err(TryAcquireError::NoPermits) => {
+                warn!("simultaneous request limit exceeded - dropping query request");
+                self.query_request_limit_rejected.inc(1);
+                return Err(Error::RequestLimit)?;
+            }
+            Err(e) => panic!("request limiter error: {e}"),
+        };
+
         let ticket = request.into_inner();
+        let request = proto::IngesterQueryRequest::decode(&*ticket.ticket).map_err(Error::from)?;
 
-        let proto_query_request =
-            proto::IngesterQueryRequest::decode(&*ticket.ticket).context(InvalidTicketSnafu {
-                ticket: ticket.ticket,
-            })?;
+        // Extract the namespace/table identifiers and the query predicate
+        let namespace_id = NamespaceId::new(request.namespace_id);
+        let table_id = TableId::new(request.table_id);
+        let predicate = if let Some(p) = request.predicate {
+            debug!(predicate=?p, "received query predicate");
+            Some(Predicate::try_from(p).map_err(Error::from)?)
+        } else {
+            None
+        };
 
-        let query_request = proto_query_request.try_into().context(InvalidQuerySnafu)?;
+        let projection = OwnedProjection::from(request.columns);
 
-        self.maybe_panic_in_flight_do_get();
-
-        let query_response = self
-            .ingest_handler
-            .query(query_request, span_ctx.child_span("ingest handler query"))
+        let response = match self
+            .query_handler
+            .query_exec(
+                namespace_id,
+                table_id,
+                projection,
+                query_recorder.child_span("query exec"),
+                predicate,
+            )
             .await
-            .map_err(|e| match e {
-                crate::querier_handler::Error::NamespaceNotFound { namespace_id } => {
-                    Error::NamespaceNotFound { namespace_id }
-                }
-                crate::querier_handler::Error::TableNotFound {
-                    namespace_id,
-                    table_id,
-                } => Error::TableNotFound {
-                    namespace_id,
-                    table_id,
-                },
-                _ => Error::Query {
-                    source: Box::new(e),
-                },
-            })?;
+        {
+            Ok(v) => v,
+            Err(e @ (QueryError::TableNotFound(_, _) | QueryError::NamespaceNotFound(_))) => {
+                debug!(
+                    error=%e,
+                    %namespace_id,
+                    %table_id,
+                    "no buffered data found for query"
+                );
 
-        let output = query_response
-            .flatten()
-            // map FlightError --> tonic::Status
-            .map_err(|e| e.into());
+                return Err(e)?;
+            }
+        };
+
+        let output = encode_response(
+            response,
+            self.ingester_id,
+            query_recorder.child_span("serialise response"),
+            Arc::clone(&self.query_request_frame_encoding_duration),
+        )
+        .map_err(tonic::Status::from);
+
+        query_recorder.ok("query exec complete - streaming results");
         Ok(Response::new(Box::pin(output) as Self::DoGetStream))
     }
 
@@ -258,5 +298,407 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
+    }
+}
+
+/// Encode the partition information as a None flight data with meatadata
+fn encode_partition(
+    // Partition identifier.
+    partition_id: TransitionPartitionId,
+    // Count of persisted Parquet files for the [`PartitionData`] instance this
+    // [`PartitionResponse`] was generated from.
+    //
+    // [`PartitionData`]: crate::buffer_tree::partition::PartitionData
+    // [`PartitionResponse`]: crate::query::partition_response::PartitionResponse
+    completed_persistence_count: u64,
+    ingester_id: IngesterId,
+) -> Result<FlightData, FlightError> {
+    use proto::ingester_query_response_metadata::PartitionIdentifier;
+
+    let mut bytes = bytes::BytesMut::new();
+    let partition_identifier = match partition_id {
+        TransitionPartitionId::Deterministic(hash_id) => {
+            PartitionIdentifier::HashId(hash_id.as_bytes().to_owned())
+        }
+        TransitionPartitionId::Deprecated(partition_id) => {
+            PartitionIdentifier::CatalogId(partition_id.get())
+        }
+    };
+
+    let app_metadata = proto::IngesterQueryResponseMetadata {
+        partition_identifier: Some(partition_identifier),
+        ingester_uuid: ingester_id.to_string(),
+        completed_persistence_count,
+    };
+    prost::Message::encode(&app_metadata, &mut bytes)
+        .map_err(|e| FlightError::from_external_error(Box::new(e)))?;
+
+    Ok(FlightData::new()
+        .with_app_metadata(bytes)
+        .with_data_header(build_none_flight_msg()))
+}
+
+fn build_none_flight_msg() -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+
+    let mut message = arrow::ipc::MessageBuilder::new(&mut fbb);
+    message.add_version(arrow::ipc::MetadataVersion::V5);
+    message.add_header_type(arrow::ipc::MessageHeader::NONE);
+    message.add_bodyLength(0);
+
+    let data = message.finish();
+    fbb.finish(data, None);
+
+    fbb.finished_data().to_vec()
+}
+
+/// Converts a QueryResponse into a stream of Arrow Flight [`FlightData`] response frames.
+fn encode_response(
+    response: QueryResponse,
+    ingester_id: IngesterId,
+    span: Option<Span>,
+    frame_encoding_duration_metric: Arc<DurationHistogram>,
+) -> impl Stream<Item = Result<FlightData, FlightError>> {
+    let span = SpanRecorder::new(span.clone()).span().cloned();
+
+    response.into_partition_stream().flat_map(move |partition| {
+        let partition_id = partition.id().clone();
+        let completed_persistence_count = partition.completed_persistence_count();
+
+        // prefix payload data w/ metadata for that particular partition
+        let head = futures::stream::once(async move {
+            encode_partition(partition_id, completed_persistence_count, ingester_id)
+        });
+
+        // An output vector of FlightDataEncoder streams, each entry stream with
+        // a differing schema.
+        //
+        // Optimized for the common case of there being a single consistent
+        // schema across all batches (1 stream).
+        let mut output = Vec::with_capacity(1);
+
+        let mut batch_iter = partition.into_record_batches().into_iter().peekable();
+
+        // While there are more batches to process.
+        while let Some(schema) = batch_iter.peek().map(|v| v.schema()) {
+            output.push(FlightFrameEncodeInstrumentation::new(
+                FlightDataEncoderBuilder::new().build(futures::stream::iter(
+                    // Take all the RecordBatch with a matching schema
+                    std::iter::from_fn(|| batch_iter.next_if(|v| v.schema() == schema))
+                        .map(Ok)
+                        .collect::<Vec<Result<_, FlightError>>>(),
+                )),
+                span.clone(),
+                Arc::clone(&frame_encoding_duration_metric),
+            ))
+        }
+
+        head.chain(futures::stream::iter(output).flatten())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        make_batch,
+        query::{
+            mock_query_exec::MockQueryExec, partition_response::PartitionResponse,
+            response::PartitionStream,
+        },
+        test_util::{ARBITRARY_PARTITION_HASH_ID, ARBITRARY_TRANSITION_PARTITION_ID},
+    };
+    use arrow::array::{Float64Array, Int32Array};
+    use arrow_flight::decode::{DecodedPayload, FlightRecordBatchStream};
+    use assert_matches::assert_matches;
+    use bytes::Bytes;
+    use data_types::PartitionId;
+    use proto::ingester_query_response_metadata::PartitionIdentifier;
+    use tonic::Code;
+    use trace::{ctx::SpanContext, RingBufferTraceCollector, TraceCollector};
+
+    #[tokio::test]
+    async fn sends_only_partition_hash_id_if_present() {
+        let ingester_id = IngesterId::new();
+
+        let flight = FlightService::new(
+            MockQueryExec::default().with_result(Ok(QueryResponse::new(PartitionStream::new(
+                futures::stream::iter([PartitionResponse::new(
+                    vec![],
+                    ARBITRARY_TRANSITION_PARTITION_ID.clone(),
+                    42,
+                )]),
+            )))),
+            ingester_id,
+            100,
+            &metric::Registry::default(),
+        );
+
+        let req = tonic::Request::new(Ticket {
+            ticket: Bytes::new(),
+        });
+        let response_stream = flight
+            .do_get(req)
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(FlightError::Tonic);
+        let flight_decoder =
+            FlightRecordBatchStream::new_from_flight_data(response_stream).into_inner();
+        let flight_data = flight_decoder.try_collect::<Vec<_>>().await.unwrap();
+
+        // partition info
+        assert_matches!(flight_data[0].payload, DecodedPayload::None);
+        let md_actual =
+            proto::IngesterQueryResponseMetadata::decode(flight_data[0].app_metadata()).unwrap();
+        let md_expected = proto::IngesterQueryResponseMetadata {
+            partition_identifier: Some(PartitionIdentifier::HashId(
+                ARBITRARY_PARTITION_HASH_ID.as_bytes().to_vec(),
+            )),
+            ingester_uuid: ingester_id.to_string(),
+            completed_persistence_count: 42,
+        };
+        assert_eq!(md_actual, md_expected);
+    }
+
+    #[tokio::test]
+    async fn doesnt_send_partition_hash_id_if_not_present() {
+        let ingester_id = IngesterId::new();
+        let flight = FlightService::new(
+            MockQueryExec::default().with_result(Ok(QueryResponse::new(PartitionStream::new(
+                futures::stream::iter([PartitionResponse::new(
+                    vec![],
+                    TransitionPartitionId::Deprecated(PartitionId::new(2)),
+                    42,
+                )]),
+            )))),
+            ingester_id,
+            100,
+            &metric::Registry::default(),
+        );
+
+        let req = tonic::Request::new(Ticket {
+            ticket: Bytes::new(),
+        });
+        let response_stream = flight
+            .do_get(req)
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(FlightError::Tonic);
+        let flight_decoder =
+            FlightRecordBatchStream::new_from_flight_data(response_stream).into_inner();
+        let flight_data = flight_decoder.try_collect::<Vec<_>>().await.unwrap();
+
+        // partition info
+        assert_matches!(flight_data[0].payload, DecodedPayload::None);
+        let md_actual =
+            proto::IngesterQueryResponseMetadata::decode(flight_data[0].app_metadata()).unwrap();
+        let md_expected = proto::IngesterQueryResponseMetadata {
+            partition_identifier: Some(PartitionIdentifier::CatalogId(2)),
+            ingester_uuid: ingester_id.to_string(),
+            completed_persistence_count: 42,
+        };
+        assert_eq!(md_actual, md_expected);
+    }
+
+    #[tokio::test]
+    async fn limits_concurrent_queries() {
+        let mut flight = FlightService::new(
+            MockQueryExec::default(),
+            IngesterId::new(),
+            100,
+            &metric::Registry::default(),
+        );
+
+        let req = tonic::Request::new(Ticket {
+            ticket: Bytes::new(),
+        });
+        match flight.do_get(req).await {
+            Ok(_) => panic!("expected error because of invalid ticket"),
+            Err(s) => {
+                assert_eq!(s.code(), Code::NotFound); // Mock response value
+            }
+        }
+
+        flight.request_sem = Semaphore::new(0);
+
+        let req = tonic::Request::new(Ticket {
+            ticket: Bytes::new(),
+        });
+        match flight.do_get(req).await {
+            Ok(_) => panic!("expected error because of request limit"),
+            Err(s) => {
+                assert_eq!(s.code(), Code::ResourceExhausted);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encoded_spans_attached_to_collector() {
+        let ingester_id = IngesterId::new();
+
+        // A dummy batch of data.
+        let (batch, _) = make_batch!(
+            Int32Array("int" => vec![1, 2, 3]),
+        );
+
+        let query_response = QueryResponse::new(PartitionStream::new(futures::stream::iter([
+            PartitionResponse::new(vec![batch], ARBITRARY_TRANSITION_PARTITION_ID.clone(), 42),
+        ])));
+
+        let histogram = Arc::new(
+            metric::Registry::default()
+                .register_metric::<DurationHistogram>("test", "")
+                .recorder([]),
+        );
+
+        // Initialise a tracing backend to capture the emitted traces.
+        let trace_collector = Arc::new(RingBufferTraceCollector::new(5));
+        let trace_observer: Arc<dyn TraceCollector> = Arc::new(Arc::clone(&trace_collector));
+        let span_ctx = SpanContext::new(Arc::clone(&trace_observer));
+        let query_span = span_ctx.child("query span");
+
+        // test with encode_response
+        let call_chain = encode_response(query_response, ingester_id, Some(query_span), histogram);
+        call_chain.collect::<Vec<_>>().await;
+
+        let spans = trace_collector.spans();
+        assert_matches!(spans.as_slice(), [parent_span, frame_encoding_span_1, frame_encoding_span_2, frame_encoding_span_3] => {
+            assert_eq!(parent_span.name, "query span");
+            assert_eq!(frame_encoding_span_1.name, "frame encoding");
+            assert_eq!(frame_encoding_span_2.name, "frame encoding");
+            assert_eq!(frame_encoding_span_3.name, "frame encoding");
+        });
+    }
+
+    /// Regression test for https://github.com/influxdata/idpe/issues/17408
+    #[tokio::test]
+    async fn test_chunks_with_different_schemas() {
+        let ingester_id = IngesterId::new();
+        let (batch1, schema1) = make_batch!(
+            Float64Array("float" => vec![1.1, 2.2, 3.3]),
+            Int32Array("int" => vec![1, 2, 3]),
+        );
+        let (batch2, schema2) = make_batch!(
+            Float64Array("float" => vec![4.4]),
+            Int32Array("int" => vec![4]),
+        );
+        assert_eq!(schema1, schema2);
+        let (batch3, schema3) = make_batch!(
+            Int32Array("int" => vec![5, 6]),
+        );
+        let (batch4, schema4) = make_batch!(
+            Float64Array("float" => vec![7.7]),
+            Int32Array("int" => vec![8]),
+        );
+        assert_eq!(schema1, schema4);
+
+        let flight = FlightService::new(
+            MockQueryExec::default().with_result(Ok(QueryResponse::new(PartitionStream::new(
+                futures::stream::iter([PartitionResponse::new(
+                    vec![
+                        batch1.clone(),
+                        batch2.clone(),
+                        batch3.clone(),
+                        batch4.clone(),
+                    ],
+                    ARBITRARY_TRANSITION_PARTITION_ID.clone(),
+                    42,
+                )]),
+            )))),
+            ingester_id,
+            100,
+            &metric::Registry::default(),
+        );
+
+        let req = tonic::Request::new(Ticket {
+            ticket: Bytes::new(),
+        });
+        let response_stream = flight
+            .do_get(req)
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(FlightError::Tonic);
+        let flight_decoder =
+            FlightRecordBatchStream::new_from_flight_data(response_stream).into_inner();
+        let flight_data = flight_decoder.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(flight_data.len(), 8);
+
+        // partition info
+        assert_matches!(flight_data[0].payload, DecodedPayload::None);
+        let md_actual =
+            proto::IngesterQueryResponseMetadata::decode(flight_data[0].app_metadata()).unwrap();
+        let md_expected = proto::IngesterQueryResponseMetadata {
+            partition_identifier: Some(PartitionIdentifier::HashId(
+                ARBITRARY_PARTITION_HASH_ID.as_bytes().to_vec(),
+            )),
+            ingester_uuid: ingester_id.to_string(),
+            completed_persistence_count: 42,
+        };
+        assert_eq!(md_actual, md_expected);
+
+        // first & second chunk
+        match &flight_data[1].payload {
+            DecodedPayload::Schema(actual) => {
+                assert_eq!(actual, &schema1);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
+        match &flight_data[2].payload {
+            DecodedPayload::RecordBatch(actual) => {
+                assert_eq!(actual, &batch1);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
+        match &flight_data[3].payload {
+            DecodedPayload::RecordBatch(actual) => {
+                assert_eq!(actual, &batch2);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
+
+        // third chunk
+        match &flight_data[4].payload {
+            DecodedPayload::Schema(actual) => {
+                assert_eq!(actual, &schema3);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
+        match &flight_data[5].payload {
+            DecodedPayload::RecordBatch(actual) => {
+                assert_eq!(actual, &batch3);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
+
+        // forth chunk
+        match &flight_data[6].payload {
+            DecodedPayload::Schema(actual) => {
+                assert_eq!(actual, &schema4);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
+        match &flight_data[7].payload {
+            DecodedPayload::RecordBatch(actual) => {
+                assert_eq!(actual, &batch4);
+            }
+            other => {
+                panic!("Unexpected payload: {other:?}");
+            }
+        }
     }
 }

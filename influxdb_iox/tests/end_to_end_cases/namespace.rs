@@ -12,9 +12,9 @@ async fn querier_namespace_client() {
 
     let table_name = "the_table";
 
-    let ingester_config = TestConfig::new_ingester2(&database_url);
-    let router_config = TestConfig::new_router2(&ingester_config);
-    let querier_config = TestConfig::new_querier2(&ingester_config);
+    let ingester_config = TestConfig::new_ingester(&database_url);
+    let router_config = TestConfig::new_router(&ingester_config);
+    let querier_config = TestConfig::new_querier(&ingester_config);
 
     // Set up the cluster  ====================================
     let cluster = MiniCluster::new()
@@ -27,7 +27,7 @@ async fn querier_namespace_client() {
 
     // Write some data into the v2 HTTP API ==============
     let lp = format!("{table_name},tag1=A,tag2=B val=42i 123456");
-    let response = cluster.write_to_router(lp).await;
+    let response = cluster.write_to_router(lp, None).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let mut client =
@@ -49,7 +49,7 @@ async fn soft_deletion() {
 
     // Set up the cluster  ====================================
     // cannot use shared cluster because we're going to restart services
-    let mut cluster = MiniCluster::create_non_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_non_shared(database_url).await;
 
     let namespace_name = cluster.namespace().to_string();
     let table_name = "ananas";
@@ -64,7 +64,10 @@ async fn soft_deletion() {
                         state.cluster().router().router_grpc_connection(),
                     );
                     let namespace_name = state.cluster().namespace();
-                    client.create_namespace(namespace_name, None).await.unwrap();
+                    client
+                        .create_namespace(namespace_name, None, None, None)
+                        .await
+                        .unwrap();
                     let namespaces = client.get_namespaces().await.unwrap();
                     let created_namespace = namespaces
                         .iter()
@@ -91,6 +94,10 @@ async fn soft_deletion() {
             Step::WriteLineProtocolExpectingError {
                 line_protocol: format!("{table_name},tag1=A,tag2=B val=42i 123456"),
                 expected_error_code: StatusCode::FORBIDDEN,
+                expected_error_message:
+                    "dml handler error: data in table ananas is outside of the retention period"
+                        .into(),
+                expected_line_number: None,
             },
             // Update the retention period again to infinite retention
             Step::Custom(Box::new(move |state: &mut StepTestState| {
@@ -117,6 +124,10 @@ async fn soft_deletion() {
             Step::WriteLineProtocolExpectingError {
                 line_protocol: format!("{table_name},tag1=A,tag2=B val=42i 123456"),
                 expected_error_code: StatusCode::FORBIDDEN,
+                expected_error_message:
+                    "dml handler error: data in table ananas is outside of the retention period"
+                        .into(),
+                expected_line_number: None,
             },
             // Restart the router
             Step::Custom(Box::new(move |state: &mut StepTestState| {
@@ -176,12 +187,14 @@ async fn soft_deletion() {
             Step::QueryExpectingError {
                 sql: format!("select * from {table_name}"),
                 expected_error_code: tonic::Code::NotFound,
-                expected_message: format!("Namespace '{namespace_name}' not found"),
+                expected_message: format!("Database '{namespace_name}' not found"),
             },
             // Writing now fails
             Step::WriteLineProtocolExpectingError {
                 line_protocol: format!("{table_name},tag1=A,tag2=B val=126i 12345678"),
                 expected_error_code: StatusCode::INTERNAL_SERVER_ERROR,
+                expected_error_message: "failed to resolve namespace ID".into(),
+                expected_line_number: None,
             },
             // Recreating the same namespace errors
             Step::Custom(Box::new(move |state: &mut StepTestState| {
@@ -192,12 +205,15 @@ async fn soft_deletion() {
                     let namespace_name = state.cluster().namespace();
 
                     let error = client
-                        .create_namespace(namespace_name, None)
+                        .create_namespace(namespace_name, None, None, None)
                         .await
                         .unwrap_err();
                     assert_eq!(
                         error.to_string(),
-                        format!("Internal error: name {namespace_name} already exists"),
+                        format!(
+                            "Some entity that we attempted to create already exists: \
+                            A namespace with the name `{namespace_name}` already exists"
+                        ),
                     );
                 }
                 .boxed()

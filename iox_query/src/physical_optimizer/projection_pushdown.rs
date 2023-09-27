@@ -7,6 +7,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
+    datasource::physical_plan::{FileScanConfig, ParquetExec},
     error::{DataFusionError, Result},
     physical_expr::{
         utils::{collect_columns, reassign_predicate_columns},
@@ -16,7 +17,6 @@ use datafusion::{
     physical_plan::{
         empty::EmptyExec,
         expressions::Column,
-        file_format::{FileScanConfig, ParquetExec},
         filter::FilterExec,
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
@@ -94,32 +94,14 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                             .collect::<Result<Vec<_>>>()?,
                         None => column_indices,
                     };
-                    let output_ordering = match &child_parquet.base_config().output_ordering {
-                        Some(sort_exprs) => {
-                            let projected_schema = projection_exec.schema();
-
-                            // filter out sort exprs columns that got projected away
-                            let known_columns = projected_schema
-                                .all_fields()
-                                .iter()
-                                .map(|f| f.name().as_str())
-                                .collect::<HashSet<_>>();
-                            let sort_exprs = sort_exprs
-                                .iter()
-                                .filter(|expr| {
-                                    if let Some(col) = expr.expr.as_any().downcast_ref::<Column>() {
-                                        known_columns.contains(col.name())
-                                    } else {
-                                        true
-                                    }
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>();
-
-                            Some(reassign_sort_exprs_columns(&sort_exprs, &projected_schema)?)
-                        }
-                        None => None,
-                    };
+                    let output_ordering = child_parquet
+                        .base_config()
+                        .output_ordering
+                        .iter()
+                        .map(|output_ordering| {
+                            project_output_ordering(output_ordering, projection_exec.schema())
+                        })
+                        .collect::<Result<_>>()?;
                     let base_config = FileScanConfig {
                         projection: Some(projection),
                         output_ordering,
@@ -169,11 +151,14 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         &column_names,
                         Arc::clone(child_sort.input()),
                         |plan| {
-                            Ok(Arc::new(SortExec::try_new(
-                                reassign_sort_exprs_columns(child_sort.expr(), &plan.schema())?,
-                                plan,
-                                child_sort.fetch(),
-                            )?))
+                            Ok(Arc::new(
+                                SortExec::new(
+                                    reassign_sort_exprs_columns(child_sort.expr(), &plan.schema())?,
+                                    plan,
+                                )
+                                .with_preserve_partitioning(child_sort.preserve_partitioning())
+                                .with_fetch(child_sort.fetch()),
+                            ))
                         },
                     )?;
 
@@ -269,6 +254,56 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
     }
 }
 
+/// Given the output ordering and a projected schema, returns the
+/// largest prefix of the ordering that is in the projection
+///
+/// For example,
+///
+/// ```text
+/// output_ordering: a, b, c
+/// projection: a, c
+/// returns --> a
+/// ```
+///
+/// To see why the input has to be a prefix, consider this input:
+///
+/// ```text
+/// a    b
+/// 1    1
+/// 2    2
+/// 3    1
+/// ``
+///
+/// It is sorted on `a,b` but *not* sorted on `b`
+fn project_output_ordering(
+    output_ordering: &[PhysicalSortExpr],
+    projected_schema: SchemaRef,
+) -> Result<Vec<PhysicalSortExpr>> {
+    // filter out sort exprs columns that got projected away
+    let known_columns = projected_schema
+        .all_fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect::<HashSet<_>>();
+
+    // take longest prefix
+    let sort_exprs = output_ordering
+        .iter()
+        .take_while(|expr| {
+            if let Some(col) = expr.expr.as_any().downcast_ref::<Column>() {
+                known_columns.contains(col.name())
+            } else {
+                // do not keep exprs like `a+1` or `-a` as they may
+                // not maintain ordering
+                false
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    reassign_sort_exprs_columns(&sort_exprs, &projected_schema)
+}
+
 fn schema_name_projection(
     schema: &SchemaRef,
     cols: &[&str],
@@ -329,9 +364,36 @@ where
         .chain(outer_cols.iter())
         .copied()
         .collect::<HashSet<_>>();
-    if inner_required_cols.len() < plan.schema().fields().len() {
-        let mut inner_projection_cols = inner_required_cols.iter().copied().collect::<Vec<_>>();
-        inner_projection_cols.sort();
+
+    // sort inner required cols according the final projection
+    let outer_cols_order = outer_cols
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, col)| (col, idx))
+        .collect::<HashMap<_, _>>();
+    let mut inner_projection_cols = inner_required_cols
+        .iter()
+        .copied()
+        .map(|col| {
+            // Note: if the col is NOT known, this will fail in `schema_name_projection`, so we just default it here
+            let idx = outer_cols_order.get(col).copied().unwrap_or_default();
+            (idx, col)
+        })
+        .collect::<Vec<_>>();
+    inner_projection_cols.sort();
+    let inner_projection_cols = inner_projection_cols
+        .into_iter()
+        .map(|(_idx, col)| col)
+        .collect::<Vec<_>>();
+
+    let plan_schema = plan.schema();
+    let plan_cols = plan_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect::<Vec<_>>();
+    if plan_cols != inner_projection_cols {
         let expr = schema_name_projection(&plan.schema(), &inner_projection_cols)?;
         plan = Arc::new(ProjectionExec::try_new(expr, plan)?);
     }
@@ -365,19 +427,23 @@ fn reassign_sort_exprs_columns(
 mod tests {
     use arrow::{
         compute::SortOptions,
-        datatypes::{DataType, Field, Schema, SchemaRef},
+        datatypes::{DataType, Field, Fields, Schema, SchemaRef},
     };
     use datafusion::{
         datasource::object_store::ObjectStoreUrl,
         logical_expr::Operator,
         physical_plan::{
             expressions::{BinaryExpr, Literal},
-            PhysicalExpr, Statistics,
+            DisplayAs, PhysicalExpr, Statistics,
         },
         scalar::ScalarValue,
     };
+    use serde::Serialize;
 
-    use crate::{physical_optimizer::test_util::OptimizationTest, test::TestChunk};
+    use crate::{
+        physical_optimizer::test_util::{assert_unknown_partitioning, OptimizationTest},
+        test::TestChunk,
+    };
 
     use super::*;
 
@@ -391,7 +457,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -430,7 +496,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -469,7 +535,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -498,7 +564,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -527,7 +593,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -553,7 +619,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -582,7 +648,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -619,7 +685,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -663,7 +729,7 @@ mod tests {
             projection: Some(projection),
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(vec![
+            output_ordering: vec![vec![
                 PhysicalSortExpr {
                     expr: expr_col("tag3", &schema_projected),
                     options: Default::default(),
@@ -676,7 +742,7 @@ mod tests {
                     expr: expr_col("tag2", &schema_projected),
                     options: Default::default(),
                 },
-            ]),
+            ]],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, Some(expr_string_cmp("tag1", &schema)), None);
@@ -690,7 +756,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -698,10 +764,10 @@ mod tests {
         ---
         input:
           - " ProjectionExec: expr=[tag2@2 as tag2, tag3@1 as tag3]"
-          - "   ParquetExec: limit=None, partitions={0 groups: []}, predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1, output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], projection=[field, tag3, tag2]"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1"
         output:
           Ok:
-            - " ParquetExec: limit=None, partitions={0 groups: []}, predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1, output_ordering=[tag3@1 ASC, tag2@0 ASC], projection=[tag2, tag3]"
+            - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1"
         "###
         );
 
@@ -734,7 +800,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -767,7 +833,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -801,7 +867,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -833,7 +899,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -850,7 +916,48 @@ mod tests {
         );
     }
 
-    // since `SortExec` and `FilterExec` both use `wrap_user_into_projections`, we only test one variant for `SortExec`
+    #[test]
+    fn test_filter_uses_resorted_cols() {
+        let schema = schema();
+        let plan = Arc::new(
+            ProjectionExec::try_new(
+                vec![
+                    (expr_col("tag2", &schema), String::from("tag2")),
+                    (expr_col("tag1", &schema), String::from("tag1")),
+                    (expr_col("field", &schema), String::from("field")),
+                ],
+                Arc::new(
+                    FilterExec::try_new(
+                        expr_and(
+                            expr_string_cmp("tag2", &schema),
+                            expr_string_cmp("tag1", &schema),
+                        ),
+                        Arc::new(TestExec::new(schema)),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+        let opt = ProjectionPushdown;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan, opt),
+            @r###"
+        ---
+        input:
+          - " ProjectionExec: expr=[tag2@1 as tag2, tag1@0 as tag1, field@2 as field]"
+          - "   FilterExec: tag2@1 = foo AND tag1@0 = foo"
+          - "     Test"
+        output:
+          Ok:
+            - " FilterExec: tag2@0 = foo AND tag1@1 = foo"
+            - "   ProjectionExec: expr=[tag2@1 as tag2, tag1@0 as tag1, field@2 as field]"
+            - "     Test"
+        "###
+        );
+    }
+
+    // since `SortExec` and `FilterExec` both use `wrap_user_into_projections`, we only test a few variants for `SortExec`
     #[test]
     fn test_sort_projection_split() {
         let schema = schema();
@@ -858,7 +965,7 @@ mod tests {
             ProjectionExec::try_new(
                 vec![(expr_col("tag1", &schema), String::from("tag1"))],
                 Arc::new(
-                    SortExec::try_new(
+                    SortExec::new(
                         vec![PhysicalSortExpr {
                             expr: expr_col("tag2", &schema),
                             options: SortOptions {
@@ -867,14 +974,13 @@ mod tests {
                             },
                         }],
                         Arc::new(TestExec::new(schema)),
-                        Some(42),
                     )
-                    .unwrap(),
+                    .with_fetch(Some(42)),
                 ),
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -891,6 +997,54 @@ mod tests {
             - "       Test"
         "###
         );
+    }
+
+    #[test]
+    fn test_sort_preserve_partitioning() {
+        let schema = schema();
+        let plan = Arc::new(
+            ProjectionExec::try_new(
+                vec![(expr_col("tag1", &schema), String::from("tag1"))],
+                Arc::new(
+                    SortExec::new(
+                        vec![PhysicalSortExpr {
+                            expr: expr_col("tag2", &schema),
+                            options: SortOptions {
+                                descending: true,
+                                ..Default::default()
+                            },
+                        }],
+                        Arc::new(TestExec::new_with_partitions(schema, 2)),
+                    )
+                    .with_preserve_partitioning(true)
+                    .with_fetch(Some(42)),
+                ),
+            )
+            .unwrap(),
+        );
+
+        assert_unknown_partitioning(plan.output_partitioning(), 2);
+
+        let opt = ProjectionPushdown;
+        let test = OptimizationTest::new(plan, opt);
+        insta::assert_yaml_snapshot!(
+            test,
+            @r###"
+        ---
+        input:
+          - " ProjectionExec: expr=[tag1@0 as tag1]"
+          - "   SortExec: fetch=42, expr=[tag2@1 DESC]"
+          - "     Test"
+        output:
+          Ok:
+            - " ProjectionExec: expr=[tag1@0 as tag1]"
+            - "   SortExec: fetch=42, expr=[tag2@1 DESC]"
+            - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
+            - "       Test"
+        "###
+        );
+
+        assert_unknown_partitioning(test.output_plan().unwrap().output_partitioning(), 2);
     }
 
     // since `SortPreservingMergeExec` and `FilterExec` both use `wrap_user_into_projections`, we only test one variant for `SortPreservingMergeExec`
@@ -913,7 +1067,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -959,7 +1113,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -997,7 +1151,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -1043,7 +1197,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1099,7 +1253,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1110,9 +1264,9 @@ mod tests {
           - "     Test"
         output:
           Ok:
-            - " ProjectionExec: expr=[tag1@1 as tag1, field1@0 as field1]"
-            - "   DeduplicateExec: [tag1@1 DESC,tag2@2 ASC]"
-            - "     ProjectionExec: expr=[field1@2 as field1, tag1@0 as tag1, tag2@1 as tag2]"
+            - " ProjectionExec: expr=[tag1@0 as tag1, field1@2 as field1]"
+            - "   DeduplicateExec: [tag1@0 DESC,tag2@1 ASC]"
+            - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2, field1@2 as field1]"
             - "       Test"
         "###
         );
@@ -1135,7 +1289,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -1143,10 +1297,10 @@ mod tests {
         ---
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
-          - "   RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
+          - "   RecordBatchesExec: chunks=1"
         output:
           Ok:
-            - " RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
+            - " RecordBatchesExec: chunks=1"
         "###
         );
 
@@ -1176,7 +1330,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: None,
+            output_ordering: vec![],
             infinite_source: false,
         };
         let plan = Arc::new(ParquetExec::new(base_config, None, None));
@@ -1205,7 +1359,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1215,7 +1369,7 @@ mod tests {
           - "   FilterExec: tag2@1 = foo"
           - "     DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
           - "       UnionExec"
-          - "         ParquetExec: limit=None, partitions={0 groups: []}, projection=[tag1, tag2, field1, field2]"
+          - "         ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field1, field2]"
         output:
           Ok:
             - " ProjectionExec: expr=[field1@0 as field1]"
@@ -1223,9 +1377,235 @@ mod tests {
             - "     ProjectionExec: expr=[field1@0 as field1, tag2@2 as tag2]"
             - "       DeduplicateExec: [tag1@1 ASC,tag2@2 ASC]"
             - "         UnionExec"
-            - "           ParquetExec: limit=None, partitions={0 groups: []}, projection=[field1, tag1, tag2]"
+            - "           ParquetExec: file_groups={0 groups: []}, projection=[field1, tag1, tag2]"
         "###
         );
+    }
+
+    #[test]
+    fn test_project_output_ordering_keep() {
+        let schema = schema();
+        let projection = vec!["tag1", "tag2"];
+        let output_ordering = vec![
+            PhysicalSortExpr {
+                expr: expr_col("tag1", &schema),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            },
+        ];
+
+        insta::assert_yaml_snapshot!(
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            @r###"
+        ---
+        output_ordering:
+          - tag1@0
+          - tag2@1
+        projection:
+          - tag1
+          - tag2
+        projected_ordering:
+          - tag1@0
+          - tag2@1
+        "###
+        );
+    }
+
+    #[test]
+    fn test_project_output_ordering_project_prefix() {
+        let schema = schema();
+        let projection = vec!["tag1"]; // prefix of the sort key
+        let output_ordering = vec![
+            PhysicalSortExpr {
+                expr: expr_col("tag1", &schema),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            },
+        ];
+
+        insta::assert_yaml_snapshot!(
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            @r###"
+        ---
+        output_ordering:
+          - tag1@0
+          - tag2@1
+        projection:
+          - tag1
+        projected_ordering:
+          - tag1@0
+        "###
+        );
+    }
+
+    #[test]
+    fn test_project_output_ordering_project_non_prefix() {
+        let schema = schema();
+        let projection = vec!["tag2"]; // in sort key, but not prefix
+        let output_ordering = vec![
+            PhysicalSortExpr {
+                expr: expr_col("tag1", &schema),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            },
+        ];
+
+        insta::assert_yaml_snapshot!(
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            @r###"
+        ---
+        output_ordering:
+          - tag1@0
+          - tag2@1
+        projection:
+          - tag2
+        projected_ordering: []
+        "###
+        );
+    }
+
+    #[test]
+    fn test_project_output_ordering_projection_reorder() {
+        let schema = schema();
+        let projection = vec!["tag2", "tag1", "field"]; // in different order than sort key
+        let output_ordering = vec![
+            PhysicalSortExpr {
+                expr: expr_col("tag1", &schema),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            },
+        ];
+
+        insta::assert_yaml_snapshot!(
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            @r###"
+        ---
+        output_ordering:
+          - tag1@0
+          - tag2@1
+        projection:
+          - tag2
+          - tag1
+          - field
+        projected_ordering:
+          - tag1@1
+          - tag2@0
+        "###
+        );
+    }
+
+    #[test]
+    fn test_project_output_ordering_constant() {
+        let schema = schema();
+        let projection = vec!["tag2"];
+        let output_ordering = vec![
+            // ordering by a constant is ignored
+            PhysicalSortExpr {
+                expr: datafusion::physical_plan::expressions::lit(1),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            },
+        ];
+
+        insta::assert_yaml_snapshot!(
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            @r###"
+        ---
+        output_ordering:
+          - "1"
+          - tag2@1
+        projection:
+          - tag2
+        projected_ordering: []
+        "###
+        );
+    }
+
+    #[test]
+    fn test_project_output_ordering_constant_second_position() {
+        let schema = schema();
+        let projection = vec!["tag2"];
+        let output_ordering = vec![
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            },
+            // ordering by a constant is ignored
+            PhysicalSortExpr {
+                expr: datafusion::physical_plan::expressions::lit(1),
+                options: Default::default(),
+            },
+        ];
+
+        insta::assert_yaml_snapshot!(
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            @r###"
+        ---
+        output_ordering:
+          - tag2@1
+          - "1"
+        projection:
+          - tag2
+        projected_ordering:
+          - tag2@0
+        "###
+        );
+    }
+
+    /// project the output_ordering with the projection,
+    // derive serde to make a nice 'insta' snapshot
+    #[derive(Debug, Serialize)]
+    struct ProjectOutputOrdering {
+        output_ordering: Vec<String>,
+        projection: Vec<String>,
+        projected_ordering: Vec<String>,
+    }
+
+    impl ProjectOutputOrdering {
+        fn new(
+            schema: &Schema,
+            output_ordering: Vec<PhysicalSortExpr>,
+            projection: Vec<&'static str>,
+        ) -> Self {
+            let projected_fields: Fields = projection
+                .iter()
+                .map(|field_name| {
+                    schema
+                        .field_with_name(field_name)
+                        .expect("finding field")
+                        .clone()
+                })
+                .collect();
+            let projected_schema = Arc::new(Schema::new(projected_fields));
+
+            let projected_ordering = project_output_ordering(&output_ordering, projected_schema);
+
+            let projected_ordering = match projected_ordering {
+                Ok(projected_ordering) => format_sort_exprs(&projected_ordering),
+                Err(e) => vec![e.to_string()],
+            };
+
+            Self {
+                output_ordering: format_sort_exprs(&output_ordering),
+                projection: projection.iter().map(|s| s.to_string()).collect(),
+                projected_ordering,
+            }
+        }
     }
 
     fn schema() -> SchemaRef {
@@ -1234,6 +1614,16 @@ mod tests {
             Field::new("tag2", DataType::Utf8, true),
             Field::new("field", DataType::UInt64, true),
         ]))
+    }
+
+    fn format_sort_exprs(sort_exprs: &[PhysicalSortExpr]) -> Vec<String> {
+        sort_exprs
+            .iter()
+            .map(|expr| {
+                let PhysicalSortExpr { expr, options: _ } = expr;
+                expr.to_string()
+            })
+            .collect::<Vec<_>>()
     }
 
     fn expr_col(name: &str, schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
@@ -1248,14 +1638,23 @@ mod tests {
         ))
     }
 
+    fn expr_and(a: Arc<dyn PhysicalExpr>, b: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(a, Operator::And, b))
+    }
+
     #[derive(Debug)]
     struct TestExec {
         schema: SchemaRef,
+        partitions: usize,
     }
 
     impl TestExec {
         fn new(schema: SchemaRef) -> Self {
-            Self { schema }
+            Self::new_with_partitions(schema, 1)
+        }
+
+        fn new_with_partitions(schema: SchemaRef, partitions: usize) -> Self {
+            Self { schema, partitions }
         }
     }
 
@@ -1269,7 +1668,7 @@ mod tests {
         }
 
         fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(self.partitions)
         }
 
         fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
@@ -1296,16 +1695,18 @@ mod tests {
             unimplemented!()
         }
 
+        fn statistics(&self) -> datafusion::physical_plan::Statistics {
+            Statistics::default()
+        }
+    }
+
+    impl DisplayAs for TestExec {
         fn fmt_as(
             &self,
             _t: datafusion::physical_plan::DisplayFormatType,
             f: &mut std::fmt::Formatter<'_>,
         ) -> std::fmt::Result {
             write!(f, "Test")
-        }
-
-        fn statistics(&self) -> datafusion::physical_plan::Statistics {
-            unimplemented!()
         }
     }
 }

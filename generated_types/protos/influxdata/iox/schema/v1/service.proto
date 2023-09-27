@@ -3,13 +3,17 @@ package influxdata.iox.schema.v1;
 option go_package = "github.com/influxdata/iox/schema/v1";
 
 service SchemaService {
-  // Get the schema for a namespace
+  // Get the schema for a namespace and, optionally, a table within that namespace
   rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
 }
 
 message GetSchemaRequest {
   // The namespace for which to fetch the schema
   string namespace = 1;
+
+  // If specified, the table in the namespace for which to fetch the schema. If not specified, the
+  // schemas for all tables in this namespace will be returned.
+  optional string table = 2;
 }
 
 message GetSchemaResponse {
@@ -20,13 +24,15 @@ message NamespaceSchema {
   // Renamed to topic_id
   reserved 2;
   reserved "kafka_topic_id";
+  // Removed topic ID
+  reserved 5;
+  reserved "topic_id";
+  // Removed query pool ID
+  reserved 3;
+  reserved "query_pool_id";
 
   // Namespace ID
   int64 id = 1;
-  // Topic ID
-  int64 topic_id = 5;
-  // Query Pool ID
-  int64 query_pool_id = 3;
   // Map of Table Name -> Table Schema
   map<string, TableSchema> tables = 4;
 }

@@ -4,21 +4,27 @@ pub(crate) mod name_resolver;
 
 use std::sync::Arc;
 
-use data_types::{NamespaceId, SequenceNumber, ShardId, TableId};
-use dml::DmlOperation;
+use async_trait::async_trait;
+use data_types::{NamespaceId, TableId};
 use metric::U64Counter;
-use observability_deps::tracing::warn;
-use parking_lot::RwLock;
-use write_summary::ShardProgress;
+use predicate::Predicate;
+use trace::span::Span;
 
 use super::{
-    partition::resolver::PartitionProvider,
-    table::{name_resolver::TableNameProvider, TableData},
+    partition::{counter::PartitionCounter, resolver::PartitionProvider},
+    post_write::PostWriteObserver,
+    table::{metadata_resolver::TableProvider, TableData},
+    BufferWriteError,
 };
-#[cfg(test)]
-use crate::data::triggers::TestTriggers;
 use crate::{
-    arcmap::ArcMap, data::DmlApplyAction, deferred_load::DeferredLoad, lifecycle::LifecycleHandle,
+    arcmap::ArcMap,
+    deferred_load::DeferredLoad,
+    dml_payload::IngestOp,
+    dml_sink::DmlSink,
+    query::{
+        projection::OwnedProjection, response::QueryResponse, tracing::QueryExecTracing,
+        QueryError, QueryExec,
+    },
 };
 
 /// The string name / identifier of a Namespace.
@@ -50,89 +56,50 @@ impl std::fmt::Display for NamespaceName {
     }
 }
 
-/// Data of a Namespace that belongs to a given Shard
+/// Data of a Namespace
 #[derive(Debug)]
-pub(crate) struct NamespaceData {
+pub(crate) struct NamespaceData<O> {
     namespace_id: NamespaceId,
-    namespace_name: DeferredLoad<NamespaceName>,
-
-    /// The catalog ID of the shard this namespace is being populated from.
-    shard_id: ShardId,
+    namespace_name: Arc<DeferredLoad<NamespaceName>>,
 
     /// A set of tables this [`NamespaceData`] instance has processed
-    /// [`DmlOperation`]'s for.
+    /// [`IngestOp`]'s for.
     ///
-    /// The [`TableNameProvider`] acts as a [`DeferredLoad`] constructor to
-    /// resolve the [`TableName`] for new [`TableData`] out of the hot path.
+    /// The [`TableProvider`] acts as a [`DeferredLoad`] constructor to
+    /// resolve the catalog [`Table`] for new [`TableData`] out of the hot path.
     ///
-    /// [`TableName`]: crate::buffer_tree::table::TableName
-    tables: ArcMap<TableId, TableData>,
-    table_name_resolver: Arc<dyn TableNameProvider>,
+    ///
+    /// [`Table`]: data_types::Table
+    tables: ArcMap<TableId, TableData<O>>,
+    catalog_table_resolver: Arc<dyn TableProvider>,
     /// The count of tables initialised in this Ingester so far, across all
-    /// shards / namespaces.
+    /// namespaces.
     table_count: U64Counter,
 
-    /// The resolver of `(shard_id, table_id, partition_key)` to
-    /// [`PartitionData`].
+    /// The resolver of `(table_id, partition_key)` to [`PartitionData`].
     ///
     /// [`PartitionData`]: super::partition::PartitionData
     partition_provider: Arc<dyn PartitionProvider>,
 
-    /// The sequence number being actively written, if any.
+    /// A counter tracking the number of non-empty partitions currently
+    /// buffered for this namespace.
     ///
-    /// This is used to know when a sequence number is only partially
-    /// buffered for readability reporting. For example, in the
-    /// following diagram a write for SequenceNumber 10 is only
-    /// partially readable because it has been written into partitions
-    /// A and B but not yet C. The max buffered number on each
-    /// PartitionData is not sufficient to determine if the write is
-    /// complete.
-    ///
-    /// ```text
-    /// ╔═══════════════════════════════════════════════╗
-    /// ║                                               ║   DML Operation (write)
-    /// ║  ┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓  ║   SequenceNumber = 10
-    /// ║  ┃ Data for C  ┃ Data for B  ┃ Data for A  ┃  ║
-    /// ║  ┗━━━━━━━━━━━━━┻━━━━━━━━━━━━━┻━━━━━━━━━━━━━┛  ║
-    /// ║         │             │             │         ║
-    /// ╚═══════════════════════╬═════════════╬═════════╝
-    ///           │             │             │           ┌──────────────────────────────────┐
-    ///                         │             │           │           Partition A            │
-    ///           │             │             └──────────▶│        max buffered = 10         │
-    ///                         │                         └──────────────────────────────────┘
-    ///           │             │
-    ///                         │                         ┌──────────────────────────────────┐
-    ///           │             │                         │           Partition B            │
-    ///                         └────────────────────────▶│        max buffered = 10         │
-    ///           │                                       └──────────────────────────────────┘
-    ///
-    ///           │
-    ///                                                   ┌──────────────────────────────────┐
-    ///           │                                       │           Partition C            │
-    ///            ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ▶│         max buffered = 7         │
-    ///                                                   └──────────────────────────────────┘
-    ///           Write is partially buffered. It has been
-    ///            written to Partitions A and B, but not
-    ///                  yet written to Partition C
-    ///                                                               PartitionData
-    ///                                                       (Ingester state per partition)
-    ///```
-    buffering_sequence_number: RwLock<Option<SequenceNumber>>,
+    /// This counter is eventually consistent / relaxed when read, but strongly
+    /// consistent when enforced.
+    partition_count: Arc<PartitionCounter>,
 
-    /// Control the flow of ingest, for testing purposes
-    #[cfg(test)]
-    pub(crate) test_triggers: TestTriggers,
+    post_write_observer: Arc<O>,
 }
 
-impl NamespaceData {
+impl<O> NamespaceData<O> {
     /// Initialize new tables with default partition template of daily
-    // TODO(kafkaless): pub(super)
-    pub(crate) fn new(
+    pub(super) fn new(
         namespace_id: NamespaceId,
-        namespace_name: DeferredLoad<NamespaceName>,
-        table_name_resolver: Arc<dyn TableNameProvider>,
-        shard_id: ShardId,
+        namespace_name: Arc<DeferredLoad<NamespaceName>>,
+        catalog_table_resolver: Arc<dyn TableProvider>,
         partition_provider: Arc<dyn PartitionProvider>,
+        partition_counter: PartitionCounter,
+        post_write_observer: Arc<O>,
         metrics: &metric::Registry,
     ) -> Self {
         let table_count = metrics
@@ -145,43 +112,50 @@ impl NamespaceData {
         Self {
             namespace_id,
             namespace_name,
-            shard_id,
             tables: Default::default(),
-            table_name_resolver,
+            catalog_table_resolver,
             table_count,
-            buffering_sequence_number: RwLock::new(None),
             partition_provider,
-            #[cfg(test)]
-            test_triggers: TestTriggers::new(),
+            post_write_observer,
+            partition_count: Arc::new(partition_counter),
         }
     }
 
-    /// Buffer the operation in the cache, adding any new partitions or delete tombstones to the
-    /// catalog. Returns true if ingest should be paused due to memory limits set in the passed
-    /// lifecycle manager.
-    pub(crate) async fn buffer_operation(
-        &self,
-        dml_operation: DmlOperation,
-        lifecycle_handle: &dyn LifecycleHandle,
-    ) -> Result<DmlApplyAction, crate::data::Error> {
-        let sequence_number = dml_operation
-            .meta()
-            .sequence()
-            .expect("must have sequence number")
-            .sequence_number;
+    /// Return the table data by ID.
+    pub(crate) fn table(&self, table_id: TableId) -> Option<Arc<TableData<O>>> {
+        self.tables.get(&table_id)
+    }
 
-        // Note that this namespace is actively writing this sequence
-        // number. Since there is no namespace wide lock held during a
-        // write, this number is used to detect and update reported
-        // progress during a write
-        let _sequence_number_guard =
-            ScopedSequenceNumber::new(sequence_number, &self.buffering_sequence_number);
+    /// Return the [`NamespaceId`] this [`NamespaceData`] belongs to.
+    pub(crate) fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
 
-        match dml_operation {
-            DmlOperation::Write(write) => {
-                let mut pause_writes = false;
-                let mut all_skipped = true;
+    /// Returns the [`NamespaceName`] for this namespace.
+    pub(crate) fn namespace_name(&self) -> &DeferredLoad<NamespaceName> {
+        &self.namespace_name
+    }
 
+    /// Obtain a snapshot of the tables within this [`NamespaceData`].
+    ///
+    /// NOTE: the snapshot is an atomic / point-in-time snapshot of the set of
+    /// [`NamespaceData`], but the tables (and partitions) within them may
+    /// change as they continue to buffer DML operations.
+    pub(super) fn tables(&self) -> Vec<Arc<TableData<O>>> {
+        self.tables.values()
+    }
+}
+
+#[async_trait]
+impl<O> DmlSink for NamespaceData<O>
+where
+    O: PostWriteObserver,
+{
+    type Error = BufferWriteError;
+
+    async fn apply(&self, op: IngestOp) -> Result<(), Self::Error> {
+        match op {
+            IngestOp::Write(write) => {
                 // Extract the partition key derived by the router.
                 let partition_key = write.partition_key().clone();
 
@@ -192,161 +166,86 @@ impl NamespaceData {
                         self.table_count.inc(1);
                         Arc::new(TableData::new(
                             table_id,
-                            self.table_name_resolver.for_table(table_id),
-                            self.shard_id,
+                            Arc::new(self.catalog_table_resolver.for_table(table_id)),
                             self.namespace_id,
+                            Arc::clone(&self.namespace_name),
                             Arc::clone(&self.partition_provider),
+                            Arc::clone(&self.partition_count),
+                            Arc::clone(&self.post_write_observer),
                         ))
                     });
 
-                    let action = table_data
+                    let partitioned_data = b.into_partitioned_data();
+
+                    table_data
                         .buffer_table_write(
-                            sequence_number,
-                            b,
+                            partitioned_data.sequence_number(),
+                            partitioned_data.into_data(),
                             partition_key.clone(),
-                            lifecycle_handle,
                         )
                         .await?;
-                    if let DmlApplyAction::Applied(should_pause) = action {
-                        pause_writes = pause_writes || should_pause;
-                        all_skipped = false;
-                    }
-
-                    #[cfg(test)]
-                    self.test_triggers.on_write().await;
-                }
-
-                if all_skipped {
-                    Ok(DmlApplyAction::Skipped)
-                } else {
-                    // at least some were applied
-                    Ok(DmlApplyAction::Applied(pause_writes))
                 }
             }
-            DmlOperation::Delete(delete) => {
-                // Deprecated delete support:
-                // https://github.com/influxdata/influxdb_iox/issues/5825
-                warn!(
-                    shard_id=%self.shard_id,
-                    namespace_name=%self.namespace_name,
-                    namespace_id=%self.namespace_id,
-                    table_name=?delete.table_name(),
-                    sequence_number=?delete.meta().sequence(),
-                    "discarding unsupported delete op"
-                );
-
-                Ok(DmlApplyAction::Applied(false))
-            }
         }
-    }
 
-    /// Return the table data by ID.
-    pub(crate) fn table(&self, table_id: TableId) -> Option<Arc<TableData>> {
-        self.tables.get(&table_id)
-    }
-
-    /// Return progress from this Namespace
-    // TODO(kafkaless): pub(super)
-    pub(crate) async fn progress(&self) -> ShardProgress {
-        let tables: Vec<_> = self.tables.values();
-
-        // Consolidate progress across partitions.
-        let mut progress = ShardProgress::new()
-            // Properly account for any sequence number that is
-            // actively buffering and thus not yet completely
-            // readable.
-            .actively_buffering(*self.buffering_sequence_number.read());
-
-        for table_data in tables {
-            progress = progress.combine(table_data.progress())
-        }
-        progress
-    }
-
-    /// Return the [`NamespaceId`] this [`NamespaceData`] belongs to.
-    pub(crate) fn namespace_id(&self) -> NamespaceId {
-        self.namespace_id
-    }
-
-    #[cfg(test)]
-    pub(super) fn table_count(&self) -> &U64Counter {
-        &self.table_count
-    }
-
-    /// Returns the [`NamespaceName`] for this namespace.
-    pub(crate) fn namespace_name(&self) -> &DeferredLoad<NamespaceName> {
-        &self.namespace_name
+        Ok(())
     }
 }
 
-/// RAAI struct that sets buffering sequence number on creation and clears it on free
-struct ScopedSequenceNumber<'a> {
-    sequence_number: SequenceNumber,
-    buffering_sequence_number: &'a RwLock<Option<SequenceNumber>>,
-}
+#[async_trait]
+impl<O> QueryExec for NamespaceData<O>
+where
+    O: Send + Sync + std::fmt::Debug,
+{
+    type Response = QueryResponse;
 
-impl<'a> ScopedSequenceNumber<'a> {
-    fn new(
-        sequence_number: SequenceNumber,
-        buffering_sequence_number: &'a RwLock<Option<SequenceNumber>>,
-    ) -> Self {
-        *buffering_sequence_number.write() = Some(sequence_number);
-
-        Self {
-            sequence_number,
-            buffering_sequence_number,
-        }
-    }
-}
-
-impl<'a> Drop for ScopedSequenceNumber<'a> {
-    fn drop(&mut self) {
-        // clear write on drop
-        let mut buffering_sequence_number = self.buffering_sequence_number.write();
+    async fn query_exec(
+        &self,
+        namespace_id: NamespaceId,
+        table_id: TableId,
+        projection: OwnedProjection,
+        span: Option<Span>,
+        predicate: Option<Predicate>,
+    ) -> Result<Self::Response, QueryError> {
         assert_eq!(
-            *buffering_sequence_number,
-            Some(self.sequence_number),
-            "multiple operations are being buffered concurrently"
+            self.namespace_id, namespace_id,
+            "buffer tree index inconsistency"
         );
-        *buffering_sequence_number = None;
+
+        // Extract the table if it exists.
+        let inner = self
+            .table(table_id)
+            .ok_or(QueryError::TableNotFound(namespace_id, table_id))?;
+
+        // Delegate query execution to the namespace, wrapping the execution in
+        // a tracing delegate to emit a child span.
+        Ok(QueryResponse::new(
+            QueryExecTracing::new(inner, "table")
+                .query_exec(namespace_id, table_id, projection, span, predicate)
+                .await?,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{num::NonZeroUsize, sync::Arc};
 
-    use assert_matches::assert_matches;
-    use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, PartitionId, PartitionKey,
-        ShardIndex, Timestamp,
-    };
-    use iox_catalog::{interface::Catalog, mem::MemCatalog};
-    use iox_time::SystemProvider;
-    use metric::{Attributes, Metric, MetricObserver, Observation};
-    use uuid::Uuid;
+    use metric::{Attributes, Metric};
 
     use super::*;
     use crate::{
         buffer_tree::{
-            namespace::NamespaceData,
-            partition::{
-                resolver::{CatalogPartitionResolver, MockPartitionProvider},
-                PartitionData, SortKeyState,
-            },
-            table::{name_resolver::mock::MockTableNameProvider, TableName},
+            namespace::NamespaceData, partition::resolver::mock::MockPartitionProvider,
+            post_write::mock::MockPostWriteObserver,
         },
-        deferred_load::{self, DeferredLoad},
-        lifecycle::{mock_handle::MockLifecycleHandle, LifecycleConfig, LifecycleManager},
-        test_util::{make_write_op, TEST_TABLE},
+        deferred_load,
+        test_util::{
+            defer_namespace_name_1_ms, make_write_op, PartitionDataBuilder, ARBITRARY_NAMESPACE_ID,
+            ARBITRARY_NAMESPACE_NAME, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_ID,
+            ARBITRARY_TABLE_NAME, ARBITRARY_TABLE_PROVIDER,
+        },
     };
-
-    const SHARD_INDEX: ShardIndex = ShardIndex::new(24);
-    const SHARD_ID: ShardId = ShardId::new(22);
-    const TABLE_NAME: &str = TEST_TABLE;
-    const TABLE_ID: TableId = TableId::new(44);
-    const NAMESPACE_NAME: &str = "platanos";
-    const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
 
     #[tokio::test]
     async fn test_namespace_init_table() {
@@ -354,58 +253,48 @@ mod tests {
 
         // Configure the mock partition provider to return a partition for this
         // table ID.
-        let partition_provider = Arc::new(MockPartitionProvider::default().with_partition(
-            PartitionData::new(
-                PartitionId::new(0),
-                PartitionKey::from("banana-split"),
-                SHARD_ID,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
-                SortKeyState::Provided(None),
-                None,
-            ),
-        ));
+        let partition_provider =
+            Arc::new(MockPartitionProvider::default().with_partition(PartitionDataBuilder::new()));
 
         let ns = NamespaceData::new(
-            NAMESPACE_ID,
-            DeferredLoad::new(Duration::from_millis(1), async { NAMESPACE_NAME.into() }),
-            Arc::new(MockTableNameProvider::new(TABLE_NAME)),
-            SHARD_ID,
+            ARBITRARY_NAMESPACE_ID,
+            defer_namespace_name_1_ms(),
+            Arc::clone(&*ARBITRARY_TABLE_PROVIDER),
             partition_provider,
+            PartitionCounter::new(NonZeroUsize::new(usize::MAX).unwrap()),
+            Arc::new(MockPostWriteObserver::default()),
             &metrics,
         );
 
         // Assert the namespace name was stored
         let name = ns.namespace_name().to_string();
         assert!(
-            (name == NAMESPACE_NAME) || (name == deferred_load::UNRESOLVED_DISPLAY_STRING),
+            (name.as_str() == &***ARBITRARY_NAMESPACE_NAME)
+                || (name == deferred_load::UNRESOLVED_DISPLAY_STRING),
             "unexpected namespace name: {name}"
         );
 
         // Assert the namespace does not contain the test data
-        assert!(ns.table(TABLE_ID).is_none());
+        assert!(ns.table(ARBITRARY_TABLE_ID).is_none());
 
         // Write some test data
-        ns.buffer_operation(
-            DmlOperation::Write(make_write_op(
-                &PartitionKey::from("banana-split"),
-                SHARD_INDEX,
-                NAMESPACE_ID,
-                TABLE_NAME,
-                TABLE_ID,
-                0,
-                r#"test_table,city=Medford day="sun",temp=55 22"#,
-            )),
-            &MockLifecycleHandle::default(),
-        )
+        ns.apply(IngestOp::Write(make_write_op(
+            &ARBITRARY_PARTITION_KEY,
+            ARBITRARY_NAMESPACE_ID,
+            &ARBITRARY_TABLE_NAME,
+            ARBITRARY_TABLE_ID,
+            0,
+            &format!(
+                r#"{},city=Medford day="sun",temp=55 22"#,
+                &*ARBITRARY_TABLE_NAME
+            ),
+            None,
+        )))
         .await
         .expect("buffer op should succeed");
 
         // Referencing the table should succeed
-        assert!(ns.table(TABLE_ID).is_some());
+        assert!(ns.table(ARBITRARY_TABLE_ID).is_some());
 
         // And the table counter metric should increase
         let tables = metrics
@@ -418,153 +307,10 @@ mod tests {
 
         // Ensure the deferred namespace name is loaded.
         let name = ns.namespace_name().get().await;
-        assert_eq!(&**name, NAMESPACE_NAME);
-        assert_eq!(ns.namespace_name().to_string(), NAMESPACE_NAME);
-    }
-
-    #[tokio::test]
-    async fn buffer_operation_ignores_already_persisted_data() {
-        test_helpers::maybe_start_logging();
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-
-        let w1 = make_write_op(
-            &PartitionKey::from("1970-01-01"),
-            SHARD_INDEX,
-            NAMESPACE_ID,
-            TABLE_NAME,
-            TABLE_ID,
-            1,
-            "test_table foo=1 10",
-        );
-        let w2 = make_write_op(
-            &PartitionKey::from("1970-01-01"),
-            SHARD_INDEX,
-            NAMESPACE_ID,
-            TABLE_NAME,
-            TABLE_ID,
-            2,
-            "test_table foo=1 10",
-        );
-
-        // create some persisted state
-        let partition = repos
-            .partitions()
-            .create_or_get("1970-01-01".into(), SHARD_ID, TABLE_ID)
-            .await
-            .unwrap();
-        repos
-            .partitions()
-            .update_persisted_sequence_number(partition.id, SequenceNumber::new(1))
-            .await
-            .unwrap();
-        let partition2 = repos
-            .partitions()
-            .create_or_get("1970-01-02".into(), SHARD_ID, TABLE_ID)
-            .await
-            .unwrap();
-
-        let parquet_file_params = ParquetFileParams {
-            shard_id: SHARD_ID,
-            namespace_id: NAMESPACE_ID,
-            table_id: TABLE_ID,
-            partition_id: partition.id,
-            object_store_id: Uuid::new_v4(),
-            max_sequence_number: SequenceNumber::new(1),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(1),
-            file_size_bytes: 0,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
-        repos
-            .parquet_files()
-            .create(parquet_file_params.clone())
-            .await
-            .unwrap();
-
-        // now create a parquet file in another partition with a much higher sequence persisted
-        // sequence number. We want to make sure that this doesn't cause our write in the other
-        // partition to get ignored.
-        let other_file_params = ParquetFileParams {
-            max_sequence_number: SequenceNumber::new(15),
-            object_store_id: Uuid::new_v4(),
-            partition_id: partition2.id,
-            ..parquet_file_params
-        };
-        repos
-            .parquet_files()
-            .create(other_file_params)
-            .await
-            .unwrap();
-        std::mem::drop(repos);
-
-        let manager = LifecycleManager::new(
-            LifecycleConfig::new(
-                1,
-                0,
-                0,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                1000000,
-            ),
-            Arc::clone(&metrics),
-            Arc::new(SystemProvider::new()),
-        );
-
-        let partition_provider = Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog)));
-
-        let data = NamespaceData::new(
-            NAMESPACE_ID,
-            DeferredLoad::new(Duration::from_millis(1), async { "foo".into() }),
-            Arc::new(MockTableNameProvider::new(TABLE_NAME)),
-            SHARD_ID,
-            partition_provider,
-            &metrics,
-        );
-
-        // w1 should be ignored because the per-partition replay offset is set
-        // to 1 already, so it shouldn't be buffered and the buffer should
-        // remain empty.
-        let action = data
-            .buffer_operation(DmlOperation::Write(w1), &manager.handle())
-            .await
-            .unwrap();
-        {
-            let table = data.table(TABLE_ID).unwrap();
-            assert!(table
-                .partitions()
-                .into_iter()
-                .all(|p| p.lock().get_query_data().is_none()));
-            assert_eq!(
-                table
-                    .get_partition_by_key(&"1970-01-01".into())
-                    .unwrap()
-                    .lock()
-                    .max_persisted_sequence_number(),
-                Some(SequenceNumber::new(1))
-            );
-        }
-        assert_matches!(action, DmlApplyAction::Skipped);
-
-        // w2 should be in the buffer
-        data.buffer_operation(DmlOperation::Write(w2), &manager.handle())
-            .await
-            .unwrap();
-
-        let table = data.table(TABLE_ID).unwrap();
-        let partition = table.get_partition_by_key(&"1970-01-01".into()).unwrap();
+        assert_eq!(&*name, &**ARBITRARY_NAMESPACE_NAME);
         assert_eq!(
-            partition.lock().sequence_number_range().inclusive_min(),
-            Some(SequenceNumber::new(2))
+            ns.namespace_name().to_string().as_str(),
+            &***ARBITRARY_NAMESPACE_NAME
         );
-
-        assert_matches!(data.table_count().observe(), Observation::U64Counter(v) => {
-            assert_eq!(v, 1, "unexpected table count metric value");
-        });
     }
 }

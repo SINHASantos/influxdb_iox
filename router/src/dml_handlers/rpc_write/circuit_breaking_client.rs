@@ -2,8 +2,12 @@ use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use generated_types::influxdata::iox::ingester::v1::WriteRequest;
+use trace::ctx::SpanContext;
 
-use super::{circuit_breaker::CircuitBreaker, client::WriteClient, RpcWriteError};
+use super::{
+    circuit_breaker::CircuitBreaker,
+    client::{RpcWriteClientError, WriteClient},
+};
 
 /// An internal abstraction over the health probing & result recording
 /// functionality of a circuit breaker.
@@ -47,9 +51,13 @@ pub(super) struct CircuitBreakingClient<T, C = CircuitBreaker> {
 }
 
 impl<T> CircuitBreakingClient<T> {
-    pub(super) fn new(inner: T, endpoint_name: impl Into<Arc<str>>) -> Self {
+    pub(super) fn new(
+        inner: T,
+        endpoint_name: impl Into<Arc<str>>,
+        num_probes_per_client: u64,
+    ) -> Self {
         let endpoint_name = endpoint_name.into();
-        let state = CircuitBreaker::new(Arc::clone(&endpoint_name));
+        let state = CircuitBreaker::new(Arc::clone(&endpoint_name), num_probes_per_client);
         state.set_healthy();
         Self {
             inner,
@@ -95,8 +103,12 @@ where
     T: WriteClient,
     C: CircuitBreakerState,
 {
-    async fn write(&self, op: WriteRequest) -> Result<(), RpcWriteError> {
-        let res = self.inner.write(op).await;
+    async fn write(
+        &self,
+        op: WriteRequest,
+        span_ctx: Option<SpanContext>,
+    ) -> Result<(), RpcWriteClientError> {
+        let res = self.inner.write(op, span_ctx).await;
         self.state.observe(&res);
         res
     }
@@ -164,7 +176,7 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Borrow, sync::Arc};
+    use std::sync::Arc;
 
     use crate::dml_handlers::rpc_write::client::mock::MockWriteClient;
 
@@ -173,7 +185,7 @@ mod tests {
     #[tokio::test]
     async fn test_healthy() {
         let circuit_breaker = Arc::new(MockCircuitBreaker::default());
-        let wrapper = CircuitBreakingClient::new(MockWriteClient::default(), "bananas")
+        let wrapper = CircuitBreakingClient::new(MockWriteClient::default(), "bananas", 10)
             .with_circuit_breaker(Arc::clone(&circuit_breaker));
 
         circuit_breaker.set_healthy(true);
@@ -194,26 +206,32 @@ mod tests {
     #[tokio::test]
     async fn test_observe() {
         let circuit_breaker = Arc::new(MockCircuitBreaker::default());
-        let mock_client = Arc::new(MockWriteClient::default().with_ret(Box::new(
-            [Ok(()), Err(RpcWriteError::DeletesUnsupported)].into_iter(),
-        )));
-        let wrapper = CircuitBreakingClient::new(Arc::clone(&mock_client), "bananas")
+        let mock_client = Arc::new(
+            MockWriteClient::default().with_ret(Box::new(
+                [
+                    Ok(()),
+                    Err(RpcWriteClientError::UpstreamNotConnected(
+                        "bananas".to_string(),
+                    )),
+                ]
+                .into_iter(),
+            )),
+        );
+        let wrapper = CircuitBreakingClient::new(Arc::clone(&mock_client), "bananas", 10)
             .with_circuit_breaker(Arc::clone(&circuit_breaker));
 
         assert_eq!(circuit_breaker.ok_count(), 0);
         assert_eq!(circuit_breaker.err_count(), 0);
 
         wrapper
-            .borrow()
-            .write(WriteRequest::default())
+            .write(WriteRequest::default(), None)
             .await
             .expect("wrapper should return Ok mock value");
         assert_eq!(circuit_breaker.ok_count(), 1);
         assert_eq!(circuit_breaker.err_count(), 0);
 
         wrapper
-            .borrow()
-            .write(WriteRequest::default())
+            .write(WriteRequest::default(), None)
             .await
             .expect_err("wrapper should return Err mock value");
         assert_eq!(circuit_breaker.ok_count(), 1);

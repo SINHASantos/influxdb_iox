@@ -9,12 +9,12 @@ license.workspace = true
 data_types = { path = "../data_types" }
 generated_types = { path = "../generated_types" }
 observability_deps = { path = "../observability_deps" }
-tonic = "0.8"
+tonic = { workspace = true }
 iox_catalog = { path = "../iox_catalog" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
-iox_tests = { path = "../iox_tests" }
 metric = { path = "../metric" }
+paste = "1.0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

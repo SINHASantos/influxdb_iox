@@ -1,28 +1,33 @@
-use std::{ops::DerefMut, sync::Arc};
-
 use async_trait::async_trait;
-use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use data_types::{NamespaceName, NamespaceSchema};
 use hashbrown::HashMap;
-use iox_catalog::interface::{get_schema_by_name, Catalog, SoftDeletedRows};
 use iox_time::{SystemProvider, TimeProvider};
 use mutable_batch::MutableBatch;
 use observability_deps::tracing::*;
+use std::sync::Arc;
 use thiserror::Error;
 use trace::ctx::SpanContext;
 
 use super::DmlHandler;
-use crate::namespace_cache::{metrics::InstrumentedCache, MemoryNamespaceCache, NamespaceCache};
 
 /// Errors emitted during retention validation.
 #[derive(Debug, Error)]
 pub enum RetentionError {
-    /// The requested namespace could not be found in the catalog.
-    #[error("failed to read namespace schema from catalog: {0}")]
-    NamespaceLookup(iox_catalog::interface::Error),
-
     /// Time is outside the retention period.
-    #[error("data in table {0} is outside of the retention period")]
-    OutsideRetention(String),
+    #[error(
+        "data in table {table_name} is outside of the retention period: minimum \
+        acceptable timestamp is {min_acceptable_ts}, but observed timestamp \
+        {observed_ts} is older."
+    )]
+    OutsideRetention {
+        /// The minimum row timestamp that will be considered within the
+        /// retention period.
+        min_acceptable_ts: iox_time::Time,
+        /// The timestamp in the write that exceeds the retention minimum.
+        observed_ts: iox_time::Time,
+        /// The table name in which the observed timestamp was found.
+        table_name: String,
+    },
 }
 
 /// A [`DmlHandler`] implementation that validates that the write is within the
@@ -31,36 +36,24 @@ pub enum RetentionError {
 /// Each row of data being wrote is inspected, and if any "time" column
 /// timestamp lays outside of the configured namespace retention period, the
 /// entire write is rejected.
-///
-/// Namespace retention periods are loaded from the provided [`NamespaceCache`]
-/// implementation. If a cache miss occurs, the [`Catalog`] is queried and the
-/// cache is populated.
-#[derive(Debug)]
-pub struct RetentionValidator<C = Arc<InstrumentedCache<MemoryNamespaceCache>>, P = SystemProvider>
-{
-    catalog: Arc<dyn Catalog>,
-    cache: C,
+#[derive(Debug, Default)]
+pub struct RetentionValidator<P = SystemProvider> {
     time_provider: P,
 }
 
-impl<C> RetentionValidator<C> {
+impl RetentionValidator {
     /// Initialise a new [`RetentionValidator`], rejecting time outside retention period
-    pub fn new(catalog: Arc<dyn Catalog>, cache: C) -> Self {
-        Self {
-            catalog,
-            cache,
-            time_provider: Default::default(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
 #[async_trait]
-impl<C> DmlHandler for RetentionValidator<C>
+impl<P> DmlHandler for RetentionValidator<P>
 where
-    C: NamespaceCache,
+    P: TimeProvider,
 {
     type WriteError = RetentionError;
-    type DeleteError = RetentionError;
 
     type WriteInput = HashMap<String, MutableBatch>;
     type WriteOutput = Self::WriteInput;
@@ -68,54 +61,23 @@ where
     /// Partition the per-table [`MutableBatch`].
     async fn write(
         &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        _namespace: &NamespaceName<'static>,
+        namespace_schema: Arc<NamespaceSchema>,
         batch: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
-        let mut repos = self.catalog.repositories().await;
-
-        // Load the namespace schema from the cache, falling back to pulling it
-        // from the global catalog (if it exists).
-        let schema = self.cache.get_schema(namespace);
-        let schema = match schema {
-            Some(v) => v,
-            None => {
-                // Pull the schema from the global catalog or error if it does
-                // not exist.
-                let schema = get_schema_by_name(
-                    namespace,
-                    repos.deref_mut(),
-                    SoftDeletedRows::ExcludeDeleted,
-                )
-                .await
-                .map_err(|e| {
-                    warn!(
-                        error=%e,
-                        %namespace,
-                        %namespace_id,
-                        "failed to retrieve namespace schema"
-                    );
-                    RetentionError::NamespaceLookup(e)
-                })
-                .map(Arc::new)?;
-
-                self.cache
-                    .put_schema(namespace.clone(), Arc::clone(&schema));
-
-                trace!(%namespace, "schema cache populated");
-                schema
-            }
-        };
-
         // retention is not infinte, validate all lines of a write are within the retention period
-        if let Some(retention_period_ns) = schema.retention_period_ns {
+        if let Some(retention_period_ns) = namespace_schema.retention_period_ns {
             let min_retention = self.time_provider.now().timestamp_nanos() - retention_period_ns;
             // batch is a HashMap<tring, MutableBatch>
             for (table_name, batch) in &batch {
                 if let Some(min) = batch.timestamp_summary().and_then(|v| v.stats.min) {
                     if min < min_retention {
-                        return Err(RetentionError::OutsideRetention(table_name.clone()));
+                        return Err(RetentionError::OutsideRetention {
+                            table_name: table_name.clone(),
+                            min_acceptable_ts: iox_time::Time::from_timestamp_nanos(min_retention),
+                            observed_ts: iox_time::Time::from_timestamp_nanos(min),
+                        });
                     }
                 }
             }
@@ -123,25 +85,16 @@ where
 
         Ok(batch)
     }
-
-    /// Pass the delete request through unmodified to the next handler.
-    async fn delete(
-        &self,
-        _namespace: &NamespaceName<'static>,
-        _namespace_id: NamespaceId,
-        _table_name: &str,
-        _predicate: &DeletePredicate,
-        _span_ctx: Option<SpanContext>,
-    ) -> Result<(), Self::DeleteError> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use iox_tests::{TestCatalog, TestNamespace};
-    use once_cell::sync::Lazy;
     use std::sync::Arc;
+
+    use assert_matches::assert_matches;
+    use iox_tests::{TestCatalog, TestNamespace};
+    use iox_time::MockProvider;
+    use once_cell::sync::Lazy;
 
     use super::*;
 
@@ -149,14 +102,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_time_inside_retention_period() {
-        let (catalog, namespace) = test_setup().await;
+        let namespace = test_setup().await;
 
         // Create the table so that there is a known ID that must be returned.
         let _want_id = namespace.create_table("bananas").await.table.id;
 
-        // Create the validator whse retention period is 1 hour
-        let handler =
-            RetentionValidator::new(catalog.catalog(), Arc::new(MemoryNamespaceCache::default()));
+        // Create the validator whose retention period is 1 hour
+        let handler = RetentionValidator::new();
 
         // Make time now to be inside the retention period
         let now = SystemProvider::default()
@@ -166,112 +118,124 @@ mod tests {
         let line = "bananas,tag1=A,tag2=B val=42i ".to_string() + &now;
         let writes = lp_to_writes(&line);
 
-        let result = handler
-            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
-            .await;
-
-        // no error means the time is inside the retention period
-        assert!(result.is_ok());
+        let _result = handler
+            .write(&NAMESPACE, namespace.schema().await.into(), writes, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_time_outside_retention_period() {
-        let (catalog, namespace) = test_setup().await;
+        let namespace = test_setup().await;
 
         // Create the table so that there is a known ID that must be returned.
         let _want_id = namespace.create_table("bananas").await.table.id;
 
-        // Create the validator whose retention period is 1 hour
-        let handler =
-            RetentionValidator::new(catalog.catalog(), Arc::new(MemoryNamespaceCache::default()));
+        let mock_now = iox_time::Time::from_rfc3339("2023-05-23T09:59:06+00:00").unwrap();
+        let mock_time = MockProvider::new(mock_now);
+
+        // Create the validator whse retention period is 1 hour
+        let handler = RetentionValidator {
+            time_provider: mock_time.clone(),
+        };
 
         // Make time outside the retention period
-        let two_hours_ago = (SystemProvider::default().now().timestamp_nanos()
-            - 2 * 3_600 * 1_000_000_000)
-            .to_string();
+        let two_hours_ago = (mock_now.timestamp_nanos() - 2 * 3_600 * 1_000_000_000).to_string();
         let line = "bananas,tag1=A,tag2=B val=42i ".to_string() + &two_hours_ago;
         let writes = lp_to_writes(&line);
 
         let result = handler
-            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, namespace.schema().await.into(), writes, None)
             .await;
 
         // error means the time is outside the retention period
-        assert!(result.is_err());
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("data in table bananas is outside of the retention period"));
+        assert_matches!(result, Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "data in table bananas is outside of the retention period: \
+                minimum acceptable timestamp is 2023-05-23T08:59:06+00:00, but \
+                observed timestamp 2023-05-23T07:59:06+00:00 is older."
+            )
+        });
     }
 
     #[tokio::test]
     async fn test_time_partial_inside_retention_period() {
-        let (catalog, namespace) = test_setup().await;
+        let namespace = test_setup().await;
 
         // Create the table so that there is a known ID that must be returned.
         let _want_id = namespace.create_table("bananas").await.table.id;
 
+        let mock_now = iox_time::Time::from_rfc3339("2023-05-23T09:59:06+00:00").unwrap();
+        let mock_time = MockProvider::new(mock_now);
+
         // Create the validator whse retention period is 1 hour
-        let handler =
-            RetentionValidator::new(catalog.catalog(), Arc::new(MemoryNamespaceCache::default()));
+        let handler = RetentionValidator {
+            time_provider: mock_time.clone(),
+        };
 
         // Make time now to be inside the retention period
-        let now = SystemProvider::default()
-            .now()
-            .timestamp_nanos()
-            .to_string();
+        let now = mock_now.timestamp_nanos().to_string();
         let line1 = "bananas,tag1=A,tag2=B val=42i ".to_string() + &now;
         // Make time outside the retention period
-        let two_hours_ago = (SystemProvider::default().now().timestamp_nanos()
-            - 2 * 3_600 * 1_000_000_000)
-            .to_string();
+        let two_hours_ago = (mock_now.timestamp_nanos() - 2 * 3_600 * 1_000_000_000).to_string();
         let line2 = "bananas,tag1=AA,tag2=BB val=422i ".to_string() + &two_hours_ago;
         // a lp with 2 lines, one inside and one outside retention period
         let lp = format!("{line1}\n{line2}");
 
         let writes = lp_to_writes(&lp);
         let result = handler
-            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, namespace.schema().await.into(), writes, None)
             .await;
 
         // error means the time is outside the retention period
-        assert!(result.is_err());
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("data in table bananas is outside of the retention period"));
+        assert_matches!(result, Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "data in table bananas is outside of the retention period: \
+                minimum acceptable timestamp is 2023-05-23T08:59:06+00:00, but \
+                observed timestamp 2023-05-23T07:59:06+00:00 is older."
+            )
+        });
     }
 
     #[tokio::test]
     async fn test_one_table_inside_one_table_outside_retention_period() {
-        let (catalog, namespace) = test_setup().await;
+        let namespace = test_setup().await;
 
         // Create the table so that there is a known ID that must be returned.
         let _want_id = namespace.create_table("bananas").await.table.id;
 
+        let mock_now = iox_time::Time::from_rfc3339("2023-05-23T09:59:06+00:00").unwrap();
+        let mock_time = MockProvider::new(mock_now);
+
         // Create the validator whse retention period is 1 hour
-        let handler =
-            RetentionValidator::new(catalog.catalog(), Arc::new(MemoryNamespaceCache::default()));
+        let handler = RetentionValidator {
+            time_provider: mock_time.clone(),
+        };
 
         // Make time now to be inside the retention period
-        let now = SystemProvider::default()
-            .now()
-            .timestamp_nanos()
-            .to_string();
+        let now = mock_now.timestamp_nanos().to_string();
         let line1 = "bananas,tag1=A,tag2=B val=42i ".to_string() + &now;
         // Make time outside the retention period
-        let two_hours_ago = (SystemProvider::default().now().timestamp_nanos()
-            - 2 * 3_600 * 1_000_000_000)
-            .to_string();
+        let two_hours_ago = (mock_now.timestamp_nanos() - 2 * 3_600 * 1_000_000_000).to_string();
         let line2 = "apple,tag1=AA,tag2=BB val=422i ".to_string() + &two_hours_ago;
         // a lp with 2 lines, one inside and one outside retention period
         let lp = format!("{line1}\n{line2}");
 
         let writes = lp_to_writes(&lp);
         let result = handler
-            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, namespace.schema().await.into(), writes, None)
             .await;
 
         // error means the time is outside the retention period
-        assert!(result.is_err());
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("data in table apple is outside of the retention period"));
+        assert_matches!(result, Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "data in table apple is outside of the retention period: minimum \
+                 acceptable timestamp is 2023-05-23T08:59:06+00:00, but observed \
+                 timestamp 2023-05-23T07:59:06+00:00 is older.")
+        });
     }
 
     // Parse `lp` into a table-keyed MutableBatch map.
@@ -283,10 +247,9 @@ mod tests {
 
     /// Initialise an in-memory [`MemCatalog`] and create a single namespace
     /// named [`NAMESPACE`].
-    async fn test_setup() -> (Arc<TestCatalog>, Arc<TestNamespace>) {
+    async fn test_setup() -> Arc<TestNamespace> {
         let catalog = TestCatalog::new();
-        let namespace = catalog.create_namespace_1hr_retention(&NAMESPACE).await;
 
-        (catalog, namespace)
+        catalog.create_namespace_1hr_retention(&NAMESPACE).await
     }
 }

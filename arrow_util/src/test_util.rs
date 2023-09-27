@@ -193,17 +193,17 @@ pub fn equalize_batch_schemas(batches: Vec<RecordBatch>) -> Result<Vec<RecordBat
 /// `32/51/216/13452/1d325760-2b20-48de-ab48-2267b034133d.parquet`
 ///
 /// matches `1d325760-2b20-48de-ab48-2267b034133d`
-static REGEX_UUID: Lazy<Regex> = Lazy::new(|| {
+pub static REGEX_UUID: Lazy<Regex> = Lazy::new(|| {
     Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").expect("UUID regex")
 });
 
 /// Match the parquet directory names
 /// For example, given
-/// `32/51/216/13452/1d325760-2b20-48de-ab48-2267b034133d.parquet`
+/// `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502/1d325760-2b20-48de-ab48-2267b034133d.parquet`
 ///
-/// matches `32/51/216/13452`
+/// matches `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502`
 static REGEX_DIRS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"[0-9]+/[0-9]+/[0-9]+/[0-9]+"#).expect("directory regex"));
+    Lazy::new(|| Regex::new(r#"[0-9]+/[0-9]+/[0-9a-f]+/"#).expect("directory regex"));
 
 /// Replace table row separators of flexible width with fixed with. This is required
 /// because the original timing values may differ in "printed width", so the table
@@ -221,23 +221,47 @@ static REGEX_LINESEP: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[+-]{6,}"#).expec
 ///
 ///   `        |`  -> `    |`
 ///   `         |` -> `    |`
-static REGEX_COL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\s+\|"#).expect("col regex"));
+static REGEX_COL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+\|").expect("col regex"));
 
 /// Matches line like `metrics=[foo=1, bar=2]`
 static REGEX_METRICS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"metrics=\[([^\]]*)\]"#).expect("metrics regex"));
+    Lazy::new(|| Regex::new(r"metrics=\[([^\]]*)\]").expect("metrics regex"));
 
 /// Matches things like  `1s`, `1.2ms` and `10.2μs`
 static REGEX_TIMING: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"[0-9]+(\.[0-9]+)?.s"#).expect("timing regex"));
+    Lazy::new(|| Regex::new(r"[0-9]+(\.[0-9]+)?.s").expect("timing regex"));
 
-/// Matches things like `FilterExec: time@2 < -9223372036854775808 OR time@2 > 1640995204240217000`
-static REGEX_FILTER: Lazy<Regex> =
-    Lazy::new(|| Regex::new("FilterExec: .*").expect("filter regex"));
+/// Matches things like `FilterExec: .*` and `ParquetExec: .*`
+///
+/// Should be used in combination w/ [`REGEX_TIME_OP`].
+static REGEX_FILTER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new("(?P<prefix>(FilterExec)|(ParquetExec): )(?P<expr>.*)").expect("filter regex")
+});
+
+/// Matches things like `time@3 < -9223372036854775808` and `time_min@2 > 1641031200399937022`
+static REGEX_TIME_OP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new("(?P<prefix>time((_min)|(_max))?@[0-9]+ [<>=]=? (CAST\\()?)(?P<value>-?[0-9]+)(?P<suffix> AS Timestamp\\(Nanosecond, \"[^\"]\"\\)\\))?")
+        .expect("time opt regex")
+});
 
 fn normalize_for_variable_width(s: Cow<'_, str>) -> String {
     let s = REGEX_LINESEP.replace_all(&s, "----------");
     REGEX_COL.replace_all(&s, "    |").to_string()
+}
+
+pub fn strip_table_lines(s: Cow<'_, str>) -> String {
+    let s = REGEX_LINESEP.replace_all(&s, "----------");
+    REGEX_COL.replace_all(&s, "").to_string()
+}
+
+fn normalize_time_ops(s: &str) -> String {
+    REGEX_TIME_OP
+        .replace_all(s, |c: &Captures<'_>| {
+            let prefix = c.name("prefix").expect("always captures").as_str();
+            let suffix = c.name("suffix").map_or("", |m| m.as_str());
+            format!("{prefix}<REDACTED>{suffix}")
+        })
+        .to_string()
 }
 
 /// A query to run with optional annotations
@@ -258,6 +282,9 @@ pub struct Normalizer {
     /// if true, normalize filter predicates for explain plans
     /// `FilterExec: <REDACTED>`
     pub normalized_filters: bool,
+
+    /// if `true`, render tables without borders.
+    pub no_table_borders: bool,
 }
 
 impl Normalizer {
@@ -288,11 +315,11 @@ impl Normalizer {
             current_results = current_results
                 .into_iter()
                 .map(|s| {
-                    // Rewrite  parquet directory names like
-                    // `51/216/13452/1d325760-2b20-48de-ab48-2267b034133d.parquet`
+                    // Rewrite Parquet directory names like
+                    // `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502/1d325760-2b20-48de-ab48-2267b034133d.parquet`
                     //
                     // to:
-                    // 1/1/1/1/00000000-0000-0000-0000-000000000000.parquet
+                    // 1/1/1/00000000-0000-0000-0000-000000000000.parquet
 
                     let s = REGEX_UUID.replace_all(&s, |s: &Captures<'_>| {
                         let next = seen.len() as u128;
@@ -305,7 +332,7 @@ impl Normalizer {
                     });
 
                     let s = normalize_for_variable_width(s);
-                    REGEX_DIRS.replace_all(&s, "1/1/1/1").to_string()
+                    REGEX_DIRS.replace_all(&s, "1/1/1/").to_string()
                 })
                 .collect();
         }
@@ -345,15 +372,24 @@ impl Normalizer {
         //
         // Converts:
         // FilterExec: time@2 < -9223372036854775808 OR time@2 > 1640995204240217000
+        // ParquetExec: limit=None, partitions={...}, predicate=time@2 > 1640995204240217000, pruning_predicate=time@2 > 1640995204240217000, output_ordering=[...], projection=[...]
         //
         // to
-        // FilterExec: <REDACTED>
+        // FilterExec: time@2 < <REDACTED> OR time@2 > <REDACTED>
+        // ParquetExec: limit=None, partitions={...}, predicate=time@2 > <REDACTED>, pruning_predicate=time@2 > <REDACTED>, output_ordering=[...], projection=[...]
         if self.normalized_filters {
             current_results = current_results
                 .into_iter()
                 .map(|s| {
                     REGEX_FILTER
-                        .replace_all(&s, |_: &Captures<'_>| "FilterExec: <REDACTED>")
+                        .replace_all(&s, |c: &Captures<'_>| {
+                            let prefix = c.name("prefix").expect("always captrues").as_str();
+
+                            let expr = c.name("expr").expect("always captures").as_str();
+                            let expr = normalize_time_ops(expr);
+
+                            format!("{prefix}{expr}")
+                        })
                         .to_string()
                 })
                 .collect();
@@ -375,6 +411,9 @@ impl Normalizer {
         }
         if self.normalized_filters {
             output.push("-- Results After Normalizing Filters".into())
+        }
+        if self.no_table_borders {
+            output.push("-- Results After No Table Borders".into())
         }
     }
 }

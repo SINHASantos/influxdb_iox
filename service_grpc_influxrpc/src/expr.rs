@@ -19,6 +19,7 @@ use generated_types::{
     Aggregate as RPCAggregate, Duration as RPCDuration, Node as RPCNode, Predicate as RPCPredicate,
     TimestampRange as RPCTimestampRange, Window as RPCWindow,
 };
+use prost::DecodeError;
 
 use super::{TAG_KEY_FIELD, TAG_KEY_MEASUREMENT};
 use iox_query::{Aggregate as QueryAggregate, WindowDuration};
@@ -35,11 +36,19 @@ pub enum Error {
                     aggregates.len(), aggregates))]
     AggregateNotSingleton { aggregates: Vec<RPCAggregate> },
 
-    #[snafu(display("Error creating aggregate: Unknown aggregate type {}", aggregate_type))]
-    UnknownAggregate { aggregate_type: i32 },
+    #[snafu(display(
+        "Error creating aggregate: Unknown aggregate type {aggregate_type}: {source}"
+    ))]
+    UnknownAggregate {
+        aggregate_type: i32,
+        source: DecodeError,
+    },
 
-    #[snafu(display("Error creating aggregate: Unknown group type: {}", group_type))]
-    UnknownGroup { group_type: i32 },
+    #[snafu(display("Error creating aggregate: Unknown group type {group_type}: {source}"))]
+    UnknownGroup {
+        group_type: i32,
+        source: DecodeError,
+    },
 
     #[snafu(display(
         "Incompatible read_group request: Group::None had {} group keys (expected 0)",
@@ -83,14 +92,16 @@ pub enum Error {
     ))]
     UnexpectedChildren { value: RPCValue },
 
-    #[snafu(display("Error creating predicate: Unknown logical node type: {}", logical))]
-    UnknownLogicalNode { logical: i32 },
+    #[snafu(display("Error creating predicate: Unknown logical node type {logical}: {source}"))]
+    UnknownLogicalNode { logical: i32, source: DecodeError },
 
     #[snafu(display(
-        "Error creating predicate: Unknown comparison node type: {}",
-        comparison
+        "Error creating predicate: Unknown comparison node type {comparison}: {source}",
     ))]
-    UnknownComparisonNode { comparison: i32 },
+    UnknownComparisonNode {
+        comparison: i32,
+        source: DecodeError,
+    },
 
     #[snafu(display(
         "Error creating predicate: Unsupported number of children in binary operator {:?}: {} (must be 2)",
@@ -115,6 +126,12 @@ pub enum Error {
     FieldColumnsNotSupported {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Multiple table predicate specification not yet supported: {:?}",
+        tables
+    ))]
+    MultipleTablePredicateNotSupported { tables: Vec<String> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -212,17 +229,17 @@ impl InfluxRpcPredicateBuilder {
     }
 
     /// Adds an optional table name restriction to the existing list
-    pub fn table_option(self, table: Option<String>) -> Self {
+    pub fn table_option(self, table: Option<String>) -> Result<Self> {
         if let Some(table) = table {
             self.tables(vec![table])
         } else {
-            self
+            Ok(self)
         }
     }
 
     /// Sets table name restrictions from something that can iterate
     /// over items that can be converted into `Strings`
-    pub fn tables<I, S>(mut self, tables: I) -> Self
+    pub fn tables<I, S>(mut self, tables: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -230,15 +247,17 @@ impl InfluxRpcPredicateBuilder {
         // We need to distinguish predicates like `table_name In
         // (foo, bar)` and `table_name = foo and table_name = bar` in order to handle
         // this
-        assert!(
-            self.table_names.is_none(),
-            "Multiple table predicate specification not yet supported"
-        );
+        if let Some(tables) = &self.table_names {
+            return MultipleTablePredicateNotSupportedSnafu {
+                tables: tables.iter().cloned().collect::<Vec<_>>(),
+            }
+            .fail();
+        }
 
         let table_names: BTreeSet<String> = tables.into_iter().map(|s| s.into()).collect();
 
         self.table_names = Some(table_names);
-        self
+        Ok(self)
     }
 
     pub fn build(self) -> InfluxRpcPredicate {
@@ -311,7 +330,7 @@ fn convert_simple_node(
             match DecodedTagKey::try_from(tag_name) {
                 Ok(DecodedTagKey::Measurement) => {
                     // add the table names as a predicate
-                    return Ok(builder.tables(value_list));
+                    return builder.tables(value_list);
                 }
                 Ok(DecodedTagKey::Field) => {
                     builder.inner = builder
@@ -406,6 +425,7 @@ impl InListBuilder {
         }
         // lhs OR rhs
         else if Some(RPCValue::Logical(RPCLogical::Or as i32)) == node.value {
+            #[allow(clippy::manual_try_fold)]
             node.children
                 .iter()
                 .fold(Ok(self), |res, node| res.and_then(|this| this.append(node)))
@@ -448,6 +468,7 @@ impl InListBuilder {
 /// Decoded special tag key.
 ///
 /// The storage gRPC layer uses magic special bytes to encode measurement name and field name as tag
+#[derive(Debug)]
 pub enum DecodedTagKey {
     Measurement,
     Field,
@@ -553,12 +574,12 @@ fn build_tag_ref(tag_name: Vec<u8>) -> Result<Expr> {
 
 /// Creates an expr from a "Logical" Node
 fn build_logical_node(logical: i32, inputs: Vec<Expr>) -> Result<Option<Expr>> {
-    let logical_enum = RPCLogical::from_i32(logical);
+    let logical_enum =
+        RPCLogical::try_from(logical).context(UnknownLogicalNodeSnafu { logical })?;
 
     let op = match logical_enum {
-        Some(RPCLogical::And) => Operator::And,
-        Some(RPCLogical::Or) => Operator::Or,
-        None => UnknownLogicalNodeSnafu { logical }.fail()?,
+        RPCLogical::And => Operator::And,
+        RPCLogical::Or => Operator::Or,
     };
 
     if inputs.is_empty() {
@@ -572,19 +593,19 @@ fn build_logical_node(logical: i32, inputs: Vec<Expr>) -> Result<Option<Expr>> {
 
 /// Creates an expr from a "Comparison" Node
 fn build_comparison_node(comparison: i32, inputs: Vec<Expr>) -> Result<Expr> {
-    let comparison_enum = RPCComparison::from_i32(comparison);
+    let comparison_enum =
+        RPCComparison::try_from(comparison).context(UnknownComparisonNodeSnafu { comparison })?;
 
     match comparison_enum {
-        Some(RPCComparison::Equal) => build_binary_expr(Operator::Eq, inputs),
-        Some(RPCComparison::NotEqual) => build_binary_expr(Operator::NotEq, inputs),
-        Some(RPCComparison::StartsWith) => StartsWithNotSupportedSnafu {}.fail(),
-        Some(RPCComparison::Regex) => build_regex_match_expr(true, inputs),
-        Some(RPCComparison::NotRegex) => build_regex_match_expr(false, inputs),
-        Some(RPCComparison::Lt) => build_binary_expr(Operator::Lt, inputs),
-        Some(RPCComparison::Lte) => build_binary_expr(Operator::LtEq, inputs),
-        Some(RPCComparison::Gt) => build_binary_expr(Operator::Gt, inputs),
-        Some(RPCComparison::Gte) => build_binary_expr(Operator::GtEq, inputs),
-        None => UnknownComparisonNodeSnafu { comparison }.fail(),
+        RPCComparison::Equal => build_binary_expr(Operator::Eq, inputs),
+        RPCComparison::NotEqual => build_binary_expr(Operator::NotEq, inputs),
+        RPCComparison::StartsWith => StartsWithNotSupportedSnafu {}.fail(),
+        RPCComparison::Regex => build_regex_match_expr(true, inputs),
+        RPCComparison::NotRegex => build_regex_match_expr(false, inputs),
+        RPCComparison::Lt => build_binary_expr(Operator::Lt, inputs),
+        RPCComparison::Lte => build_binary_expr(Operator::LtEq, inputs),
+        RPCComparison::Gt => build_binary_expr(Operator::Gt, inputs),
+        RPCComparison::Gte => build_binary_expr(Operator::GtEq, inputs),
     }
 }
 
@@ -741,23 +762,23 @@ fn convert_aggregate(aggregate: Option<RPCAggregate>) -> Result<QueryAggregate> 
     };
 
     let aggregate_type = aggregate.r#type;
-    let aggregate_type_enum = RPCAggregateType::from_i32(aggregate_type);
+    let aggregate_type_enum = RPCAggregateType::try_from(aggregate_type)
+        .context(UnknownAggregateSnafu { aggregate_type })?;
 
     match aggregate_type_enum {
-        Some(RPCAggregateType::None) => Ok(QueryAggregate::None),
-        Some(RPCAggregateType::Sum) => Ok(QueryAggregate::Sum),
-        Some(RPCAggregateType::Count) => Ok(QueryAggregate::Count),
-        Some(RPCAggregateType::Min) => Ok(QueryAggregate::Min),
-        Some(RPCAggregateType::Max) => Ok(QueryAggregate::Max),
-        Some(RPCAggregateType::First) => Ok(QueryAggregate::First),
-        Some(RPCAggregateType::Last) => Ok(QueryAggregate::Last),
-        Some(RPCAggregateType::Mean) => Ok(QueryAggregate::Mean),
-        None => UnknownAggregateSnafu { aggregate_type }.fail(),
+        RPCAggregateType::None => Ok(QueryAggregate::None),
+        RPCAggregateType::Sum => Ok(QueryAggregate::Sum),
+        RPCAggregateType::Count => Ok(QueryAggregate::Count),
+        RPCAggregateType::Min => Ok(QueryAggregate::Min),
+        RPCAggregateType::Max => Ok(QueryAggregate::Max),
+        RPCAggregateType::First => Ok(QueryAggregate::First),
+        RPCAggregateType::Last => Ok(QueryAggregate::Last),
+        RPCAggregateType::Mean => Ok(QueryAggregate::Mean),
     }
 }
 
-pub fn convert_group_type(group: i32) -> Result<RPCGroup> {
-    RPCGroup::from_i32(group).ok_or(Error::UnknownGroup { group_type: group })
+pub fn convert_group_type(group_type: i32) -> Result<RPCGroup> {
+    RPCGroup::try_from(group_type).context(UnknownGroupSnafu { group_type })
 }
 
 /// Creates a representation of some struct (in another crate that we
@@ -874,25 +895,25 @@ fn format_value(value: &RPCValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 }
 
 fn format_logical(v: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match RPCLogical::from_i32(v) {
-        Some(RPCLogical::And) => write!(f, "AND"),
-        Some(RPCLogical::Or) => write!(f, "Or"),
-        None => write!(f, "UNKNOWN_LOGICAL:{v}"),
+    match RPCLogical::try_from(v) {
+        Ok(RPCLogical::And) => write!(f, "AND"),
+        Ok(RPCLogical::Or) => write!(f, "Or"),
+        Err(e) => write!(f, "UNKNOWN_LOGICAL:{v} ({e})"),
     }
 }
 
 fn format_comparison(v: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match RPCComparison::from_i32(v) {
-        Some(RPCComparison::Equal) => write!(f, "=="),
-        Some(RPCComparison::NotEqual) => write!(f, "!="),
-        Some(RPCComparison::StartsWith) => write!(f, "StartsWith"),
-        Some(RPCComparison::Regex) => write!(f, "RegEx"),
-        Some(RPCComparison::NotRegex) => write!(f, "NotRegex"),
-        Some(RPCComparison::Lt) => write!(f, "<"),
-        Some(RPCComparison::Lte) => write!(f, "<="),
-        Some(RPCComparison::Gt) => write!(f, ">"),
-        Some(RPCComparison::Gte) => write!(f, ">="),
-        None => write!(f, "UNKNOWN_COMPARISON:{v}"),
+    match RPCComparison::try_from(v) {
+        Ok(RPCComparison::Equal) => write!(f, "=="),
+        Ok(RPCComparison::NotEqual) => write!(f, "!="),
+        Ok(RPCComparison::StartsWith) => write!(f, "StartsWith"),
+        Ok(RPCComparison::Regex) => write!(f, "RegEx"),
+        Ok(RPCComparison::NotRegex) => write!(f, "NotRegex"),
+        Ok(RPCComparison::Lt) => write!(f, "<"),
+        Ok(RPCComparison::Lte) => write!(f, "<="),
+        Ok(RPCComparison::Gt) => write!(f, ">"),
+        Ok(RPCComparison::Gte) => write!(f, ">="),
+        Err(e) => write!(f, "UNKNOWN_COMPARISON:{v} ({e})"),
     }
 }
 
@@ -1132,7 +1153,7 @@ mod tests {
 
         let res = InfluxRpcPredicateBuilder::default().rpc_predicate(Some(rpc_predicate));
 
-        let expected_error = "Error creating predicate: Unknown comparison node type: 42";
+        let expected_error = "Error creating predicate: Unknown comparison node type 42";
         let actual_error = res.unwrap_err().to_string();
         assert!(
             actual_error.contains(expected_error),
@@ -1161,7 +1182,7 @@ mod tests {
 
         let res = InfluxRpcPredicateBuilder::default().rpc_predicate(Some(rpc_predicate));
 
-        let expected_error = "Error creating predicate: Unknown logical node type: 42";
+        let expected_error = "Error creating predicate: Unknown logical node type 42";
         let actual_error = res.unwrap_err().to_string();
         assert!(
             actual_error.contains(expected_error),
@@ -1783,7 +1804,7 @@ mod tests {
         assert_eq!(convert_group_type(2).unwrap(), RPCGroup::By);
         assert_eq!(
             convert_group_type(1).unwrap_err().to_string(),
-            "Error creating aggregate: Unknown group type: 1"
+            "Error creating aggregate: Unknown group type 1: failed to decode Protobuf message: invalid enumeration value"
         );
     }
 
@@ -1826,7 +1847,7 @@ mod tests {
             convert_aggregate(Some(make_aggregate(100)))
                 .unwrap_err()
                 .to_string(),
-            "Error creating aggregate: Unknown aggregate type 100"
+            "Error creating aggregate: Unknown aggregate type 100: failed to decode Protobuf message: invalid enumeration value"
         );
     }
 

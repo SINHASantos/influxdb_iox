@@ -28,9 +28,6 @@ pub enum Error {
     #[error("Invalid config: {0}")]
     InvalidConfigCommon(#[from] CommonServerStateError),
 
-    #[error("Invalid config: {0}")]
-    InvalidConfigIngester(#[from] clap_blocks::querier::Error),
-
     #[error("Catalog error: {0}")]
     Catalog(#[from] iox_catalog::interface::Error),
 
@@ -42,6 +39,9 @@ pub enum Error {
 
     #[error("Querier error: {0}")]
     Querier(#[from] ioxd_querier::Error),
+
+    #[error("Authz service error: {0}")]
+    AuthzService(#[from] authz::Error),
 }
 
 #[derive(Debug, clap::Parser)]
@@ -92,25 +92,19 @@ pub async fn command(config: Config) -> Result<(), Error> {
 
     let time_provider = Arc::new(SystemProvider::new());
 
-    let num_query_threads = config.querier_config.num_query_threads();
+    let num_query_threads = config.querier_config.num_query_threads;
     let num_threads = num_query_threads.unwrap_or_else(|| {
         NonZeroUsize::new(num_cpus::get()).unwrap_or_else(|| NonZeroUsize::new(1).unwrap())
     });
     info!(%num_threads, "using specified number of threads per thread pool");
 
-    let rpc_write = std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok();
-    if rpc_write {
-        info!("using the RPC write path");
-    } else {
-        info!("using the write buffer path");
-    }
-
-    let ingester_addresses = config.querier_config.ingester_addresses()?;
+    let ingester_addresses = &config.querier_config.ingester_addresses;
     info!(?ingester_addresses, "using ingester addresses");
 
     let exec = Arc::new(Executor::new(
         num_threads,
-        config.querier_config.exec_mem_pool_bytes,
+        config.querier_config.exec_mem_pool_bytes.bytes(),
+        Arc::clone(&metric_registry),
     ));
 
     let server_type = create_querier_server_type(QuerierServerTypeArgs {
@@ -120,9 +114,12 @@ pub async fn command(config: Config) -> Result<(), Error> {
         object_store,
         exec,
         time_provider,
-        ingester_addresses,
         querier_config: config.querier_config,
-        rpc_write,
+        trace_context_header_name: config
+            .run_config
+            .tracing_config()
+            .traces_jaeger_trace_context_header_name
+            .clone(),
     })
     .await?;
 

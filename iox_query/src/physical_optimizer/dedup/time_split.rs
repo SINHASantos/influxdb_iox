@@ -8,7 +8,6 @@ use datafusion::{
     physical_plan::{union::UnionExec, ExecutionPlan},
 };
 use observability_deps::tracing::warn;
-use predicate::Predicate;
 
 use crate::{
     config::IoxConfigExt,
@@ -73,7 +72,6 @@ impl PhysicalOptimizerRule for TimeSplit {
                                     &schema,
                                     output_sort_key.as_ref(),
                                     chunks,
-                                    Predicate::new(),
                                     config.execution.target_partitions,
                                 ),
                                 dedup_exec.sort_keys().to_vec(),
@@ -105,7 +103,7 @@ mod tests {
             dedup::test_util::{chunk, dedup_plan},
             test_util::OptimizationTest,
         },
-        QueryChunkMeta,
+        QueryChunk,
     };
 
     use super::*;
@@ -114,7 +112,7 @@ mod tests {
     fn test_no_chunks() {
         let schema = chunk(1).schema().clone();
         let plan = dedup_plan(schema, vec![]);
-        let opt = TimeSplit::default();
+        let opt = TimeSplit;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -139,7 +137,7 @@ mod tests {
             .with_timestamp_min_max(8, 9);
         let schema = chunk1.schema().clone();
         let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3]);
-        let opt = TimeSplit::default();
+        let opt = TimeSplit;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -147,14 +145,14 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
           - "   UnionExec"
-          - "     RecordBatchesExec: batches_groups=2 batches=0 total_rows=0"
-          - "     ParquetExec: limit=None, partitions={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "     RecordBatchesExec: chunks=2"
+          - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
             - "   UnionExec"
-            - "     RecordBatchesExec: batches_groups=2 batches=0 total_rows=0"
-            - "     ParquetExec: limit=None, partitions={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "     RecordBatchesExec: chunks=2"
+            - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
         "###
         );
     }
@@ -178,7 +176,7 @@ mod tests {
             .with_timestamp_min_max(0, 0);
         let schema = chunk1.schema().clone();
         let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3, chunk4, chunk5, chunk6]);
-        let opt = TimeSplit::default();
+        let opt = TimeSplit;
         let mut config = ConfigOptions::default();
         config.execution.target_partitions = 2;
         insta::assert_yaml_snapshot!(
@@ -188,19 +186,19 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
           - "   UnionExec"
-          - "     RecordBatchesExec: batches_groups=2 batches=0 total_rows=0"
-          - "     ParquetExec: limit=None, partitions={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "     RecordBatchesExec: chunks=2"
+          - "     ParquetExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time]"
         output:
           Ok:
             - " UnionExec"
             - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
             - "     UnionExec"
-            - "       RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
-            - "       ParquetExec: limit=None, partitions={2 groups: [[6.parquet, 5.parquet], [3.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "       RecordBatchesExec: chunks=1"
+            - "       ParquetExec: file_groups={2 groups: [[6.parquet, 5.parquet], [3.parquet]]}, projection=[field, tag1, tag2, time]"
             - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
             - "     UnionExec"
-            - "       RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
-            - "       ParquetExec: limit=None, partitions={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "       RecordBatchesExec: chunks=1"
+            - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
         "###
         );
     }
@@ -212,7 +210,7 @@ mod tests {
         let chunk3 = chunk(3).with_timestamp_min_max(3, 3);
         let schema = chunk1.schema().clone();
         let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3]);
-        let opt = TimeSplit::default();
+        let opt = TimeSplit;
         let mut config = ConfigOptions::default();
         config.extensions.insert(IoxConfigExt {
             max_dedup_time_split: 2,
@@ -225,12 +223,12 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
           - "   UnionExec"
-          - "     RecordBatchesExec: batches_groups=3 batches=0 total_rows=0"
+          - "     RecordBatchesExec: chunks=3"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
             - "   UnionExec"
-            - "     RecordBatchesExec: batches_groups=3 batches=0 total_rows=0"
+            - "     RecordBatchesExec: chunks=3"
         "###
         );
     }

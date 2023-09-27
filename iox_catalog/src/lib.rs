@@ -1,46 +1,43 @@
 //! The IOx catalog keeps track of the namespaces, tables, columns, parquet files,
 //! and deletes in the system. Configuration information for distributing ingest, query
 //! and compaction is also stored here.
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
     missing_debug_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 
-use crate::interface::{ColumnTypeMismatchSnafu, Error, RepoCollection, Result, Transaction};
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
+use crate::interface::{ColumnTypeMismatchSnafu, Error, RepoCollection, Result};
 use data_types::{
-    ColumnType, NamespaceSchema, QueryPool, Shard, ShardId, ShardIndex, TableSchema, TopicId,
-    TopicMetadata,
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
+    ColumnType, NamespaceId, NamespaceSchema, Partition, TableSchema, TransitionPartitionId,
 };
 use mutable_batch::MutableBatch;
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap},
-};
+use std::{borrow::Cow, collections::HashMap};
 use thiserror::Error;
 
-const SHARED_TOPIC_NAME: &str = "iox-shared";
-const SHARED_TOPIC_ID: TopicId = TopicId::new(1);
-const SHARED_QUERY_POOL: &str = SHARED_TOPIC_NAME;
 const TIME_COLUMN: &str = "time";
 
-/// Default per-namespace table count service protection limit.
-pub const DEFAULT_MAX_TABLES: i32 = 500;
-/// Default per-table column count service protection limit.
-pub const DEFAULT_MAX_COLUMNS_PER_TABLE: i32 = 200;
 /// Default retention period for data in the catalog.
 pub const DEFAULT_RETENTION_PERIOD: Option<i64> = None;
 
-/// A string value representing an infinite retention policy.
 pub mod interface;
+pub(crate) mod kafkaless_transition;
 pub mod mem;
 pub mod metrics;
+pub mod migrate;
 pub mod postgres;
 pub mod sqlite;
 
@@ -64,6 +61,69 @@ impl TableScopedError {
     pub fn into_err(self) -> Error {
         self.1
     }
+}
+
+/// Look up a partition in the catalog by either database-assigned ID or deterministic hash ID.
+///
+/// The existence of this function should be temporary; it can be removed once all partition lookup
+/// is happening with only the deterministic hash ID.
+pub async fn partition_lookup<R>(
+    repos: &mut R,
+    id: &TransitionPartitionId,
+) -> Result<Option<Partition>, Error>
+where
+    R: RepoCollection + ?Sized,
+{
+    match id {
+        TransitionPartitionId::Deprecated(partition_id) => {
+            repos.partitions().get_by_id(*partition_id).await
+        }
+        TransitionPartitionId::Deterministic(partition_hash_id) => {
+            repos.partitions().get_by_hash_id(partition_hash_id).await
+        }
+    }
+}
+
+/// Look up multiple partitions in the catalog by either database-assigned ID or deterministic hash ID.
+///
+/// The output only contains existing partitions, the order is undefined.
+///
+/// The existence of this function should be temporary; it can be removed once all partition lookup
+/// is happening with only the deterministic hash ID.
+pub async fn partition_lookup_batch<R>(
+    repos: &mut R,
+    ids: &[&TransitionPartitionId],
+) -> Result<Vec<Partition>, Error>
+where
+    R: RepoCollection + ?Sized,
+{
+    let mut partition_ids = Vec::with_capacity(ids.len());
+    let mut partition_hash_ids = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        match id {
+            TransitionPartitionId::Deprecated(partition_id) => {
+                partition_ids.push(*partition_id);
+            }
+            TransitionPartitionId::Deterministic(partition_hash_id) => {
+                partition_hash_ids.push(partition_hash_id);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(partition_ids.len() + partition_hash_ids.len());
+    if !partition_ids.is_empty() {
+        let mut partitions = repos.partitions().get_by_id_batch(partition_ids).await?;
+        out.append(&mut partitions);
+    }
+    if !partition_hash_ids.is_empty() {
+        let mut partitions = repos
+            .partitions()
+            .get_by_hash_id_batch(&partition_hash_ids)
+            .await?;
+        out.append(&mut partitions);
+    }
+    Ok(out)
 }
 
 /// Given an iterator of `(table_name, batch)` to validate, this function
@@ -121,21 +181,11 @@ where
         None => {
             // The table does not exist in the cached schema.
             //
-            // Attempt to create the table in the catalog, or load an existing
-            // table from the catalog to populate the cache.
-            let mut table = repos
-                .tables()
-                .create_or_get(table_name, schema.id)
-                .await
-                .map(|t| TableSchema::new(t.id))?;
-
-            // Always add a time column to all new tables.
-            let time_col = repos
-                .columns()
-                .create_or_get(TIME_COLUMN, table.id, ColumnType::Time)
-                .await?;
-
-            table.add_column(&time_col);
+            // Attempt to load an existing table from the catalog or create a new table in the
+            // catalog to populate the cache.
+            let table =
+                table_load_or_create(repos, schema.id, &schema.partition_template, table_name)
+                    .await?;
 
             assert!(schema
                 .to_mut()
@@ -153,49 +203,13 @@ where
     // If the table itself needs to be updated during column validation it
     // becomes a Cow::owned() copy and the modified copy should be inserted into
     // the schema before returning.
-    let mut column_batch: HashMap<&str, ColumnType> = HashMap::new();
-
-    for (name, col) in mb.columns() {
-        // Check if the column exists in the cached schema.
-        //
-        // If it does, validate it. If it does not exist, create it and insert
-        // it into the cached schema.
-
-        match table.columns.get(name.as_str()) {
-            Some(existing) if existing.matches_type(col.influx_type()) => {
-                // No action is needed as the column matches the existing column
-                // schema.
-            }
-            Some(existing) => {
-                // The column schema, and the column in the mutable batch are of
-                // different types.
-                return ColumnTypeMismatchSnafu {
-                    name,
-                    existing: existing.column_type,
-                    new: col.influx_type(),
-                }
-                .fail();
-            }
-            None => {
-                // The column does not exist in the cache, add it to the column
-                // batch to be bulk inserted later.
-                let old = column_batch.insert(name.as_str(), ColumnType::from(col.influx_type()));
-                assert!(
-                    old.is_none(),
-                    "duplicate column name `{name}` in new column batch shouldn't be possible"
-                );
-            }
-        }
-    }
-
-    if !column_batch.is_empty() {
-        repos
-            .columns()
-            .create_or_get_many_unchecked(table.id, column_batch)
-            .await?
-            .into_iter()
-            .for_each(|c| table.to_mut().add_column(&c));
-    }
+    validate_and_insert_columns(
+        mb.columns()
+            .map(|(name, col)| (name, col.influx_type().into())),
+        &mut table,
+        repos,
+    )
+    .await?;
 
     if let Cow::Owned(table) = table {
         // The table schema was mutated and needs inserting into the namespace
@@ -210,37 +224,218 @@ where
     Ok(())
 }
 
-/// Creates or gets records in the catalog for the shared topic, query pool, and shards
-/// for each of the partitions.
-///
-/// Used in tests and when creating an in-memory catalog.
-pub async fn create_or_get_default_records(
-    shard_count: i32,
-    txn: &mut dyn Transaction,
-) -> Result<(TopicMetadata, QueryPool, BTreeMap<ShardId, Shard>)> {
-    let topic = txn.topics().create_or_get(SHARED_TOPIC_NAME).await?;
-    let query_pool = txn.query_pools().create_or_get(SHARED_QUERY_POOL).await?;
+// &mut Cow is used to avoid a copy, so allow it
+#[allow(clippy::ptr_arg)]
+async fn validate_and_insert_columns<R>(
+    columns: impl Iterator<Item = (&String, ColumnType)> + Send,
+    table: &mut Cow<'_, TableSchema>,
+    repos: &mut R,
+) -> Result<()>
+where
+    R: RepoCollection + ?Sized,
+{
+    let mut column_batch: HashMap<&str, ColumnType> = HashMap::new();
 
-    let mut shards = BTreeMap::new();
-    // Start at 0 to match the one write buffer shard index used in all-in-one mode
-    for shard_index in 0..shard_count {
-        let shard = txn
-            .shards()
-            .create_or_get(&topic, ShardIndex::new(shard_index))
-            .await?;
-        shards.insert(shard.id, shard);
+    for (name, column_type) in columns {
+        // Check if the column exists in the cached schema.
+        //
+        // If it does, validate it. If it does not exist, create it and insert
+        // it into the cached schema.
+
+        match table.columns.get(name.as_str()) {
+            Some(existing) if existing.column_type == column_type => {
+                // No action is needed as the column matches the existing column
+                // schema.
+            }
+            Some(existing) => {
+                // The column schema and the column in the schema change are of
+                // different types.
+                return ColumnTypeMismatchSnafu {
+                    name,
+                    existing: existing.column_type,
+                    new: column_type,
+                }
+                .fail();
+            }
+            None => {
+                // The column does not exist in the cache, add it to the column
+                // batch to be bulk inserted later.
+                let old = column_batch.insert(name.as_str(), column_type);
+                assert!(
+                    old.is_none(),
+                    "duplicate column name `{name}` in new column schema shouldn't be possible"
+                );
+            }
+        }
     }
 
-    Ok((topic, query_pool, shards))
+    if !column_batch.is_empty() {
+        repos
+            .columns()
+            .create_or_get_many_unchecked(table.id, column_batch)
+            .await?
+            .into_iter()
+            .for_each(|c| table.to_mut().add_column(c));
+    }
+
+    Ok(())
+}
+
+async fn table_load_or_create<R>(
+    repos: &mut R,
+    namespace_id: NamespaceId,
+    namespace_partition_template: &NamespacePartitionTemplateOverride,
+    table_name: &str,
+) -> Result<TableSchema>
+where
+    R: RepoCollection + ?Sized,
+{
+    let table = match repos
+        .tables()
+        .get_by_namespace_and_name(namespace_id, table_name)
+        .await?
+    {
+        Some(table) => table,
+        None => {
+            // There is a possibility of a race condition here, if another request has also
+            // created this table after the `get_by_namespace_and_name` call but before
+            // this `create` call. In that (hopefully) rare case, do an additional fetch
+            // from the catalog for the record that should now exist.
+            let create_result = repos
+                .tables()
+                .create(
+                    table_name,
+                    // This table is being created implicitly by this write, so there's no
+                    // possibility of a user-supplied partition template here, which is why there's
+                    // a hardcoded `None`. If there is a namespace template, it must be valid because
+                    // validity was checked during its creation, so that's why there's an `expect`.
+                    TablePartitionTemplateOverride::try_new(None, namespace_partition_template)
+                        .expect("no table partition template; namespace partition template has been validated"),
+                    namespace_id,
+                )
+                .await;
+            if let Err(Error::TableNameExists { .. }) = create_result {
+                repos
+                    .tables()
+                    .get_by_namespace_and_name(namespace_id, table_name)
+                    // Propagate any `Err` returned by the catalog
+                    .await?
+                    // Getting `Ok(None)` should be impossible if we're in this code path because
+                    // the `create` request just said the table exists
+                    .expect(
+                        "Table creation failed because the table exists, so looking up the table \
+                        should return `Some(table)`, but it returned `None`",
+                    )
+            } else {
+                create_result?
+            }
+        }
+    };
+
+    let mut table = TableSchema::new_empty_from(&table);
+
+    // Always add a time column to all new tables.
+    let time_col = repos
+        .columns()
+        .create_or_get(TIME_COLUMN, table.id, ColumnType::Time)
+        .await?;
+
+    table.add_column(time_col);
+
+    Ok(table)
+}
+
+/// Catalog helper functions for creation of catalog objects
+pub mod test_helpers {
+    use crate::RepoCollection;
+    use data_types::{
+        partition_template::TablePartitionTemplateOverride, ColumnId, ColumnSet, CompactionLevel,
+        Namespace, NamespaceName, ParquetFileParams, Partition, Table, Timestamp,
+    };
+    use uuid::Uuid;
+
+    /// When the details of the namespace don't matter; the test just needs *a* catalog namespace
+    /// with a particular name.
+    ///
+    /// Use [`NamespaceRepo::create`] directly if:
+    ///
+    /// - The values of the parameters to `create` need to be different than what's here
+    /// - The values of the parameters to `create` are relevant to the behavior under test
+    /// - You expect namespace creation to fail in the test
+    ///
+    /// [`NamespaceRepo::create`]: crate::interface::NamespaceRepo::create
+    pub async fn arbitrary_namespace<R: RepoCollection + ?Sized>(
+        repos: &mut R,
+        name: &str,
+    ) -> Namespace {
+        let namespace_name = NamespaceName::new(name).unwrap();
+        repos
+            .namespaces()
+            .create(&namespace_name, None, None, None)
+            .await
+            .unwrap()
+    }
+
+    /// When the details of the table don't matter; the test just needs *a* catalog table
+    /// with a particular name in a particular namespace.
+    ///
+    /// Use [`TableRepo::create`] directly if:
+    ///
+    /// - The values of the parameters to `create_or_get` need to be different than what's here
+    /// - The values of the parameters to `create_or_get` are relevant to the behavior under test
+    /// - You expect table creation to fail in the test
+    ///
+    /// [`TableRepo::create`]: crate::interface::TableRepo::create
+    pub async fn arbitrary_table<R: RepoCollection + ?Sized>(
+        repos: &mut R,
+        name: &str,
+        namespace: &Namespace,
+    ) -> Table {
+        repos
+            .tables()
+            .create(
+                name,
+                TablePartitionTemplateOverride::try_new(None, &namespace.partition_template)
+                    .unwrap(),
+                namespace.id,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// When the details of a Parquet file record don't matter, the test just needs *a* Parquet
+    /// file record in a particular namespace+table+partition.
+    pub fn arbitrary_parquet_file_params(
+        namespace: &Namespace,
+        table: &Table,
+        partition: &Partition,
+    ) -> ParquetFileParams {
+        ParquetFileParams {
+            namespace_id: namespace.id,
+            table_id: table.id,
+            partition_id: partition.transition_partition_id(),
+            object_store_id: Uuid::new_v4(),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(10),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(1),
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use super::*;
-    use crate::interface::{get_schema_by_name, SoftDeletedRows};
-    use crate::mem::MemCatalog;
+    use crate::{
+        interface::{get_schema_by_name, SoftDeletedRows},
+        mem::MemCatalog,
+    };
 
     // Generate a test that simulates multiple, sequential writes in `lp` and
     // asserts the resulting schema.
@@ -258,33 +453,18 @@ mod tests {
                 #[allow(clippy::bool_assert_comparison)]
                 #[tokio::test]
                 async fn [<test_validate_schema_ $name>]() {
-                    use crate::interface::Catalog;
+                    use crate::{interface::Catalog, test_helpers::arbitrary_namespace};
                     use std::ops::DerefMut;
                     use pretty_assertions::assert_eq;
                     const NAMESPACE_NAME: &str = "bananas";
 
                     let metrics = Arc::new(metric::Registry::default());
                     let repo = MemCatalog::new(metrics);
-                    let mut txn = repo.start_transaction().await.unwrap();
-                    let (topic, query_pool, _) = create_or_get_default_records(
-                        2,
-                        txn.deref_mut()
-                    ).await.unwrap();
+                    let mut txn = repo.repositories().await;
 
-                    let namespace = txn
-                        .namespaces()
-                        .create(NAMESPACE_NAME, None, topic.id, query_pool.id)
-                        .await
-                        .unwrap();
-
-                    let schema = NamespaceSchema::new(
-                        namespace.id,
-                        namespace.topic_id,
-                        namespace.query_pool_id,
-                        namespace.max_columns_per_table,
-                        namespace.max_tables,
-                        namespace.retention_period_ns,
-                    );
+                    let namespace = arbitrary_namespace(&mut *txn, NAMESPACE_NAME)
+                        .await;
+                    let schema = NamespaceSchema::new_empty_from(&namespace);
 
                     // Apply all the lp literals as individual writes, feeding
                     // the result of one validation into the next to drive
@@ -513,4 +693,45 @@ mod tests {
             ],
         }
     );
+
+    #[tokio::test]
+    async fn validate_table_create_race_doesnt_get_all_columns() {
+        use crate::{interface::Catalog, test_helpers::arbitrary_namespace};
+        use std::{collections::BTreeSet, ops::DerefMut};
+        const NAMESPACE_NAME: &str = "bananas";
+
+        let repo = MemCatalog::new(Default::default());
+        let mut txn = repo.repositories().await;
+        let namespace = arbitrary_namespace(&mut *txn, NAMESPACE_NAME).await;
+
+        // One cached schema has no tables.
+        let empty_schema = NamespaceSchema::new_empty_from(&namespace);
+
+        // Another cached schema gets a write that creates a table with some columns.
+        let schema_with_table = empty_schema.clone();
+        let writes = mutable_batch_lp::lines_to_batches("m1,t1=a f1=2i", 42).unwrap();
+        validate_or_insert_schema(
+            writes.iter().map(|(k, v)| (k.as_str(), v)),
+            &schema_with_table,
+            txn.deref_mut(),
+        )
+        .await
+        .unwrap();
+
+        // then the empty schema adds the same table with some different columns
+        let other_writes = mutable_batch_lp::lines_to_batches("m1,t2=a f2=2i", 43).unwrap();
+        let formerly_empty_schema = validate_or_insert_schema(
+            other_writes.iter().map(|(k, v)| (k.as_str(), v)),
+            &empty_schema,
+            txn.deref_mut(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // the formerly-empty schema should NOT have all the columns; schema convergence is handled
+        // at a higher level by the namespace cache/gossip system
+        let table = formerly_empty_schema.tables.get("m1").unwrap();
+        assert_eq!(table.columns.names(), BTreeSet::from(["t2", "f2", "time"]));
+    }
 }

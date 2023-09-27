@@ -4,23 +4,21 @@ use crate::{
     provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs, QueryChunk,
     QueryChunkData, CHUNK_ORDER_COLUMN_NAME,
 };
-use arrow::datatypes::{DataType, Schema as ArrowSchema, SchemaRef};
+use arrow::datatypes::{DataType, Fields, Schema as ArrowSchema, SchemaRef};
 use datafusion::{
-    datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl},
-    physical_expr::{execution_props::ExecutionProps, PhysicalSortExpr},
+    datasource::{
+        listing::PartitionedFile,
+        object_store::ObjectStoreUrl,
+        physical_plan::{FileScanConfig, ParquetExec},
+    },
+    physical_expr::PhysicalSortExpr,
     physical_plan::{
-        empty::EmptyExec,
-        expressions::Column,
-        file_format::{FileScanConfig, ParquetExec},
-        union::UnionExec,
-        ColumnStatistics, ExecutionPlan, Statistics,
+        empty::EmptyExec, expressions::Column, union::UnionExec, ColumnStatistics, ExecutionPlan,
+        Statistics,
     },
     scalar::ScalarValue,
 };
-use datafusion_util::create_physical_expr_from_schema;
 use object_store::ObjectMeta;
-use observability_deps::tracing::warn;
-use predicate::Predicate;
 use schema::{sort::SortKey, Schema};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -144,7 +142,6 @@ pub fn chunks_to_physical_nodes(
     schema: &SchemaRef,
     output_sort_key: Option<&SortKey>,
     chunks: Vec<Arc<dyn QueryChunk>>,
-    predicate: Predicate,
     target_partitions: usize,
 ) -> Arc<dyn ExecutionPlan> {
     if chunks.is_empty() {
@@ -167,6 +164,8 @@ pub fn chunks_to_physical_nodes(
                             .add_parquet_file(chunk, parquet_input.object_meta);
                     }
                     Entry::Vacant(v) => {
+                        // better have some instead of no sort information at all
+                        let output_sort_key = output_sort_key.or_else(|| chunk.sort_key());
                         v.insert(ParquetChunkList::new(
                             parquet_input.object_store_url,
                             chunk,
@@ -200,10 +199,14 @@ pub fn chunks_to_physical_nodes(
         // ensure that chunks are actually ordered by chunk order
         chunks.sort_by_key(|(_meta, c)| c.order());
 
-        let num_rows = chunks
-            .iter()
-            .map(|(_meta, c)| c.summary().total_count() as usize)
-            .sum::<usize>();
+        #[allow(clippy::manual_try_fold)]
+        let num_rows = chunks.iter().map(|(_meta, c)| c.stats().num_rows).fold(
+            Some(0usize),
+            |accu, x| match (accu, x) {
+                (Some(accu), Some(x)) => Some(accu + x),
+                _ => None,
+            },
+        );
         let chunk_order_min = chunks
             .iter()
             .map(|(_meta, c)| c.order().get())
@@ -238,18 +241,6 @@ pub fn chunks_to_physical_nodes(
         // Tell datafusion about the sort key, if any
         let output_ordering = sort_key.map(|sort_key| arrow_sort_key_exprs(&sort_key, schema));
 
-        let props = ExecutionProps::new();
-        let filter_expr = predicate.filter_expr()
-            .and_then(|filter_expr| {
-                match create_physical_expr_from_schema(&props, &filter_expr, schema) {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        warn!(%e, ?filter_expr, "Error creating physical filter expression, can not push down");
-                        None
-                    }
-                }
-            });
-
         let (table_partition_cols, file_schema, output_ordering) = if has_chunk_order_col {
             let table_partition_cols = vec![(CHUNK_ORDER_COLUMN_NAME.to_owned(), DataType::Int64)];
             let file_schema = Arc::new(ArrowSchema::new(
@@ -257,8 +248,8 @@ pub fn chunks_to_physical_nodes(
                     .fields
                     .iter()
                     .filter(|f| f.name() != CHUNK_ORDER_COLUMN_NAME)
-                    .cloned()
-                    .collect(),
+                    .map(Arc::clone)
+                    .collect::<Fields>(),
             ));
             let output_ordering = Some(
                 output_ordering
@@ -279,7 +270,7 @@ pub fn chunks_to_physical_nodes(
         };
 
         let statistics = Statistics {
-            num_rows: Some(num_rows),
+            num_rows,
             total_byte_size: None,
             column_statistics: Some(
                 schema
@@ -312,6 +303,9 @@ pub fn chunks_to_physical_nodes(
             is_exact: false,
         };
 
+        // No sort order is represented by an empty Vec
+        let output_ordering = vec![output_ordering.unwrap_or_default()];
+
         let base_config = FileScanConfig {
             object_store_url,
             file_schema,
@@ -325,7 +319,7 @@ pub fn chunks_to_physical_nodes(
         };
         let meta_size_hint = None;
 
-        let parquet_exec = ParquetExec::new(base_config, filter_expr, meta_size_hint);
+        let parquet_exec = ParquetExec::new(base_config, None, meta_size_hint);
         output_nodes.push(Arc::new(parquet_exec));
     }
 
@@ -361,7 +355,6 @@ mod tests {
     use crate::{
         chunk_order_field,
         test::{format_execution_plan, TestChunk},
-        QueryChunkMeta,
     };
 
     use super::*;
@@ -457,7 +450,7 @@ mod tests {
     #[test]
     fn test_chunks_to_physical_nodes_empty() {
         let schema = TestChunk::new("table").schema().as_arrow();
-        let plan = chunks_to_physical_nodes(&schema, None, vec![], Predicate::new(), 2);
+        let plan = chunks_to_physical_nodes(&schema, None, vec![], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
@@ -471,14 +464,13 @@ mod tests {
     fn test_chunks_to_physical_nodes_recordbatch() {
         let chunk = TestChunk::new("table");
         let schema = chunk.schema().as_arrow();
-        let plan =
-            chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], Predicate::new(), 2);
+        let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " UnionExec"
-        - "   RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
+        - "   RecordBatchesExec: chunks=1"
         "###
         );
     }
@@ -487,14 +479,13 @@ mod tests {
     fn test_chunks_to_physical_nodes_parquet_one_file() {
         let chunk = TestChunk::new("table").with_dummy_parquet_file();
         let schema = chunk.schema().as_arrow();
-        let plan =
-            chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], Predicate::new(), 2);
+        let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " UnionExec"
-        - "   ParquetExec: limit=None, partitions={1 group: [[0.parquet]]}, projection=[]"
+        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}"
         "###
         );
     }
@@ -509,7 +500,6 @@ mod tests {
             &schema,
             None,
             vec![Arc::new(chunk1), Arc::new(chunk2), Arc::new(chunk3)],
-            Predicate::new(),
             2,
         );
         insta::assert_yaml_snapshot!(
@@ -517,7 +507,7 @@ mod tests {
             @r###"
         ---
         - " UnionExec"
-        - "   ParquetExec: limit=None, partitions={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[]"
+        - "   ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}"
         "###
         );
     }
@@ -531,20 +521,15 @@ mod tests {
             .with_id(1)
             .with_dummy_parquet_file_and_store("iox2://");
         let schema = chunk1.schema().as_arrow();
-        let plan = chunks_to_physical_nodes(
-            &schema,
-            None,
-            vec![Arc::new(chunk1), Arc::new(chunk2)],
-            Predicate::new(),
-            2,
-        );
+        let plan =
+            chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk1), Arc::new(chunk2)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " UnionExec"
-        - "   ParquetExec: limit=None, partitions={1 group: [[0.parquet]]}, projection=[]"
-        - "   ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, projection=[]"
+        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}"
+        - "   ParquetExec: file_groups={1 group: [[1.parquet]]}"
         "###
         );
     }
@@ -554,20 +539,15 @@ mod tests {
         let chunk1 = TestChunk::new("table").with_dummy_parquet_file();
         let chunk2 = TestChunk::new("table");
         let schema = chunk1.schema().as_arrow();
-        let plan = chunks_to_physical_nodes(
-            &schema,
-            None,
-            vec![Arc::new(chunk1), Arc::new(chunk2)],
-            Predicate::new(),
-            2,
-        );
+        let plan =
+            chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk1), Arc::new(chunk2)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " UnionExec"
-        - "   RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
-        - "   ParquetExec: limit=None, partitions={1 group: [[0.parquet]]}, projection=[]"
+        - "   RecordBatchesExec: chunks=1"
+        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}"
         "###
         );
     }
@@ -586,22 +566,17 @@ mod tests {
                 .iter()
                 .cloned()
                 .chain(std::iter::once(chunk_order_field()))
-                .collect(),
+                .collect::<Fields>(),
         ));
-        let plan = chunks_to_physical_nodes(
-            &schema,
-            None,
-            vec![Arc::new(chunk1), Arc::new(chunk2)],
-            Predicate::new(),
-            2,
-        );
+        let plan =
+            chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk1), Arc::new(chunk2)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " UnionExec"
-        - "   RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
-        - "   ParquetExec: limit=None, partitions={1 group: [[0.parquet]]}, output_ordering=[__chunk_order@1 ASC], projection=[tag, __chunk_order]"
+        - "   RecordBatchesExec: chunks=1"
+        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, __chunk_order], output_ordering=[__chunk_order@1 ASC]"
         "###
         );
     }

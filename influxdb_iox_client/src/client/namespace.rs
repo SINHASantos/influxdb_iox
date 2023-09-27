@@ -7,7 +7,10 @@ use ::generated_types::google::OptionalField;
 
 /// Re-export generated_types
 pub mod generated_types {
-    pub use generated_types::influxdata::iox::namespace::v1::*;
+    pub use generated_types::influxdata::iox::{
+        namespace::v1::{update_namespace_service_protection_limit_request::LimitUpdate, *},
+        partition_template::v1::{template_part::*, *},
+    };
 }
 
 /// A basic client for working with Namespaces.
@@ -42,12 +45,16 @@ impl Client {
         &mut self,
         namespace: &str,
         retention_period_ns: Option<i64>,
+        service_protection_limits: Option<ServiceProtectionLimits>,
+        partition_template: Option<PartitionTemplate>,
     ) -> Result<Namespace, Error> {
         let response = self
             .inner
             .create_namespace(CreateNamespaceRequest {
                 name: namespace.to_string(),
                 retention_period_ns,
+                partition_template,
+                service_protection_limits,
             })
             .await?;
 
@@ -72,6 +79,30 @@ impl Client {
                 name: namespace.to_string(),
                 retention_period_ns,
             })
+            .await?;
+
+        Ok(response.into_inner().namespace.unwrap_field("namespace")?)
+    }
+
+    /// Update one of the service protection limits for a namespace
+    ///
+    /// `limit_update` is the new service limit protection limit to set
+    /// on the namespace.
+    ///
+    /// Zero-valued limits are rejected, returning an error.
+    pub async fn update_namespace_service_protection_limit(
+        &mut self,
+        namespace: &str,
+        limit_update: LimitUpdate,
+    ) -> Result<Namespace, Error> {
+        let response = self
+            .inner
+            .update_namespace_service_protection_limit(
+                UpdateNamespaceServiceProtectionLimitRequest {
+                    name: namespace.to_string(),
+                    limit_update: Some(limit_update),
+                },
+            )
             .await?;
 
         Ok(response.into_inner().namespace.unwrap_field("namespace")?)

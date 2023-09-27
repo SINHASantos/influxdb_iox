@@ -1,23 +1,21 @@
 //! APIs for testing.
 #![cfg(test)]
 
+use crate::error;
 use crate::plan::SchemaProvider;
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use chrono::{DateTime, NaiveDate, Utc};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::empty::EmptyTable;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource};
+use datafusion::physical_expr::execution_props::ExecutionProps;
 use influxdb_influxql_parser::parse_statements;
-use influxdb_influxql_parser::select::{Field, SelectStatement};
+use influxdb_influxql_parser::select::SelectStatement;
 use influxdb_influxql_parser::statement::Statement;
 use itertools::Itertools;
 use schema::{Schema, SchemaBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Returns the first `Field` of the `SELECT` statement.
-pub(crate) fn get_first_field(s: &str) -> Field {
-    parse_select(s).fields.head().unwrap().clone()
-}
 
 /// Returns the InfluxQL [`SelectStatement`] for the specified SQL, `s`.
 pub(crate) fn parse_select(s: &str) -> SelectStatement {
@@ -118,17 +116,39 @@ pub(crate) mod database {
                 .influx_field("col2", InfluxFieldType::String)
                 .build()
                 .unwrap(),
+            // Schema with all types
+            SchemaBuilder::new()
+                .measurement("all_types")
+                .timestamp()
+                .tag("tag0")
+                .influx_field("field_f64", InfluxFieldType::Float)
+                .influx_field("field_i64", InfluxFieldType::Integer)
+                .influx_field("field_u64", InfluxFieldType::UInteger)
+                .influx_field("field_str", InfluxFieldType::String)
+                .influx_field("field_bool", InfluxFieldType::Boolean)
+                .build()
+                .unwrap(),
         ]
     }
 }
 
 pub(crate) struct MockSchemaProvider {
+    execution_props: ExecutionProps,
     tables: HashMap<String, (Arc<dyn TableSource>, Schema)>,
 }
 
 impl Default for MockSchemaProvider {
     fn default() -> Self {
+        // Choose a static start time so that tests are deteministic.
+        let start_time = NaiveDate::from_ymd_opt(2023, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let start_time = DateTime::<Utc>::from_naive_utc_and_offset(start_time, Utc);
+        let mut execution_props = ExecutionProps::new();
+        execution_props.query_execution_start_time = start_time;
         let mut res = Self {
+            execution_props,
             tables: HashMap::new(),
         };
         res.add_schemas(database::schemas());
@@ -156,7 +176,7 @@ impl SchemaProvider for MockSchemaProvider {
         self.tables
             .get(name)
             .map(|(t, _)| Arc::clone(t))
-            .ok_or_else(|| DataFusionError::Plan(format!("measurement does not exist: {name}")))
+            .ok_or_else(|| error::map::query(format!("measurement does not exist: {name}")))
     }
 
     fn get_function_meta(&self, _name: &str) -> Option<Arc<ScalarUDF>> {
@@ -177,5 +197,9 @@ impl SchemaProvider for MockSchemaProvider {
 
     fn table_schema(&self, name: &str) -> Option<Schema> {
         self.tables.get(name).map(|(_, s)| s.clone())
+    }
+
+    fn execution_props(&self) -> &ExecutionProps {
+        &self.execution_props
     }
 }

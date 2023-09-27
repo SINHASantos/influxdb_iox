@@ -7,7 +7,6 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::ExecutionPlan,
 };
-use predicate::Predicate;
 use schema::{sort::SortKeyBuilder, TIME_COLUMN_NAME};
 
 use crate::{
@@ -41,7 +40,8 @@ impl PhysicalOptimizerRule for DedupNullColumns {
                 let mut children = dedup_exec.children();
                 assert_eq!(children.len(), 1);
                 let child = children.remove(0);
-                let Some((schema, chunks, _output_sort_key)) = extract_chunks(child.as_ref()) else {
+                let Some((schema, chunks, _output_sort_key)) = extract_chunks(child.as_ref())
+                else {
                     return Ok(Transformed::No(plan));
                 };
 
@@ -69,7 +69,6 @@ impl PhysicalOptimizerRule for DedupNullColumns {
                     &schema,
                     (!sort_key.is_empty()).then_some(&sort_key),
                     chunks,
-                    Predicate::new(),
                     config.execution.target_partitions,
                 );
 
@@ -104,7 +103,7 @@ mod tests {
             test_util::OptimizationTest,
         },
         test::TestChunk,
-        QueryChunkMeta,
+        QueryChunk,
     };
 
     use super::*;
@@ -113,7 +112,7 @@ mod tests {
     fn test_no_chunks() {
         let schema = chunk(1).schema().clone();
         let plan = dedup_plan(schema, vec![]);
-        let opt = DedupNullColumns::default();
+        let opt = DedupNullColumns;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -134,7 +133,7 @@ mod tests {
         let chunk = chunk(1).with_dummy_parquet_file();
         let schema = chunk.schema().clone();
         let plan = dedup_plan(schema, vec![chunk]);
-        let opt = DedupNullColumns::default();
+        let opt = DedupNullColumns;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -142,12 +141,12 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
           - "   UnionExec"
-          - "     ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
             - "   UnionExec"
-            - "     ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
         "###
         );
     }
@@ -157,7 +156,7 @@ mod tests {
         let chunk = chunk(1).with_dummy_parquet_file();
         let schema = chunk.schema().clone();
         let plan = dedup_plan_with_chunk_order_col(schema, vec![chunk]);
-        let opt = DedupNullColumns::default();
+        let opt = DedupNullColumns;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -165,12 +164,12 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
           - "   UnionExec"
-          - "     ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, output_ordering=[__chunk_order@4 ASC], projection=[field, tag1, tag2, time, __chunk_order]"
+          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
             - "   UnionExec"
-            - "     ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, output_ordering=[__chunk_order@4 ASC], projection=[field, tag1, tag2, time, __chunk_order]"
+            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "###
         );
     }
@@ -189,7 +188,7 @@ mod tests {
             .build()
             .unwrap();
         let plan = dedup_plan(schema, vec![chunk]);
-        let opt = DedupNullColumns::default();
+        let opt = DedupNullColumns;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -197,12 +196,12 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,zzz@2 ASC,time@3 ASC]"
           - "   UnionExec"
-          - "     ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
+          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@0 ASC]"
             - "   UnionExec"
-            - "     ParquetExec: limit=None, partitions={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
+            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
         "###
         );
     }
@@ -230,7 +229,7 @@ mod tests {
             .build()
             .unwrap();
         let plan = dedup_plan(schema, vec![chunk1, chunk2]);
-        let opt = DedupNullColumns::default();
+        let opt = DedupNullColumns;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -238,12 +237,12 @@ mod tests {
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,tag3@2 ASC,tag4@3 ASC,time@4 ASC]"
           - "   UnionExec"
-          - "     ParquetExec: limit=None, partitions={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
+          - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,tag3@2 ASC,time@4 ASC]"
             - "   UnionExec"
-            - "     ParquetExec: limit=None, partitions={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
+            - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
         "###
         );
     }

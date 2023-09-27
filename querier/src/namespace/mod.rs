@@ -7,23 +7,35 @@ use crate::{
     query_log::QueryLog,
     table::{PruneMetrics, QuerierTable, QuerierTableArgs},
 };
-use data_types::{NamespaceId, ShardIndex};
+use data_types::NamespaceId;
 use iox_query::exec::Executor;
-use sharder::JumpHash;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 mod query_access;
 
 #[cfg(test)]
 mod test_util;
 
+/// Arguments to create a [`QuerierNamespace`].
+#[derive(Debug)]
+pub struct QuerierNamespaceArgs {
+    pub chunk_adapter: Arc<ChunkAdapter>,
+    pub ns: Arc<CachedNamespace>,
+    pub name: Arc<str>,
+    pub exec: Arc<Executor>,
+    pub ingester_connection: Option<Arc<dyn IngesterConnection>>,
+    pub query_log: Arc<QueryLog>,
+    pub prune_metrics: Arc<PruneMetrics>,
+    pub datafusion_config: Arc<HashMap<String, String>>,
+    pub include_debug_info_tables: bool,
+}
+
 /// Maps a catalog namespace to all the in-memory resources and sync-state that the querier needs.
 ///
 /// # Data Structures & Sync
 ///
 /// Tables and schemas are created when [`QuerierNamespace`] is created because DataFusion does not
-/// implement async schema inspection. The actual payload (chunks and tombstones) are only queried
-/// on demand.
+/// implement async schema inspection. The actual payload (chunks) is only queried on demand.
 ///
 /// Most accesses to the [IOx Catalog](iox_catalog::interface::Catalog) are cached via
 /// [`CatalogCache`].
@@ -46,27 +58,37 @@ pub struct QuerierNamespace {
 
     /// Query log.
     query_log: Arc<QueryLog>,
+
+    /// DataFusion config.
+    datafusion_config: Arc<HashMap<String, String>>,
+
+    /// Include debug info tables.
+    include_debug_info_tables: bool,
+
+    /// Retention period.
+    retention_period: Option<Duration>,
 }
 
 impl QuerierNamespace {
     /// Create new namespace for given schema.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chunk_adapter: Arc<ChunkAdapter>,
-        ns: Arc<CachedNamespace>,
-        name: Arc<str>,
-        exec: Arc<Executor>,
-        ingester_connection: Option<Arc<dyn IngesterConnection>>,
-        query_log: Arc<QueryLog>,
-        sharder: Option<Arc<JumpHash<Arc<ShardIndex>>>>,
-        prune_metrics: Arc<PruneMetrics>,
-    ) -> Self {
+    pub fn new(args: QuerierNamespaceArgs) -> Self {
+        let QuerierNamespaceArgs {
+            chunk_adapter,
+            ns,
+            name,
+            exec,
+            ingester_connection,
+            query_log,
+            prune_metrics,
+            datafusion_config,
+            include_debug_info_tables,
+        } = args;
+
         let tables: HashMap<_, _> = ns
             .tables
             .iter()
             .map(|(table_name, cached_table)| {
                 let table = Arc::new(QuerierTable::new(QuerierTableArgs {
-                    sharder: sharder.clone(),
                     namespace_id: ns.id,
                     namespace_name: Arc::clone(&name),
                     namespace_retention_period: ns.retention_period,
@@ -75,7 +97,6 @@ impl QuerierNamespace {
                     schema: cached_table.schema.clone(),
                     ingester_connection: ingester_connection.clone(),
                     chunk_adapter: Arc::clone(&chunk_adapter),
-                    exec: Arc::clone(&exec),
                     prune_metrics: Arc::clone(&prune_metrics),
                 }));
 
@@ -92,11 +113,13 @@ impl QuerierNamespace {
             exec,
             catalog_cache: Arc::clone(chunk_adapter.catalog_cache()),
             query_log,
+            datafusion_config,
+            include_debug_info_tables,
+            retention_period: ns.retention_period,
         }
     }
 
     /// Create new namespace for given schema, for testing.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_testing(
         catalog_cache: Arc<CatalogCache>,
         metric_registry: Arc<metric::Registry>,
@@ -104,24 +127,23 @@ impl QuerierNamespace {
         ns: Arc<CachedNamespace>,
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
-        sharder: Arc<JumpHash<Arc<ShardIndex>>>,
-        write_rpc: bool,
     ) -> Self {
         let time_provider = catalog_cache.time_provider();
-        let chunk_adapter = Arc::new(ChunkAdapter::new(catalog_cache, metric_registry, write_rpc));
+        let prune_metrics = Arc::new(PruneMetrics::new(&metric_registry));
+        let chunk_adapter = Arc::new(ChunkAdapter::new(catalog_cache, Arc::clone(&prune_metrics)));
         let query_log = Arc::new(QueryLog::new(10, time_provider));
-        let prune_metrics = Arc::new(PruneMetrics::new(&chunk_adapter.metric_registry()));
 
-        Self::new(
+        Self::new(QuerierNamespaceArgs {
             chunk_adapter,
             ns,
             name,
             exec,
             ingester_connection,
             query_log,
-            Some(sharder),
             prune_metrics,
-        )
+            datafusion_config: Default::default(),
+            include_debug_info_tables: true,
+        })
     }
 
     /// Namespace name.

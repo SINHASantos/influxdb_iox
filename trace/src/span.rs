@@ -58,27 +58,26 @@ impl Span {
     }
 
     /// Record an event on this `Span`
-    pub fn event(&mut self, meta: impl Into<Cow<'static, str>>) {
-        let event = SpanEvent {
-            time: Utc::now(),
-            msg: meta.into(),
-        };
-        self.events.push(event)
+    pub fn event(&mut self, event: SpanEvent) {
+        self.events.push(event);
     }
 
     /// Record success on this `Span` setting the status if it isn't already set
-    pub fn ok(&mut self, meta: impl Into<Cow<'static, str>>) {
-        self.event(meta);
-        if self.status == SpanStatus::Unknown {
-            self.status = SpanStatus::Ok;
-        }
+    pub fn ok(&mut self, msg: impl Into<Cow<'static, str>>) {
+        self.event(SpanEvent::new(msg));
+        self.status(SpanStatus::Ok);
     }
 
     /// Record an error on this `Span` setting the status if it isn't already set
-    pub fn error(&mut self, meta: impl Into<Cow<'static, str>>) {
-        self.event(meta);
+    pub fn error(&mut self, msg: impl Into<Cow<'static, str>>) {
+        self.event(SpanEvent::new(msg));
+        self.status(SpanStatus::Err);
+    }
+
+    /// Set status of `Span`
+    pub fn status(&mut self, status: SpanStatus) {
         if self.status == SpanStatus::Unknown {
-            self.status = SpanStatus::Err;
+            self.status = status;
         }
     }
 
@@ -90,6 +89,11 @@ impl Span {
     }
 
     /// Create a new child span with the specified name
+    ///
+    /// Note that the created Span will not be emitted
+    /// automatically. The caller must explicitly call [`Self::export`].
+    ///
+    /// See [`SpanRecorder`] for a helper that automatically emits span data.
     pub fn child(&self, name: impl Into<Cow<'static, str>>) -> Self {
         self.ctx.child(name)
     }
@@ -105,6 +109,25 @@ pub struct SpanEvent {
     pub time: DateTime<Utc>,
 
     pub msg: Cow<'static, str>,
+
+    pub metadata: HashMap<Cow<'static, str>, MetaValue>,
+}
+
+impl SpanEvent {
+    /// Create new event.
+    pub fn new(msg: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            time: Utc::now(),
+            msg: msg.into(),
+            // assume no metadata by default
+            metadata: HashMap::with_capacity(0),
+        }
+    }
+
+    /// Set meta data.
+    pub fn set_metadata(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<MetaValue>) {
+        self.metadata.insert(key.into(), value.into());
+    }
 }
 
 /// Values that can be stored in a Span's metadata and events
@@ -149,10 +172,10 @@ impl From<i64> for MetaValue {
     }
 }
 
-/// `SpanRecorder` is a utility for instrumenting code that produces `Span`
+/// Utility for instrumenting code that produces [`Span`].
 ///
-/// If a `SpanRecorder` is created from a `Span` it will update the start timestamp
-/// of the span on creation, and on Drop will set the finish time and call `Span::export`
+/// If a [`SpanRecorder`] is created from a [`Span`] it will update the start timestamp
+/// of the span on creation, and on Drop will set the finish time and call [`Span::export`]
 ///
 /// If not created with a `Span`, e.g. this request is not being sampled, all operations
 /// called on this `SpanRecorder` will be a no-op
@@ -178,9 +201,9 @@ impl SpanRecorder {
     }
 
     /// Record an event on the contained `Span` if any
-    pub fn event(&mut self, meta: impl Into<Cow<'static, str>>) {
+    pub fn event(&mut self, event: SpanEvent) {
         if let Some(span) = self.span.as_mut() {
-            span.event(meta)
+            span.event(event);
         }
     }
 
@@ -198,6 +221,13 @@ impl SpanRecorder {
         }
     }
 
+    /// Set status of contained `Span` if any
+    pub fn status(&mut self, status: SpanStatus) {
+        if let Some(span) = self.span.as_mut() {
+            span.status(status);
+        }
+    }
+
     /// Take the contents of this recorder returning a new recorder
     ///
     /// From this point on `self` will behave as if it were created with no span
@@ -207,7 +237,7 @@ impl SpanRecorder {
 
     /// If this `SpanRecorder` has a `Span`, creates a new child of that `Span` and
     /// returns a `SpanRecorder` for it. Otherwise returns an empty `SpanRecorder`
-    pub fn child(&self, name: &'static str) -> Self {
+    pub fn child(&self, name: impl Into<Cow<'static, str>>) -> Self {
         Self::new(self.child_span(name))
     }
 
@@ -219,7 +249,7 @@ impl SpanRecorder {
 
     /// Return a child span of the specified name, if this SpanRecorder
     /// has an active span, `None` otherwise.
-    pub fn child_span(&self, name: &'static str) -> Option<Span> {
+    pub fn child_span(&self, name: impl Into<Cow<'static, str>>) -> Option<Span> {
         self.span.as_ref().map(|span| span.child(name))
     }
 

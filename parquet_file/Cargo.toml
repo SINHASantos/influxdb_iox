@@ -8,25 +8,28 @@ license.workspace = true
 [dependencies] # In alphabetical order
 arrow = { workspace = true, features = ["prettyprint"] }
 base64 = "0.21"
-bytes = "1.4"
+bytes = "1.5"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
 futures = "0.3"
 generated_types = { path = "../generated_types" }
 iox_time = { path = "../iox_time" }
-object_store = "0.5.5"
+object_store = { workspace = true }
 observability_deps = { path = "../observability_deps" }
-parking_lot = "0.12"
 parquet = { workspace = true, features = ["experimental"]}
-pbjson-types = "0.5"
-predicate = { path = "../predicate" }
-prost = "0.11"
+pbjson-types = { workspace = true }
+prost = { workspace = true }
 schema = { path = "../schema" }
 snafu = "0.7"
-thiserror = "1.0.39"
+thiserror = "1.0.49"
 thrift = "0.17"
-tokio = { version = "1.26", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1.32", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.12"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+
+[dev-dependencies] # In alphabetical order
+rand = "0.8.3"
+test_helpers = { version = "0.1.0", path = "../test_helpers" }

@@ -1,5 +1,6 @@
 use std::{convert::Infallible, num::NonZeroI32, sync::Arc};
 
+use authz::http::AuthorizationHeaderExtension;
 use hyper::{
     http::HeaderValue,
     server::conn::{AddrIncoming, AddrStream},
@@ -7,7 +8,6 @@ use hyper::{
 };
 use observability_deps::tracing::{debug, error};
 use serde::Deserialize;
-use server_util::authorization::AuthorizationHeaderExtension;
 use snafu::Snafu;
 use tokio_util::sync::CancellationToken;
 use tower::Layer;
@@ -97,7 +97,13 @@ pub async fn serve(
     let metric_registry = server_type.metric_registry();
     let trace_collector = server_type.trace_collector();
 
-    let trace_layer = TraceLayer::new(trace_header_parser, metric_registry, trace_collector, false);
+    let trace_layer = TraceLayer::new(
+        trace_header_parser,
+        metric_registry,
+        trace_collector,
+        false,
+        server_type.name(),
+    );
 
     hyper::Server::builder(addr)
         .serve(hyper::service::make_service_fn(|_conn: &AddrStream| {

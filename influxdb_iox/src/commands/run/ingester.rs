@@ -1,41 +1,43 @@
-//! Implementation of command line option for running ingester
+//! Command line options for running an ingester for a router using the RPC write path to talk to.
 
-use clap_blocks::object_store::make_object_store;
+use std::{num::NonZeroUsize, sync::Arc};
+
 use clap_blocks::{
-    catalog_dsn::CatalogDsnConfig, ingester::IngesterConfig, run_config::RunConfig,
-    write_buffer::WriteBufferConfig,
+    catalog_dsn::CatalogDsnConfig, ingester::IngesterConfig, object_store::make_object_store,
+    run_config::RunConfig,
 };
 use iox_query::exec::Executor;
 use iox_time::{SystemProvider, TimeProvider};
-use ioxd_common::server_type::{CommonServerState, CommonServerStateError};
-use ioxd_common::Service;
+use ioxd_common::{
+    server_type::{CommonServerState, CommonServerStateError},
+    Service,
+};
 use ioxd_ingester::create_ingester_server_type;
 use object_store::DynObjectStore;
 use object_store_metrics::ObjectStoreMetrics;
 use observability_deps::tracing::*;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use panic_logging::make_panics_fatal;
+use parquet_file::storage::{ParquetStorage, StorageId};
 use thiserror::Error;
 
-use crate::process_info::{setup_metric_registry, USIZE_MAX};
-
 use super::main;
+use crate::process_info::{setup_metric_registry, USIZE_MAX};
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("Run: {0}")]
+    #[error("run: {0}")]
     Run(#[from] main::Error),
 
-    #[error("Invalid config: {0}")]
+    #[error("invalid config: {0}")]
     InvalidConfig(#[from] CommonServerStateError),
 
-    #[error("Cannot parse object store config: {0}")]
+    #[error("cannot parse object store config: {0}")]
     ObjectStoreParsing(#[from] clap_blocks::object_store::ParseError),
 
     #[error("error initializing ingester: {0}")]
     Ingester(#[from] ioxd_ingester::Error),
 
-    #[error("Catalog DSN error: {0}")]
+    #[error("catalog DSN error: {0}")]
     CatalogDsn(#[from] clap_blocks::catalog_dsn::Error),
 }
 
@@ -63,19 +65,17 @@ pub struct Config {
     pub(crate) catalog_dsn: CatalogDsnConfig,
 
     #[clap(flatten)]
-    pub(crate) write_buffer_config: WriteBufferConfig,
-
-    #[clap(flatten)]
     pub(crate) ingester_config: IngesterConfig,
 
-    /// Number of threads to use for the ingester query execution, compaction and persistence.
+    /// Specify the size of the thread-pool for query execution, and the
+    /// separate compaction thread-pool.
     #[clap(
-        long = "query-exec-thread-count",
-        env = "INFLUXDB_IOX_QUERY_EXEC_THREAD_COUNT",
-        default_value = "4",
+        long = "exec-thread-count",
+        env = "INFLUXDB_IOX_EXEC_THREAD_COUNT",
+        default_value = as_clap_str(half_cores()),
         action
     )]
-    pub query_exec_thread_count: NonZeroUsize,
+    pub exec_thread_count: NonZeroUsize,
 
     /// Size of memory pool used during query exec, in bytes.
     #[clap(
@@ -84,19 +84,27 @@ pub struct Config {
         default_value = &USIZE_MAX[..],
         action
     )]
-    pub exec_mem_pool_bytes: usize,
+    exec_mem_pool_bytes: usize,
+}
+
+/// Returns exactly half the number of logical cores, or 1 if on a single core
+/// system.
+fn half_cores() -> usize {
+    std::cmp::max(num_cpus::get() / 2, 1)
+}
+
+fn as_clap_str(v: usize) -> clap::builder::OsStr {
+    clap::builder::OsStr::from(std::ffi::OsString::from(v.to_string()))
 }
 
 pub async fn command(config: Config) -> Result<()> {
-    if std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok() {
-        panic!(
-            "`INFLUXDB_IOX_RPC_MODE` was specified but `ingester` was the command run. Either unset
-             `INFLUXDB_IOX_RPC_MODE` or run the `ingester2` command."
-        );
-    }
+    // Ensure panics (even in threads or tokio tasks) are fatal when
+    // running in this server mode.  This is done to avoid potential
+    // data corruption because there is no foolproof way to recover
+    // state after a panic.
+    make_panics_fatal();
 
     let common_state = CommonServerState::from_config(config.run_config.clone())?;
-
     let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
     let metric_registry = setup_metric_registry();
 
@@ -105,6 +113,11 @@ pub async fn command(config: Config) -> Result<()> {
         .get_catalog("ingester", Arc::clone(&metric_registry))
         .await?;
 
+    let exec = Arc::new(Executor::new(
+        config.exec_thread_count,
+        config.exec_mem_pool_bytes,
+        Arc::clone(&metric_registry),
+    ));
     let object_store = make_object_store(config.run_config.object_store_config())
         .map_err(Error::ObjectStoreParsing)?;
 
@@ -115,18 +128,13 @@ pub async fn command(config: Config) -> Result<()> {
         &metric_registry,
     ));
 
-    let exec = Arc::new(Executor::new(
-        config.query_exec_thread_count,
-        config.exec_mem_pool_bytes,
-    ));
     let server_type = create_ingester_server_type(
         &common_state,
-        Arc::clone(&metric_registry),
         catalog,
-        object_store,
+        Arc::clone(&metric_registry),
+        &config.ingester_config,
         exec,
-        &config.write_buffer_config,
-        config.ingester_config,
+        ParquetStorage::new(object_store, StorageId::from("iox")),
     )
     .await?;
 

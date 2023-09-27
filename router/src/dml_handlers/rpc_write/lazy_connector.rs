@@ -20,8 +20,9 @@ use tonic::{
     transport::{Channel, Endpoint},
     Code,
 };
+use trace::ctx::SpanContext;
 
-use super::{client::WriteClient, RpcWriteError};
+use super::client::{RpcWriteClientError, TracePropagatingWriteClient, WriteClient};
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -30,29 +31,45 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// (at most once per [`RETRY_INTERVAL]).
 const RECONNECT_ERROR_COUNT: usize = 10;
 
+/// Define a safe maximum ingester write response size.
+const MAX_INCOMING_MSG_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Lazy [`Channel`] connector.
 ///
 /// Connections are attempted in a background thread every [`RETRY_INTERVAL`].
 /// once a connection has been established, the [`Channel`] internally handles
 /// reconnections as needed.
 ///
-/// Returns [`RpcWriteError::UpstreamNotConnected`] when no connection is
+/// Returns [`RpcWriteClientError::UpstreamNotConnected`] when no connection is
 /// available.
 #[derive(Debug)]
 pub struct LazyConnector {
     addr: Endpoint,
     connection: Arc<Mutex<Option<Channel>>>,
 
+    /// The maximum outgoing message size.
+    ///
+    /// The incoming size remains bounded at [`MAX_INCOMING_MSG_BYTES`] as the
+    /// ingester SHOULD NOT ever generate a response larger than this.
+    max_outgoing_msg_bytes: usize,
+
     /// The number of request errors observed without a single success.
     consecutive_errors: Arc<AtomicUsize>,
     /// A task that periodically opens a new connection to `addr` when
     /// `consecutive_errors` is more than [`RECONNECT_ERROR_COUNT`].
     connection_task: JoinHandle<()>,
+
+    trace_context_header_name: String,
 }
 
 impl LazyConnector {
     /// Lazily connect to `addr`.
-    pub fn new(addr: Endpoint, request_timeout: Duration) -> Self {
+    pub fn new(
+        addr: Endpoint,
+        request_timeout: Duration,
+        max_outgoing_msg_bytes: usize,
+        trace_context_header_name: String,
+    ) -> Self {
         let addr = addr
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(request_timeout);
@@ -62,6 +79,7 @@ impl LazyConnector {
         let consecutive_errors = Arc::new(AtomicUsize::new(RECONNECT_ERROR_COUNT + 1));
         Self {
             addr: addr.clone(),
+            max_outgoing_msg_bytes,
             connection: Arc::clone(&connection),
             connection_task: tokio::spawn(try_connect(
                 addr,
@@ -69,6 +87,7 @@ impl LazyConnector {
                 Arc::clone(&consecutive_errors),
             )),
             consecutive_errors,
+            trace_context_header_name,
         }
     }
 
@@ -84,12 +103,25 @@ impl LazyConnector {
 
 #[async_trait]
 impl WriteClient for LazyConnector {
-    async fn write(&self, op: WriteRequest) -> Result<(), RpcWriteError> {
+    async fn write(
+        &self,
+        op: WriteRequest,
+        span_ctx: Option<SpanContext>,
+    ) -> Result<(), RpcWriteClientError> {
         let conn = self.connection.lock().clone();
-        let conn =
-            conn.ok_or_else(|| RpcWriteError::UpstreamNotConnected(self.addr.uri().to_string()))?;
+        let conn = conn.ok_or_else(|| {
+            RpcWriteClientError::UpstreamNotConnected(self.addr.uri().to_string())
+        })?;
 
-        match WriteServiceClient::new(conn).write(op).await {
+        match TracePropagatingWriteClient::new(
+            WriteServiceClient::new(conn)
+                .max_encoding_message_size(self.max_outgoing_msg_bytes)
+                .max_decoding_message_size(MAX_INCOMING_MSG_BYTES),
+            &self.trace_context_header_name,
+        )
+        .write(op, span_ctx)
+        .await
+        {
             Err(e) if is_envoy_unavailable_error(&e) => {
                 warn!(error=%e, "detected envoy proxy upstream network error translation, reconnecting");
                 self.consecutive_errors
@@ -117,20 +149,17 @@ impl WriteClient for LazyConnector {
 /// HTTP proxy would. Unfortunately this is a breaking change in behaviour for
 /// networking code like [`tonic`]'s transport implementation, which can no
 /// longer easily differentiate network errors from actual application errors.
-fn is_envoy_unavailable_error(e: &RpcWriteError) -> bool {
+fn is_envoy_unavailable_error(e: &RpcWriteClientError) -> bool {
     match e {
-        RpcWriteError::Upstream(e) if e.code() == Code::Unavailable => e
+        RpcWriteClientError::Upstream(e) if e.code() == Code::Unavailable => e
             .metadata()
             .get("server")
             .map(|v| v == AsciiMetadataValue::from_static("envoy"))
             .unwrap_or(false),
-        RpcWriteError::Upstream(_)
-        | RpcWriteError::Timeout(_)
-        | RpcWriteError::NoUpstreams
-        | RpcWriteError::UpstreamNotConnected(_)
-        | RpcWriteError::DeletesUnsupported
-        | RpcWriteError::PartialWrite { .. }
-        | RpcWriteError::NotEnoughReplicas => false,
+        RpcWriteClientError::Upstream(_) => false,
+        RpcWriteClientError::MisconfiguredMetadataKey(_) => false,
+        RpcWriteClientError::MisconfiguredMetadataValue(_) => false,
+        RpcWriteClientError::UpstreamNotConnected(_) => unreachable!(),
     }
 }
 

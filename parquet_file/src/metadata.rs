@@ -90,8 +90,8 @@ use base64::{prelude::BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, InfluxDbType, NamespaceId,
-    ParquetFileParams, PartitionId, PartitionKey, SequenceNumber, ShardId, StatValues, Statistics,
-    TableId, Timestamp,
+    ParquetFileParams, PartitionKey, StatValues, Statistics, TableId, Timestamp,
+    TransitionPartitionId,
 };
 use generated_types::influxdata::iox::ingester::v1 as proto;
 use iox_time::Time;
@@ -218,6 +218,9 @@ pub enum Error {
     #[snafu(display("Field missing while parsing IOx metadata: {}", field))]
     IoxMetadataFieldMissing { field: String },
 
+    #[snafu(display("Cannot parse timestamp from parquet metadata: {}", e))]
+    IoxInvalidTimestamp { e: String },
+
     #[snafu(display("Cannot parse IOx metadata from Protobuf: {}", source))]
     IoxMetadataBroken {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
@@ -262,23 +265,14 @@ pub struct IoxMetadata {
     /// namespace name of the data
     pub namespace_name: Arc<str>,
 
-    /// shard id of the data
-    pub shard_id: ShardId,
-
     /// table id of the data
     pub table_id: TableId,
 
     /// table name of the data
     pub table_name: Arc<str>,
 
-    /// partition id of the data
-    pub partition_id: PartitionId,
-
-    /// parittion key of the data
+    /// partition key of the data
     pub partition_key: PartitionKey,
-
-    /// sequence number of the last write
-    pub max_sequence_number: SequenceNumber,
 
     /// The compaction level of the file.
     ///
@@ -339,12 +333,9 @@ impl IoxMetadata {
             creation_timestamp: Some(self.creation_timestamp.date_time().into()),
             namespace_id: self.namespace_id.get(),
             namespace_name: self.namespace_name.to_string(),
-            shard_id: self.shard_id.get(),
             table_id: self.table_id.get(),
             table_name: self.table_name.to_string(),
-            partition_id: self.partition_id.get(),
             partition_key: self.partition_key.to_string(),
-            max_sequence_number: self.max_sequence_number.get(),
             sort_key,
             compaction_level: self.compaction_level as i32,
             max_l0_created_at: Some(self.max_l0_created_at.date_time().into()),
@@ -392,12 +383,9 @@ impl IoxMetadata {
             creation_timestamp,
             namespace_id: NamespaceId::new(proto_msg.namespace_id),
             namespace_name,
-            shard_id: ShardId::new(proto_msg.shard_id),
             table_id: TableId::new(proto_msg.table_id),
             table_name,
-            partition_id: PartitionId::new(proto_msg.partition_id),
             partition_key,
-            max_sequence_number: SequenceNumber::new(proto_msg.max_sequence_number),
             sort_key,
             compaction_level: proto_msg.compaction_level.try_into().context(
                 InvalidCompactionLevelSnafu {
@@ -418,12 +406,9 @@ impl IoxMetadata {
             creation_timestamp: Time::from_timestamp_nanos(creation_timestamp_ns),
             namespace_id: NamespaceId::new(1),
             namespace_name: "external".into(),
-            shard_id: ShardId::new(1),
             table_id: TableId::new(1),
             table_name: table_name.into(),
-            partition_id: PartitionId::new(1),
             partition_key: "unknown".into(),
-            max_sequence_number: SequenceNumber::new(1),
             compaction_level: CompactionLevel::Initial,
             sort_key: None,
             max_l0_created_at: Time::from_timestamp_nanos(creation_timestamp_ns),
@@ -452,7 +437,7 @@ impl IoxMetadata {
     /// [`RecordBatch`]: arrow::record_batch::RecordBatch
     pub fn to_parquet_file<F>(
         &self,
-        partition_id: PartitionId,
+        partition_id: TransitionPartitionId,
         file_size_bytes: usize,
         metadata: &IoxParquetMetaData,
         column_id_map: F,
@@ -501,12 +486,10 @@ impl IoxMetadata {
         };
 
         ParquetFileParams {
-            shard_id: self.shard_id,
             namespace_id: self.namespace_id,
             table_id: self.table_id,
-            partition_id: self.partition_id,
+            partition_id,
             object_store_id: self.object_store_id,
-            max_sequence_number: self.max_sequence_number,
             min_time,
             max_time,
             file_size_bytes: file_size_bytes as i64,
@@ -554,8 +537,7 @@ fn decode_timestamp_from_field(
     let date_time = value
         .context(IoxMetadataFieldMissingSnafu { field })?
         .try_into()
-        .map_err(|e| Box::new(e) as _)
-        .context(IoxMetadataBrokenSnafu)?;
+        .map_err(|e: &str| Error::IoxInvalidTimestamp { e: e.to_string() })?;
 
     Ok(Time::from_date_time(date_time))
 }
@@ -870,7 +852,7 @@ fn read_statistics_from_parquet_row_group(
 }
 
 fn combine_column_summaries(total: &mut Vec<ColumnSummary>, other: Vec<ColumnSummary>) {
-    for col in total.iter_mut() {
+    for col in &mut *total {
         if let Some(other_col) = other.iter().find(|c| c.name == col.name) {
             col.update_from(other_col);
         }
@@ -1004,8 +986,8 @@ mod tests {
         record_batch::RecordBatch,
     };
     use data_types::CompactionLevel;
-    use datafusion_util::MemoryStream;
-    use schema::builder::SchemaBuilder;
+    use datafusion_util::{unbounded_memory_pool, MemoryStream};
+    use schema::{builder::SchemaBuilder, TIME_DATA_TIMEZONE};
 
     #[test]
     fn iox_metadata_protobuf_round_trip() {
@@ -1020,12 +1002,9 @@ mod tests {
             creation_timestamp: create_time,
             namespace_id: NamespaceId::new(2),
             namespace_name: Arc::from("hi"),
-            shard_id: ShardId::new(1),
             table_id: TableId::new(3),
             table_name: Arc::from("weather"),
-            partition_id: PartitionId::new(4),
             partition_key: PartitionKey::from("part"),
-            max_sequence_number: SequenceNumber::new(6),
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key),
             max_l0_created_at: create_time,
@@ -1045,12 +1024,9 @@ mod tests {
             creation_timestamp: Time::from_timestamp_nanos(42),
             namespace_id: NamespaceId::new(1),
             namespace_name: "bananas".into(),
-            shard_id: ShardId::new(2),
             table_id: TableId::new(3),
             table_name: "platanos".into(),
-            partition_id: PartitionId::new(4),
             partition_key: "potato".into(),
-            max_sequence_number: SequenceNumber::new(11),
             compaction_level: CompactionLevel::FileNonOverlapped,
             sort_key: None,
             max_l0_created_at: Time::from_timestamp_nanos(42),
@@ -1074,9 +1050,10 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![data, timestamps]).unwrap();
         let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
 
-        let (bytes, file_meta) = crate::serialize::to_parquet_bytes(stream, &meta)
-            .await
-            .expect("should serialize");
+        let (bytes, file_meta) =
+            crate::serialize::to_parquet_bytes(stream, &meta, unbounded_memory_pool())
+                .await
+                .expect("should serialize");
 
         // Verify if the parquet file meta data has values
         assert!(!file_meta.row_groups.is_empty());
@@ -1126,7 +1103,11 @@ mod tests {
     }
 
     fn to_timestamp_array(timestamps: &[i64]) -> ArrayRef {
-        let array: TimestampNanosecondArray = timestamps.iter().map(|v| Some(*v)).collect();
+        let array = timestamps
+            .iter()
+            .map(|v| Some(*v))
+            .collect::<TimestampNanosecondArray>()
+            .with_timezone_opt(TIME_DATA_TIMEZONE());
         Arc::new(array)
     }
 }

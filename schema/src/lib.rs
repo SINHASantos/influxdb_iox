@@ -1,4 +1,22 @@
 //! This module contains the schema definition for IOx
+
+#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
+#![allow(clippy::clone_on_ref_ptr)]
+#![warn(
+    missing_copy_implementations,
+    missing_debug_implementations,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro,
+    unused_crate_dependencies
+)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -9,8 +27,8 @@ use std::{
 };
 
 use arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-    SchemaRef as ArrowSchemaRef, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
+    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use hashbrown::HashSet;
 
@@ -27,12 +45,12 @@ pub const INFLUXQL_METADATA_KEY: &str = "iox::influxql::group_key::metadata";
 
 /// The Timezone to use for InfluxDB timezone (should be a constant)
 #[allow(non_snake_case)]
-pub fn TIME_DATA_TIMEZONE() -> Option<String> {
+pub fn TIME_DATA_TIMEZONE() -> Option<Arc<str>> {
     // TODO: we should use the "UTC" timezone as that is what the
     // InfluxDB data model timestamps are relative to. However,
     // DataFusion doesn't currently do a great job with such
     // timezones so punting for now
-    //Some(String::from("UTC"));
+    //Some("UTC".into());
     None
 }
 
@@ -288,6 +306,11 @@ impl Schema {
         self.find_index_of(name).map(|index| self.field(index))
     }
 
+    /// Return the [`InfluxColumnType`] for the field identified by `name`.
+    pub fn field_type_by_name(&self, name: &str) -> Option<InfluxColumnType> {
+        self.field_by_name(name).map(|(t, _)| t)
+    }
+
     /// Find the index of the column with the given name, if any.
     pub fn find_index_of(&self, name: &str) -> Option<usize> {
         self.inner.index_of(name).ok()
@@ -355,7 +378,7 @@ impl Schema {
     /// Resort order of our columns lexicographically by name
     pub fn sort_fields_by_name(self) -> Self {
         // pairs of (orig_index, field_ref)
-        let mut sorted_fields: Vec<(usize, &ArrowField)> =
+        let mut sorted_fields: Vec<(usize, &ArrowFieldRef)> =
             self.inner.fields().iter().enumerate().collect();
         sorted_fields.sort_by(|a, b| a.1.name().cmp(b.1.name()));
 
@@ -369,8 +392,7 @@ impl Schema {
         } else {
             // No way at present to destructure an existing Schema so
             // we have to copy :(
-            let new_fields: Vec<ArrowField> =
-                sorted_fields.iter().map(|pair| pair.1).cloned().collect();
+            let new_fields: Fields = sorted_fields.iter().map(|pair| pair.1).cloned().collect();
 
             let new_meta = self.inner.metadata().clone();
             let new_schema = ArrowSchema::new_with_metadata(new_fields, new_meta);
@@ -502,19 +524,7 @@ impl Schema {
 
         let size_inner = size_of_val(self.inner.as_ref());
 
-        let fields = self.inner.fields();
-        let size_fields = fields.capacity() * size_of::<arrow::datatypes::Field>()
-            + fields
-                .iter()
-                .map(|field| {
-                    field.name().capacity()
-                        + field
-                            .metadata()
-                            .iter()
-                            .map(|(k, v)| k.capacity() + v.capacity())
-                            .sum::<usize>()
-                })
-                .sum::<usize>();
+        let size_fields = self.inner.fields().size();
 
         let metadata = self.inner.metadata();
         let size_metadata = metadata.capacity() * size_of::<(String, String)>()
@@ -639,10 +649,19 @@ impl InfluxColumnType {
                 }
                 _ => false,
             },
-            Self::Field(_) | Self::Timestamp => {
+            Self::Field(_) => {
                 let default_type: ArrowDataType = self.into();
                 data_type == &default_type
             }
+            Self::Timestamp => match data_type {
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => true,
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
+                    if tz.as_ref() == "UTC" =>
+                {
+                    true
+                }
+                _ => false,
+            },
         }
     }
 }
@@ -1376,6 +1395,6 @@ mod test {
             .unwrap();
 
         // this is mostly a smoke test
-        assert_eq!(schema.estimate_size(), 843);
+        assert_eq!(schema.estimate_size(), 1243);
     }
 }

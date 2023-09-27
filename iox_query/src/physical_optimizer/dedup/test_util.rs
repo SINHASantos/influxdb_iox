@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use arrow::datatypes::Schema as ArrowSchema;
+use arrow::datatypes::{Fields, Schema as ArrowSchema};
 use datafusion::physical_plan::ExecutionPlan;
-use predicate::Predicate;
 use schema::Schema;
 
 use crate::{
@@ -41,12 +40,12 @@ fn dedup_plan_impl(
                 .iter()
                 .cloned()
                 .chain(std::iter::once(chunk_order_field()))
-                .collect(),
+                .collect::<Fields>(),
         ))
     } else {
         schema.as_arrow()
     };
-    let plan = chunks_to_physical_nodes(&arrow_schema, None, chunks, Predicate::new(), 2);
+    let plan = chunks_to_physical_nodes(&arrow_schema, None, chunks, 2);
 
     let sort_key = schema::sort::SortKey::from_columns(schema.primary_key());
     let sort_exprs = arrow_sort_key_exprs(&sort_key, &plan.schema());

@@ -9,6 +9,7 @@ use super::{
     split::StreamSplitNode,
 };
 use crate::{
+    config::IoxConfigExt,
     exec::{
         fieldlist::{FieldList, IntoFieldList},
         non_null_checker::NonNullCheckerExec,
@@ -32,7 +33,7 @@ use crate::{
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::catalog::CatalogProvider,
+    catalog::CatalogProvider,
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
         memory_pool::MemoryPool,
@@ -40,28 +41,25 @@ use datafusion::{
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
-        coalesce_partitions::CoalescePartitionsExec,
-        displayable,
-        planner::{DefaultPhysicalPlanner, ExtensionPlanner},
-        stream::RecordBatchStreamAdapter,
-        EmptyRecordBatchStream, ExecutionPlan, PhysicalPlanner, RecordBatchStream,
-        SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
+        EmptyRecordBatchStream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
     },
+    physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::*,
 };
 use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
 use executor::DedicatedExecutor;
 use futures::{Stream, StreamExt, TryStreamExt};
-use observability_deps::tracing::debug;
+use observability_deps::tracing::{debug, warn};
 use query_functions::{register_scalar_functions, selectors::register_selector_aggregates};
-use std::{convert::TryInto, fmt, num::NonZeroUsize, sync::Arc};
+use std::{fmt, num::NonZeroUsize, sync::Arc};
 use trace::{
     ctx::SpanContext,
-    span::{MetaValue, Span, SpanExt, SpanRecorder},
+    span::{MetaValue, Span, SpanEvent, SpanExt, SpanRecorder},
 };
 
 // Reuse DataFusion error and Result types for this module
-pub use datafusion::error::{DataFusionError as Error, Result};
+pub use datafusion::error::{DataFusionError, Result};
 
 /// This structure implements the DataFusion notion of "query planner"
 /// and is needed to create plans with the IOx extension nodes.
@@ -188,7 +186,11 @@ impl fmt::Debug for IOxSessionConfig {
 
 impl IOxSessionConfig {
     pub(super) fn new(exec: DedicatedExecutor, runtime: Arc<RuntimeEnv>) -> Self {
-        let session_config = iox_session_config();
+        let mut session_config = iox_session_config();
+        session_config
+            .options_mut()
+            .extensions
+            .insert(IoxConfigExt::default());
 
         Self {
             exec,
@@ -218,6 +220,26 @@ impl IOxSessionConfig {
     /// Set the span context from which to create  distributed tracing spans for this query
     pub fn with_span_context(self, span_ctx: Option<SpanContext>) -> Self {
         Self { span_ctx, ..self }
+    }
+
+    /// Set DataFusion [config option].
+    ///
+    /// May be used to set [IOx-specific] option as well.
+    ///
+    ///
+    /// [config option]: datafusion::common::config::ConfigOptions
+    /// [IOx-specific]: crate::config::IoxConfigExt
+    pub fn with_config_option(mut self, key: &str, value: &str) -> Self {
+        // ignore invalid config
+        if let Err(e) = self.session_config.options_mut().set(key, value) {
+            warn!(
+                key,
+                value,
+                %e,
+                "invalid DataFusion config",
+            );
+        }
+        self
     }
 
     /// Create an ExecutionContext suitable for executing DataFusion plans
@@ -320,8 +342,14 @@ impl IOxSessionContext {
     pub async fn sql_to_logical_plan(&self, sql: &str) -> Result<LogicalPlan> {
         let ctx = self.child_ctx("sql_to_logical_plan");
         debug!(text=%sql, "planning SQL query");
-        // NOTE can not use ctx.inner.sql() here as it also interprets DDL
-        ctx.inner.state().create_logical_plan(sql).await
+        let plan = ctx.inner.state().create_logical_plan(sql).await?;
+        // ensure the plan does not contain unwanted statements
+        let verifier = SQLOptions::new()
+            .with_allow_ddl(false) // no CREATE ...
+            .with_allow_dml(false) // no INSERT or COPY
+            .with_allow_statements(false); // no SET VARIABLE, etc
+        verifier.verify_plan(&plan)?;
+        Ok(plan)
     }
 
     /// Create a logical plan that reads a single [`RecordBatch`]. Use
@@ -346,36 +374,12 @@ impl IOxSessionContext {
         &self,
         logical_plan: &LogicalPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Make nicer erorrs for unsupported SQL
-        // (By default datafusion returns Internal Error)
-        match &logical_plan {
-            LogicalPlan::CreateCatalog(_) => {
-                return Err(Error::NotImplemented("CreateCatalog".to_string()));
-            }
-            LogicalPlan::CreateCatalogSchema(_) => {
-                return Err(Error::NotImplemented("CreateCatalogSchema".to_string()));
-            }
-            LogicalPlan::CreateMemoryTable(_) => {
-                return Err(Error::NotImplemented("CreateMemoryTable".to_string()));
-            }
-            LogicalPlan::DropTable(_) => {
-                return Err(Error::NotImplemented("DropTable".to_string()));
-            }
-            LogicalPlan::DropView(_) => {
-                return Err(Error::NotImplemented("DropView".to_string()));
-            }
-            LogicalPlan::CreateView(_) => {
-                return Err(Error::NotImplemented("CreateView".to_string()));
-            }
-            _ => (),
-        }
-
         let mut ctx = self.child_ctx("create_physical_plan");
         debug!(text=%logical_plan.display_indent_schema(), "create_physical_plan: initial plan");
         let physical_plan = ctx.inner.state().create_physical_plan(logical_plan).await?;
 
-        ctx.recorder.event("physical plan");
-        debug!(text=%displayable(physical_plan.as_ref()).indent(), "create_physical_plan: plan to run");
+        ctx.recorder.event(SpanEvent::new("physical plan"));
+        debug!(text=%displayable(physical_plan.as_ref()).indent(false), "create_physical_plan: plan to run");
         Ok(physical_plan)
     }
 
@@ -384,7 +388,7 @@ impl IOxSessionContext {
     pub async fn collect(&self, physical_plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
         debug!(
             "Running plan, physical:\n{}",
-            displayable(physical_plan.as_ref()).indent()
+            displayable(physical_plan.as_ref()).indent(false)
         );
         let ctx = self.child_ctx("collect");
         let stream = ctx.execute_stream(physical_plan).await?;
@@ -459,6 +463,7 @@ impl IOxSessionContext {
         &self,
         series_set_plans: SeriesSetPlans,
         memory_pool: Arc<dyn MemoryPool>,
+        points_per_batch: usize,
     ) -> Result<impl Stream<Item = Result<Either>>> {
         let SeriesSetPlans {
             mut plans,
@@ -501,11 +506,11 @@ impl IOxSessionContext {
                     })
                     .await?;
 
-                    Ok::<_, Error>(CrossRtStream::new_with_df_error_stream(stream, exec))
+                    Ok::<_, DataFusionError>(CrossRtStream::new_with_df_error_stream(stream, exec))
                 }
             })
             .try_flatten()
-            .try_filter_map(|series_set: SeriesSet| async move {
+            .try_filter_map(move |series_set: SeriesSet| async move {
                 // If all timestamps of returned columns are nulls,
                 // there must be no data. We need to check this because
                 // aggregate (e.g. count, min, max) returns one row that are
@@ -516,9 +521,10 @@ impl IOxSessionContext {
                     return Ok(None);
                 }
 
-                let series: Vec<Series> = series_set
-                    .try_into()
-                    .map_err(|e| Error::Execution(format!("Error converting to series: {e}")))?;
+                let series: Vec<Series> =
+                    series_set.try_into_series(points_per_batch).map_err(|e| {
+                        DataFusionError::Execution(format!("Error converting to series: {e}"))
+                    })?;
                 Ok(Some(futures::stream::iter(series).map(Ok)))
             })
             .try_flatten();
@@ -554,9 +560,9 @@ impl IOxSessionContext {
                             .await?
                             .into_fieldlist()
                             .map_err(|e| {
-                                Error::Context(
+                                DataFusionError::Context(
                                     "Error converting to field list".to_string(),
-                                    Box::new(Error::External(Box::new(e))),
+                                    Box::new(DataFusionError::External(Box::new(e))),
                                 )
                             })?;
 
@@ -581,9 +587,9 @@ impl IOxSessionContext {
 
         // TODO: Stream this
         results.into_fieldlist().map_err(|e| {
-            Error::Context(
+            DataFusionError::Context(
                 "Error converting to field list".to_string(),
-                Box::new(Error::External(Box::new(e))),
+                Box::new(DataFusionError::External(Box::new(e))),
             )
         })
     }
@@ -599,9 +605,9 @@ impl IOxSessionContext {
                 .await?
                 .into_stringset()
                 .map_err(|e| {
-                    Error::Context(
+                    DataFusionError::Context(
                         "Error converting to stringset".to_string(),
-                        Box::new(Error::External(Box::new(e))),
+                        Box::new(DataFusionError::External(Box::new(e))),
                     )
                 }),
         }
@@ -647,9 +653,9 @@ impl IOxSessionContext {
         T: Send + 'static,
     {
         exec.spawn(fut).await.unwrap_or_else(|e| {
-            Err(Error::Context(
+            Err(DataFusionError::Context(
                 "Join Error".to_string(),
-                Box::new(Error::External(e.into())),
+                Box::new(DataFusionError::External(Box::new(e))),
             ))
         })
     }
@@ -665,7 +671,7 @@ impl IOxSessionContext {
 
     /// Record an event on the span recorder
     pub fn record_event(&mut self, name: &'static str) {
-        self.recorder.event(name);
+        self.recorder.event(SpanEvent::new(name));
     }
 
     /// Record an event on the span recorder
@@ -676,6 +682,11 @@ impl IOxSessionContext {
     /// Returns the current [`Span`] if any
     pub fn span(&self) -> Option<&Span> {
         self.recorder.span()
+    }
+
+    /// Returns a new child span of the current context
+    pub fn child_span(&self, name: &'static str) -> Option<Span> {
+        self.recorder.child_span(name)
     }
 
     /// Number of currently active tasks.

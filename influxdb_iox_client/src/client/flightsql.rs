@@ -29,8 +29,10 @@ use arrow_flight::{
     error::{FlightError, Result},
     sql::{
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, Any,
-        CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes,
-        CommandGetTables, CommandPreparedStatementQuery, CommandStatementQuery, ProstMessageExt,
+        CommandGetCatalogs, CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys,
+        CommandGetImportedKeys, CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes,
+        CommandGetTables, CommandGetXdbcTypeInfo, CommandPreparedStatementQuery,
+        CommandStatementQuery, ProstMessageExt,
     },
     Action, FlightClient, FlightDescriptor, FlightInfo, IpcMessage, Ticket,
 };
@@ -126,6 +128,7 @@ impl FlightSqlClient {
     ) -> Result<FlightRecordBatchStream> {
         let msg = CommandStatementQuery {
             query: query.into(),
+            transaction_id: None,
         };
         self.do_get_with_cmd(msg.as_any()).await
     }
@@ -149,6 +152,56 @@ impl FlightSqlClient {
     /// [`CommandGetCatalogs`]: https://github.com/apache/arrow/blob/3a6fc1f9eedd41df2d8ffbcbdfbdab911ff6d82e/format/FlightSql.proto#L1125-L1140
     pub async fn get_catalogs(&mut self) -> Result<FlightRecordBatchStream> {
         let msg = CommandGetCatalogs {};
+        self.do_get_with_cmd(msg.as_any()).await
+    }
+
+    /// List a description of the foreign key columns in the given foreign key table that
+    /// reference the primary key or the columns representing a unique constraint of the
+    /// parent table (could be the same or a different table) on this server using a
+    /// [`CommandGetCrossReference`] message.
+    ///
+    /// # Parameters
+    ///
+    /// Definition from <https://github.com/apache/arrow/blob/f0c8229f5a09fe53186df171d518430243ddf112/format/FlightSql.proto#L1405-L1477>
+    ///
+    /// pk_catalog: The catalog name where the parent table is.
+    /// An empty string retrieves those without a catalog.
+    /// If omitted the catalog name should not be used to narrow the search.
+    ///
+    /// pk_db_schema: The Schema name where the parent table is.
+    /// An empty string retrieves those without a schema.
+    /// If omitted the schema name should not be used to narrow the search.
+    ///
+    /// pk_table: The parent table name. It cannot be null.
+    ///
+    /// fk_catalog: The catalog name where the foreign table is.
+    /// An empty string retrieves those without a catalog.
+    /// If omitted the catalog name should not be used to narrow the search.
+    ///
+    /// fk_db_schema: The schema name where the foreign table is.
+    /// An empty string retrieves those without a schema.
+    /// If omitted the schema name should not be used to narrow the search.
+    ///
+    /// fk_table: The foreign table name. It cannot be null.
+    ///
+    /// This implementation does not support alternate endpoints
+    pub async fn get_cross_reference(
+        &mut self,
+        pk_catalog: Option<impl Into<String> + Send>,
+        pk_db_schema: Option<impl Into<String> + Send>,
+        pk_table: String,
+        fk_catalog: Option<impl Into<String> + Send>,
+        fk_db_schema: Option<impl Into<String> + Send>,
+        fk_table: String,
+    ) -> Result<FlightRecordBatchStream> {
+        let msg = CommandGetCrossReference {
+            pk_catalog: pk_catalog.map(|s| s.into()),
+            pk_db_schema: pk_db_schema.map(|s| s.into()),
+            pk_table,
+            fk_catalog: fk_catalog.map(|s| s.into()),
+            fk_db_schema: fk_db_schema.map(|s| s.into()),
+            fk_table,
+        };
         self.do_get_with_cmd(msg.as_any()).await
     }
 
@@ -177,6 +230,102 @@ impl FlightSqlClient {
         let msg = CommandGetDbSchemas {
             catalog: catalog.map(|s| s.into()),
             db_schema_filter_pattern: db_schema_filter_pattern.map(|s| s.into()),
+        };
+        self.do_get_with_cmd(msg.as_any()).await
+    }
+
+    /// List a description of the foreign key columns that reference the given
+    /// table's primary key columns (the foreign keys exported by a table) of a
+    /// table on this server using a [`CommandGetExportedKeys`] message.
+    ///
+    /// # Parameters
+    ///
+    /// Definition from <https://github.com/apache/arrow/blob/0434ab65075ecd1d2ab9245bcd7ec6038934ed29/format/FlightSql.proto#L1307-L1352>
+    ///
+    /// catalog: Specifies the catalog to search for the foreign key table.
+    /// An empty string retrieves those without a catalog.
+    /// If omitted the catalog name should not be used to narrow the search.
+    ///
+    /// db_schema: Specifies the schema to search for the foreign key table.
+    /// An empty string retrieves those without a schema.
+    /// If omitted the schema name should not be used to narrow the search.
+    ///
+    /// table: Specifies the foreign key table to get the foreign keys for.
+    ///
+    /// This implementation does not support alternate endpoints
+    pub async fn get_exported_keys(
+        &mut self,
+        catalog: Option<impl Into<String> + Send>,
+        db_schema: Option<impl Into<String> + Send>,
+        table: String,
+    ) -> Result<FlightRecordBatchStream> {
+        let msg = CommandGetExportedKeys {
+            catalog: catalog.map(|s| s.into()),
+            db_schema: db_schema.map(|s| s.into()),
+            table,
+        };
+        self.do_get_with_cmd(msg.as_any()).await
+    }
+
+    /// List the foreign keys of a table on this server using a
+    /// [`CommandGetImportedKeys`] message.
+    ///
+    /// # Parameters
+    ///
+    /// Definition from <https://github.com/apache/arrow/blob/196222dbd543d6931f4a1432845add97be0db802/format/FlightSql.proto#L1354-L1403>
+    ///
+    /// catalog: Specifies the catalog to search for the primary key table.
+    /// An empty string retrieves those without a catalog.
+    /// If omitted the catalog name should not be used to narrow the search.
+    ///
+    /// db_schema: Specifies the schema to search for the primary key table.
+    /// An empty string retrieves those without a schema.
+    /// If omitted the schema name should not be used to narrow the search.
+    ///
+    /// table: Specifies the primary key table to get the foreign keys for.
+    ///
+    /// This implementation does not support alternate endpoints
+    pub async fn get_imported_keys(
+        &mut self,
+        catalog: Option<impl Into<String> + Send>,
+        db_schema: Option<impl Into<String> + Send>,
+        table: String,
+    ) -> Result<FlightRecordBatchStream> {
+        let msg = CommandGetImportedKeys {
+            catalog: catalog.map(|s| s.into()),
+            db_schema: db_schema.map(|s| s.into()),
+            table,
+        };
+        self.do_get_with_cmd(msg.as_any()).await
+    }
+
+    /// List the primary keys on this server using a [`CommandGetPrimaryKeys`] message.
+    ///
+    /// # Parameters
+    ///
+    /// Definition from <https://github.com/apache/arrow/blob/2fe17338e2d1f85d0c2685d31d2dd51f138b6b80/format/FlightSql.proto#L1261-L1297>
+    ///
+    /// catalog: Specifies the catalog to search for the table.
+    /// An empty string retrieves those without a catalog.
+    /// If omitted the catalog name should not be used to narrow the search.
+    ///
+    /// db_schema: Specifies the schema to search for the table.
+    /// An empty string retrieves those without a schema.
+    /// If omitted the schema name should not be used to narrow the search.
+    ///
+    /// table: Specifies the table to get the primary keys for.
+    ///
+    /// This implementation does not support alternate endpoints
+    pub async fn get_primary_keys(
+        &mut self,
+        catalog: Option<impl Into<String> + Send>,
+        db_schema: Option<impl Into<String> + Send>,
+        table: String,
+    ) -> Result<FlightRecordBatchStream> {
+        let msg = CommandGetPrimaryKeys {
+            catalog: catalog.map(|s| s.into()),
+            db_schema: db_schema.map(|s| s.into()),
+            table,
         };
         self.do_get_with_cmd(msg.as_any()).await
     }
@@ -214,6 +363,26 @@ impl FlightSqlClient {
         self.do_get_with_cmd(msg.as_any()).await
     }
 
+    /// List information about data type supported on this server
+    /// using a [`CommandGetXdbcTypeInfo`] message.
+    ///
+    /// # Parameters
+    ///
+    /// Definition from <https://github.com/apache/arrow/blob/9588da967c756b2923e213ccc067378ba6c90a86/format/FlightSql.proto#L1058-L1123>
+    ///
+    /// data_type: Specifies the data type to search for the info.
+    ///
+    /// This implementation does not support alternate endpoints
+    pub async fn get_xdbc_type_info(
+        &mut self,
+        data_type: Option<impl Into<i32> + Send>,
+    ) -> Result<FlightRecordBatchStream> {
+        let msg = CommandGetXdbcTypeInfo {
+            data_type: data_type.map(|dt| dt.into()),
+        };
+        self.do_get_with_cmd(msg.as_any()).await
+    }
+
     /// Implements the canonical interaction for most FlightSQL messages:
     ///
     /// 1. Call `GetFlightInfo` with the provided message, and get a
@@ -232,6 +401,7 @@ impl FlightSqlClient {
             mut endpoint,
             total_records: _,
             total_bytes: _,
+            ordered: _,
         } = self.get_flight_info_for_command(cmd).await?;
 
         let flight_endpoint = endpoint.pop().ok_or_else(|| {
@@ -278,7 +448,10 @@ impl FlightSqlClient {
     ///
     /// See [`Self::execute`] to run a previously prepared statement
     pub async fn prepare(&mut self, query: String) -> Result<PreparedStatement> {
-        let cmd = ActionCreatePreparedStatementRequest { query };
+        let cmd = ActionCreatePreparedStatementRequest {
+            query,
+            transaction_id: None,
+        };
 
         let request = Action {
             r#type: "CreatePreparedStatement".into(),

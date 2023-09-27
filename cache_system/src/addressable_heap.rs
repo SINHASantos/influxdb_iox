@@ -1,6 +1,6 @@
 //! Implementation of an [`AddressableHeap`].
 use std::{
-    collections::{hash_map, HashMap, VecDeque},
+    collections::{hash_map, BTreeSet, HashMap},
     hash::Hash,
 };
 
@@ -28,7 +28,7 @@ where
     /// The order goes first, the key goes second.
     ///
     /// Note: This is not really a heap, but it fulfills the interface that we need.
-    queue: VecDeque<(O, K)>,
+    queue: BTreeSet<(O, K)>,
 }
 
 impl<K, V, O> AddressableHeap<K, V, O>
@@ -40,7 +40,7 @@ where
     pub fn new() -> Self {
         Self {
             key_to_order_and_value: HashMap::new(),
-            queue: VecDeque::new(),
+            queue: BTreeSet::new(),
         }
     }
 
@@ -56,54 +56,40 @@ where
     ///
     /// If the element (compared by `K`) already exists, it will be returned.
     pub fn insert(&mut self, k: K, v: V, o: O) -> Option<(V, O)> {
-        let result = match self.key_to_order_and_value.entry(k.clone()) {
+        let (result, k) = match self.key_to_order_and_value.entry(k.clone()) {
             hash_map::Entry::Occupied(mut entry_o) => {
                 // `entry_o.replace_entry(...)` is not stabel yet, see https://github.com/rust-lang/rust/issues/44286
                 let mut tmp = (v, o.clone());
                 std::mem::swap(&mut tmp, entry_o.get_mut());
                 let (v_old, o_old) = tmp;
 
-                let index = self
-                    .queue
-                    .binary_search_by_key(&(&o_old, &k), project_tuple)
-                    .expect("key was in key_to_order");
-                self.queue.remove(index);
+                let query = (o_old, k);
+                let existed = self.queue.remove(&query);
+                assert!(existed, "key was in key_to_order");
+                let (o_old, k) = query;
 
-                Some((v_old, o_old))
+                (Some((v_old, o_old)), k)
             }
             hash_map::Entry::Vacant(entry_v) => {
                 entry_v.insert((v, o.clone()));
-                None
+                (None, k)
             }
         };
 
-        match self.queue.binary_search_by_key(&(&o, &k), project_tuple) {
-            Ok(_) => unreachable!("entry should have been removed by now"),
-            Err(index) => {
-                self.queue.insert(index, (o, k));
-            }
-        }
+        let inserted = self.queue.insert((o, k));
+        assert!(inserted, "entry should have been removed by now");
 
         result
     }
 
     /// Peek first element (by smallest `O`).
     pub fn peek(&self) -> Option<(&K, &V, &O)> {
-        if let Some((o, k)) = self.queue.front() {
-            let (v, o2) = self
-                .key_to_order_and_value
-                .get(k)
-                .expect("value is in queue");
-            assert!(o == o2);
-            Some((k, v, o))
-        } else {
-            None
-        }
+        self.iter().next()
     }
 
     /// Pop first element (by smallest `O`) from heap.
     pub fn pop(&mut self) -> Option<(K, V, O)> {
-        if let Some((o, k)) = self.queue.pop_front() {
+        if let Some((o, k)) = self.queue.pop_first() {
             let (v, o2) = self
                 .key_to_order_and_value
                 .remove(&k)
@@ -112,6 +98,16 @@ where
             Some((k, v, o))
         } else {
             None
+        }
+    }
+
+    /// Iterate over elements in order of `O` (starting at smallest).
+    ///
+    /// This is equivalent to calling [`pop`](Self::pop) multiple times, but does NOT modify the collection.
+    pub fn iter(&self) -> AddressableHeapIter<'_, K, V, O> {
+        AddressableHeapIter {
+            key_to_order_and_value: &self.key_to_order_and_value,
+            queue_iter: self.queue.iter(),
         }
     }
 
@@ -124,12 +120,11 @@ where
     ///
     /// If the element exists within the heap (addressed via `K`), the value and order will be returned.
     pub fn remove(&mut self, k: &K) -> Option<(V, O)> {
-        if let Some((v, o)) = self.key_to_order_and_value.remove(k) {
-            let index = self
-                .queue
-                .binary_search_by_key(&(&o, k), project_tuple)
-                .expect("key was in key_to_order");
-            self.queue.remove(index);
+        if let Some((k, (v, o))) = self.key_to_order_and_value.remove_entry(k) {
+            let query = (o, k);
+            let existed = self.queue.remove(&query);
+            assert!(existed, "key was in key_to_order");
+            let (o, _k) = query;
             Some((v, o))
         } else {
             None
@@ -140,27 +135,22 @@ where
     ///
     /// Returns existing order if the key existed.
     pub fn update_order(&mut self, k: &K, o: O) -> Option<O> {
-        match self.key_to_order_and_value.entry(k.clone()) {
-            hash_map::Entry::Occupied(mut entry_o) => {
+        match self.key_to_order_and_value.get_mut(k) {
+            Some(entry) => {
                 let mut o_old = o.clone();
-                std::mem::swap(&mut entry_o.get_mut().1, &mut o_old);
+                std::mem::swap(&mut entry.1, &mut o_old);
 
-                let index = self
-                    .queue
-                    .binary_search_by_key(&(&o_old, k), project_tuple)
-                    .expect("key was in key_to_order");
-                let (_, k) = self.queue.remove(index).expect("just looked up that index");
+                let query = (o_old, k.clone());
+                let existed = self.queue.remove(&query);
+                assert!(existed, "key was in key_to_order");
+                let (o_old, k) = query;
 
-                match self.queue.binary_search_by_key(&(&o, &k), project_tuple) {
-                    Ok(_) => unreachable!("entry should have been removed by now"),
-                    Err(index) => {
-                        self.queue.insert(index, (o, k));
-                    }
-                }
+                let inserted = self.queue.insert((o, k));
+                assert!(inserted, "entry should have been removed by now");
 
                 Some(o_old)
             }
-            hash_map::Entry::Vacant(_) => None,
+            None => None,
         }
     }
 }
@@ -178,6 +168,39 @@ where
 /// Project tuple references.
 fn project_tuple<A, B>(t: &(A, B)) -> (&A, &B) {
     (&t.0, &t.1)
+}
+
+/// Iterator of [`AddressableHeap::iter`].
+pub struct AddressableHeapIter<'a, K, V, O>
+where
+    K: Clone + Eq + Hash + Ord,
+    O: Clone + Ord,
+{
+    key_to_order_and_value: &'a HashMap<K, (V, O)>,
+    queue_iter: std::collections::btree_set::Iter<'a, (O, K)>,
+}
+
+impl<'a, K, V, O> Iterator for AddressableHeapIter<'a, K, V, O>
+where
+    K: Clone + Eq + Hash + Ord,
+    O: Clone + Ord,
+{
+    type Item = (&'a K, &'a V, &'a O);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.queue_iter.next().map(|(o, k)| {
+            let (v, o2) = self
+                .key_to_order_and_value
+                .get(k)
+                .expect("value is in queue");
+            assert!(o == o2);
+            (k, v, o)
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.queue_iter.size_hint()
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +484,12 @@ mod tests {
                 .map(|(k, v, o)| (k, v, o))
         }
 
+        fn dump_ordered(&self) -> Vec<(u8, String, i8)> {
+            let mut inner = self.inner.clone();
+            inner.sort_by_key(|(k, _v, o)| (*o, *k));
+            inner
+        }
+
         fn pop(&mut self) -> Option<(u8, String, i8)> {
             self.inner
                 .iter()
@@ -504,6 +533,7 @@ mod tests {
         IsEmpty,
         Insert { k: u8, v: String, o: i8 },
         Peek,
+        Iter,
         Pop,
         Get { k: u8 },
         Remove { k: u8 },
@@ -516,6 +546,7 @@ mod tests {
             Just(Action::IsEmpty),
             (any::<u8>(), ".*", any::<i8>()).prop_map(|(k, v, o)| Action::Insert { k, v, o }),
             Just(Action::Peek),
+            Just(Action::Iter),
             Just(Action::Pop),
             any::<u8>().prop_map(|k| Action::Get { k }),
             any::<u8>().prop_map(|k| Action::Remove { k }),
@@ -544,6 +575,11 @@ mod tests {
                     Action::Peek => {
                         let res1 = heap.peek();
                         let res2 = sim.peek();
+                        assert_eq!(res1, res2);
+                    }
+                    Action::Iter => {
+                        let res1 = heap.iter().map(|(k, v, o)| (*k, v.clone(), *o)).collect::<Vec<_>>();
+                        let res2 = sim.dump_ordered();
                         assert_eq!(res1, res2);
                     }
                     Action::Pop => {

@@ -16,6 +16,17 @@ message IoxMetadata {
   // Renamed to shard_id
   reserved 5;
   reserved "sequencer_id";
+  // shard_id was removed
+  reserved 17;
+  reserved "shard_id";
+  // max_sequence_number was removed
+  reserved 13;
+  reserved "max_sequence_number";
+  // Was the unique database partition ID. Moving to deterministic hash-based partition IDs
+  // that can be built from the table ID and the partition key, so storing the new partition hash
+  // ID here would be redundant.
+  reserved 8;
+  reserved "partition_id";
 
   // Object store ID. Used in the parquet filename. 16 bytes in big-endian order.
   bytes object_store_id = 1;
@@ -29,23 +40,14 @@ message IoxMetadata {
   // Unique name of the namespace.
   string namespace_name = 4;
 
-  // Unique shard ID.
-  int64 shard_id = 17;
-
   // Unique table ID.
   int64 table_id = 6;
 
   // Table that holds this parquet file.
   string table_name = 7;
 
-  // Unique partition ID.
-  int64 partition_id = 8;
-
   // Partition key of the partition that holds this parquet file.
   string partition_key = 9;
-
-  // The maximum sequence number from a shard in this parquet file.
-  int64 max_sequence_number = 13;
 
   // The sort key of this chunk
   SortKey sort_key = 15;

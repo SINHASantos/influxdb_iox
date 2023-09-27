@@ -1,7 +1,33 @@
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+#![allow(clippy::default_constructed_unit_structs)]
+
+use gossip::{Bytes, Identity, TopicInterests};
+use gossip_schema::{dispatcher::SchemaRx, handle::SchemaTx};
+use observability_deps::tracing::info;
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
+use std::{
+    fmt::{Debug, Display},
+    net::SocketAddr,
+    sync::Arc,
+};
+
 use async_trait::async_trait;
-use authz::Authorizer;
-use clap_blocks::{router::RouterConfig, router2::Router2Config, write_buffer::WriteBufferConfig};
-use data_types::{NamespaceName, PartitionTemplate, TemplatePart};
+use authz::{Authorizer, AuthorizerInstrumentation, IoxAuthorizer};
+use clap_blocks::{gossip::GossipConfig, router::RouterConfig};
+use data_types::NamespaceName;
 use hashbrown::HashMap;
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
@@ -10,8 +36,12 @@ use ioxd_common::{
     http::error::{HttpApiError, HttpApiErrorSource},
     reexport::{
         generated_types::influxdata::iox::{
-            catalog::v1::catalog_service_server, namespace::v1::namespace_service_server,
-            object_store::v1::object_store_service_server, schema::v1::schema_service_server,
+            catalog::v1::catalog_service_server,
+            gossip::{v1::anti_entropy_service_server, Topic},
+            namespace::v1::namespace_service_server,
+            object_store::v1::object_store_service_server,
+            schema::v1::schema_service_server,
+            table::v1::table_service_server,
         },
         tonic::transport::Endpoint,
     },
@@ -23,68 +53,77 @@ use ioxd_common::{
 use metric::Registry;
 use mutable_batch::MutableBatch;
 use object_store::DynObjectStore;
-use observability_deps::tracing::info;
 use router::{
     dml_handlers::{
         lazy_connector::LazyConnector, DmlHandler, DmlHandlerChainExt, FanOutAdaptor,
-        InstrumentationDecorator, Partitioner, RetentionValidator, RpcWrite, SchemaValidator,
-        ShardedWriteBuffer, WriteSummaryAdapter,
+        InstrumentationDecorator, Partitioner, RetentionValidator, RpcWrite,
+    },
+    gossip::{
+        anti_entropy::{
+            mst::{actor::AntiEntropyActor, handle::AntiEntropyHandle, merkle::MerkleTree},
+            sync::{
+                actor::ConvergenceActor,
+                consistency_prober::{ProbeDispatcher, SenderAddressResolver},
+                rpc_server::{AntiEntropyService, MAX_SYNC_MSG_SIZE},
+                rpc_worker::grpc_connector::GrpcConnector,
+            },
+        },
+        namespace_cache::NamespaceSchemaGossip,
+        schema_change_observer::SchemaChangeObserver,
     },
     namespace_cache::{
-        metrics::InstrumentedCache, MemoryNamespaceCache, NamespaceCache, ShardedCache,
+        metrics::InstrumentedCache, CacheMissErr, MaybeLayer, MemoryNamespaceCache, NamespaceCache,
+        ReadThroughCache, ShardedCache,
     },
     namespace_resolver::{
         MissingNamespaceAction, NamespaceAutocreation, NamespaceResolver, NamespaceSchemaResolver,
     },
+    schema_validator::SchemaValidator,
     server::{
-        grpc::{sharder::ShardService, GrpcDelegate, RpcWriteGrpcDelegate},
-        http::HttpDelegate,
-        RouterServer, RpcWriteRouterServer,
+        grpc::RpcWriteGrpcDelegate,
+        http::{
+            write::{
+                multi_tenant::MultiTenantRequestUnifier, single_tenant::SingleTenantRequestUnifier,
+                WriteRequestUnifier,
+            },
+            HttpDelegate,
+        },
+        RpcWriteRouterServer,
     },
-    shard::Shard,
-};
-use sharder::{JumpHash, Sharder};
-use std::{
-    collections::BTreeSet,
-    fmt::{Debug, Display},
-    sync::Arc,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use trace::TraceCollector;
-use write_summary::WriteSummary;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("failed to initialise write buffer connection: {0}")]
-    WriteBuffer(#[from] write_buffer::core::WriteBufferError),
-
     #[error("Catalog error: {0}")]
     Catalog(#[from] iox_catalog::interface::Error),
 
     #[error("Catalog DSN error: {0}")]
     CatalogDsn(#[from] clap_blocks::catalog_dsn::Error),
 
-    #[error("No shards found in Catalog")]
-    Sharder,
+    #[error("authz configuration error for '{addr}': '{source}'")]
+    AuthzConfig {
+        source: Box<dyn std::error::Error>,
+        addr: String,
+    },
 
-    #[error("No topic named '{topic_name}' found in the catalog")]
-    TopicCatalogLookup { topic_name: String },
-
-    #[error("Failed to init shard grpc service: {0}")]
-    ShardServiceInit(iox_catalog::interface::Error),
+    /// An error binding the UDP socket for gossip communication.
+    #[error("failed to bind udp gossip socket: {0}")]
+    GossipBind(std::io::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct RouterServerType<D, N, S> {
-    server: RouterServer<D, N, S>,
+pub struct RpcWriteRouterServerType<D, N, T> {
+    server: RpcWriteRouterServer<D, N, T>,
     shutdown: CancellationToken,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 }
 
-impl<D, N, S> RouterServerType<D, N, S> {
-    pub fn new(server: RouterServer<D, N, S>, common_state: &CommonServerState) -> Self {
+impl<D, N, T> RpcWriteRouterServerType<D, N, T> {
+    pub fn new(server: RpcWriteRouterServer<D, N, T>, common_state: &CommonServerState) -> Self {
         Self {
             server,
             shutdown: CancellationToken::new(),
@@ -93,97 +132,23 @@ impl<D, N, S> RouterServerType<D, N, S> {
     }
 }
 
-impl<D, N, S> std::fmt::Debug for RouterServerType<D, N, S> {
+impl<D, N, T> std::fmt::Debug for RpcWriteRouterServerType<D, N, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Router")
     }
 }
 
 #[async_trait]
-impl<D, N, S> ServerType for RouterServerType<D, N, S>
+impl<D, N, T> ServerType for RpcWriteRouterServerType<D, N, T>
 where
-    D: DmlHandler<WriteInput = HashMap<String, MutableBatch>, WriteOutput = WriteSummary> + 'static,
-    S: Sharder<(), Item = Arc<Shard>> + Clone + 'static,
+    D: DmlHandler<WriteInput = HashMap<String, MutableBatch>, WriteOutput = ()> + 'static,
     N: NamespaceResolver + 'static,
+    T: NamespaceCache<ReadError = CacheMissErr> + Clone + 'static,
 {
-    /// Return the [`metric::Registry`] used by the router.
-    fn metric_registry(&self) -> Arc<Registry> {
-        self.server.metric_registry()
+    fn name(&self) -> &str {
+        "rpc_write_router"
     }
 
-    /// Returns the trace collector for router traces.
-    fn trace_collector(&self) -> Option<Arc<dyn TraceCollector>> {
-        self.trace_collector.as_ref().map(Arc::clone)
-    }
-
-    /// Dispatches `req` to the router [`HttpDelegate`] delegate.
-    ///
-    /// [`HttpDelegate`]: router::server::http::HttpDelegate
-    async fn route_http_request(
-        &self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, Box<dyn HttpApiErrorSource>> {
-        self.server
-            .http()
-            .route(req)
-            .await
-            .map_err(IoxHttpErrorAdaptor)
-            .map_err(|e| Box::new(e) as _)
-    }
-
-    /// Registers the services exposed by the router [`GrpcDelegate`] delegate.
-    ///
-    /// [`GrpcDelegate`]: router::server::grpc::GrpcDelegate
-    async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
-        let builder = setup_builder!(builder_input, self);
-        add_service!(builder, self.server.grpc().schema_service());
-        add_service!(builder, self.server.grpc().catalog_service());
-        add_service!(builder, self.server.grpc().object_store_service());
-        add_service!(builder, self.server.grpc().shard_service());
-        add_service!(builder, self.server.grpc().namespace_service());
-        serve_builder!(builder);
-
-        Ok(())
-    }
-
-    async fn join(self: Arc<Self>) {
-        self.shutdown.cancelled().await;
-    }
-
-    fn shutdown(&self, frontend: CancellationToken) {
-        frontend.cancel();
-        self.shutdown.cancel();
-    }
-}
-
-pub struct RpcWriteRouterServerType<D, N> {
-    server: RpcWriteRouterServer<D, N>,
-    shutdown: CancellationToken,
-    trace_collector: Option<Arc<dyn TraceCollector>>,
-}
-
-impl<D, N> RpcWriteRouterServerType<D, N> {
-    pub fn new(server: RpcWriteRouterServer<D, N>, common_state: &CommonServerState) -> Self {
-        Self {
-            server,
-            shutdown: CancellationToken::new(),
-            trace_collector: common_state.trace_collector(),
-        }
-    }
-}
-
-impl<D, N> std::fmt::Debug for RpcWriteRouterServerType<D, N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RpcWriteRouter")
-    }
-}
-
-#[async_trait]
-impl<D, N> ServerType for RpcWriteRouterServerType<D, N>
-where
-    D: DmlHandler<WriteInput = HashMap<String, MutableBatch>, WriteOutput = WriteSummary> + 'static,
-    N: NamespaceResolver + 'static,
-{
     /// Return the [`metric::Registry`] used by the router.
     fn metric_registry(&self) -> Arc<Registry> {
         self.server.metric_registry()
@@ -234,6 +199,18 @@ where
                 self.server.grpc().namespace_service()
             )
         );
+        add_service!(
+            builder,
+            table_service_server::TableServiceServer::new(self.server.grpc().table_service())
+        );
+        add_service!(
+            builder,
+            anti_entropy_service_server::AntiEntropyServiceServer::new(
+                self.server.grpc().anti_entropy_service()
+            )
+            .max_decoding_message_size(MAX_SYNC_MSG_SIZE)
+            .max_encoding_message_size(MAX_SYNC_MSG_SIZE)
+        );
         serve_builder!(builder);
 
         Ok(())
@@ -266,30 +243,33 @@ impl std::error::Error for IoxHttpErrorAdaptor {}
 impl HttpApiErrorSource for IoxHttpErrorAdaptor {
     fn to_http_api_error(&self) -> HttpApiError {
         HttpApiError::new(self.0.as_status_code(), self.to_string())
+            .with_line(self.0.get_parse_error_line_index())
     }
 }
 
 /// Instantiate a router server that uses the RPC write path
-// NOTE!!! This needs to be kept in sync with `create_router_server_type` until the
-// switch to the RPC write path/ingester2 is complete! See the numbered sections that annotate
-// where these two functions line up and where they diverge.
-pub async fn create_router2_server_type(
+#[allow(clippy::too_many_arguments)]
+pub async fn create_router_server_type(
     common_state: &CommonServerState,
     metrics: Arc<metric::Registry>,
     catalog: Arc<dyn Catalog>,
     object_store: Arc<DynObjectStore>,
-    authz: Option<Arc<dyn Authorizer>>,
-    router_config: &Router2Config,
+    router_config: &RouterConfig,
+    gossip_config: &GossipConfig,
+    trace_context_header_name: String,
+    grpc_bind_port: u16,
 ) -> Result<Arc<dyn ServerType>> {
-    // 1. START: Different Setup Per Router Path: this part is only relevant to using RPC write
-    //    path and should not be added to `create_router_server_type`.
-
     let ingester_connections = router_config.ingester_addresses.iter().map(|addr| {
         let addr = addr.to_string();
         let endpoint = Endpoint::from_shared(hyper::body::Bytes::from(addr.clone()))
             .expect("invalid ingester connection address");
         (
-            LazyConnector::new(endpoint, router_config.rpc_write_timeout_seconds),
+            LazyConnector::new(
+                endpoint,
+                router_config.rpc_write_timeout_seconds,
+                router_config.rpc_write_max_outgoing_bytes,
+                trace_context_header_name.clone(),
+            ),
             addr,
         )
     });
@@ -299,103 +279,97 @@ pub async fn create_router2_server_type(
         ingester_connections,
         router_config.rpc_write_replicas,
         &metrics,
+        router_config.rpc_write_health_num_probes,
     );
     let rpc_writer = InstrumentationDecorator::new("rpc_writer", &metrics, rpc_writer);
-    // 1. END
 
-    // 2. START: Similar Setup: Both router paths use:
-    //    a. Namespace cache
-    //    b. Schema validator
-    //    c. Retention validator
-    //    d. Write partitioner
-    //    e. Namespace resolver
-    //    f. Parallel writer
-    //    g. Handler stack
-
-    // a. Namespace cache
+    // # Namespace cache
+    //
     // Initialise an instrumented namespace cache to be shared with the schema
     // validator, and namespace auto-creator that reports cache hit/miss/update
     // metrics.
     let ns_cache = Arc::new(InstrumentedCache::new(
-        Arc::new(ShardedCache::new(
-            std::iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
-        )),
+        ShardedCache::new(std::iter::repeat_with(MemoryNamespaceCache::default).take(10)),
         &metrics,
     ));
 
-    pre_warm_schema_cache(&ns_cache, &*catalog)
+    // Initialise the anti-entropy subsystem, responsible for maintaining a
+    // Merkle Search Tree that encodes the content of the namespace schema
+    // cache.
+    let (actor, mst) = AntiEntropyActor::new(Arc::clone(&ns_cache));
+    // Start the actor task, which exits when the `mst` handle to it drops.
+    tokio::spawn(actor.run());
+
+    // Pre-warm the cache before adding the gossip layer to avoid broadcasting
+    // the full cache content at startup.
+    //
+    // This method blocks until all schemas have been stored in the cache, and
+    // all schemas have been enqueued for the MST actor to process.
+    pre_warm_schema_cache(&ns_cache, &*catalog, &mst)
         .await
         .expect("namespace cache pre-warming failed");
 
-    // b. Schema validator
+    // Now the cache and anti-entropy merkle tree have been pre-populated, wrap
+    // the namespace cache in an observer that tracks any future changes to the
+    // cache content, ensuring the MST remains in-sync.
+    let ns_cache = MerkleTree::new(ns_cache, mst.clone());
+
+    // Optionally initialise the schema gossip subsystem.
+    let ns_cache = match gossip_config.gossip_bind_address {
+        Some(bind_addr) => MaybeLayer::With(
+            init_gossip(
+                ns_cache,
+                *bind_addr,
+                gossip_config.seed_list.clone(),
+                mst.clone(),
+                grpc_bind_port,
+                &metrics,
+            )
+            .await?,
+        ),
+        None => MaybeLayer::Without(ns_cache),
+    };
+
+    // Initialise the sync/anti-entropy RPC server, implementing the server-side
+    // anti-entropy protocol.
+    let ns_cache = Arc::new(ns_cache);
+    let sync_rpc_server = AntiEntropyService::new(mst, Arc::clone(&ns_cache));
+
+    // Wrap the NamespaceCache in a read-through layer that queries the catalog
+    // for cache misses, and populates the local cache with the result.
+    let ns_cache = Arc::new(ReadThroughCache::new(ns_cache, Arc::clone(&catalog)));
+
+    // # Schema validator
+    //
     // Initialise and instrument the schema validator
     let schema_validator =
         SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &metrics);
     let schema_validator =
         InstrumentationDecorator::new("schema_validator", &metrics, schema_validator);
 
-    // c. Retention validator
+    // # Retention validator
+    //
     // Add a retention validator into handler stack to reject data outside the retention period
-    let retention_validator = RetentionValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
+    let retention_validator = RetentionValidator::new();
     let retention_validator =
         InstrumentationDecorator::new("retention_validator", &metrics, retention_validator);
 
-    // d. Write partitioner
+    // # Write partitioner
+    //
     // Add a write partitioner into the handler stack that splits by the date
-    // portion of the write's timestamp.
-    let partitioner = Partitioner::new(PartitionTemplate {
-        parts: vec![TemplatePart::TimeFormat(
-            router_config.partition_key_pattern.clone(),
-        )],
-    });
+    // portion of the write's timestamp (the default table partition template)
+    let partitioner = Partitioner::default();
     let partitioner = InstrumentationDecorator::new("partitioner", &metrics, partitioner);
 
-    // e. Namespace resolver
+    // # Namespace resolver
+    //
     // Initialise the Namespace ID lookup + cache
-    let namespace_resolver =
-        NamespaceSchemaResolver::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // THIS CODE IS FOR TESTING ONLY.
-    //
-    // The source of truth for the topics & query pools will be read from
-    // the DB, rather than CLI args for a prod deployment.
-    //
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Look up the topic ID needed to populate namespace creation
-    // requests.
-    //
-    // This code / auto-creation is for architecture testing purposes only - a
-    // prod deployment would expect namespaces to be explicitly created and this
-    // layer would be removed.
-    let mut txn = catalog.start_transaction().await?;
-    let topic_id = txn
-        .topics()
-        .get_by_name(&router_config.topic)
-        .await?
-        .map(|v| v.id)
-        .unwrap_or_else(|| panic!("no topic named {} in catalog", router_config.topic));
-    let query_id = txn
-        .query_pools()
-        .create_or_get(&router_config.query_pool_name)
-        .await
-        .map(|v| v.id)
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to upsert query pool {} in catalog: {}",
-                router_config.query_pool_name, e
-            )
-        });
-    txn.commit().await?;
+    let namespace_resolver = NamespaceSchemaResolver::new(Arc::clone(&ns_cache));
 
     let namespace_resolver = NamespaceAutocreation::new(
         namespace_resolver,
         Arc::clone(&ns_cache),
         Arc::clone(&catalog),
-        topic_id,
-        query_id,
         {
             if router_config.namespace_autocreation_enabled {
                 MissingNamespaceAction::AutoCreate(
@@ -411,10 +385,11 @@ pub async fn create_router2_server_type(
     //
     ////////////////////////////////////////////////////////////////////////////
 
-    // f. Parallel writer (this function takes the rpc_writer as an argument)
-    let parallel_write = WriteSummaryAdapter::new(FanOutAdaptor::new(rpc_writer));
+    // # Parallel writer
+    let parallel_write = FanOutAdaptor::new(rpc_writer);
 
-    // g. Handler stack
+    // # Handler stack
+    //
     // Build the chain of DML handlers that forms the request processing pipeline
     let handler_stack = retention_validator
         .and_then(schema_validator)
@@ -434,318 +409,250 @@ pub async fn create_router2_server_type(
     // Record the overall request handling latency
     let handler_stack = InstrumentationDecorator::new("request", &metrics, handler_stack);
 
-    // 2. END
+    // Initialize the HTTP API delegate
+    let write_request_unifier: Result<Box<dyn WriteRequestUnifier>> = match (
+        router_config.single_tenant_deployment,
+        &router_config.authz_address,
+    ) {
+        (true, Some(addr)) => {
+            let authz = IoxAuthorizer::connect_lazy(addr.clone())
+                .map(|c| {
+                    Arc::new(AuthorizerInstrumentation::new(&metrics, c)) as Arc<dyn Authorizer>
+                })
+                .map_err(|source| Error::AuthzConfig {
+                    source,
+                    addr: addr.clone(),
+                })?;
+            authz.probe().await.expect("Authz connection test failed.");
 
-    // 3. N/A: Shard mapping setup is only relevant to the write buffer router path
-
-    // 4. START: Initialize the HTTP API delegate, this is the same in both router paths
+            Ok(Box::new(SingleTenantRequestUnifier::new(authz)))
+        }
+        (true, None) => {
+            // Single tenancy was requested, but no auth was provided - the
+            // router's clap flag parse configuration should not allow this
+            // combination to be accepted and therefore execution should
+            // never reach here.
+            unreachable!("INFLUXDB_IOX_SINGLE_TENANCY is set, but could not create an authz service. Check the INFLUXDB_IOX_AUTHZ_ADDR")
+        }
+        (false, None) => Ok(Box::<MultiTenantRequestUnifier>::default()),
+        (false, Some(_)) => {
+            // As above, this combination should be prevented by the
+            // router's clap flag parse configuration.
+            unreachable!("INFLUXDB_IOX_AUTHZ_ADDR is set, but authz only exists for single_tenancy. Check the INFLUXDB_IOX_SINGLE_TENANCY")
+        }
+    };
     let http = HttpDelegate::new(
         common_state.run_config().max_http_request_size,
         router_config.http_request_limit,
         namespace_resolver,
         handler_stack,
-        authz,
         &metrics,
+        write_request_unifier?,
     );
-    // 4. END
 
-    // 5. START: Initialize the gRPC API delegate that creates the services relevant to the RPC
-    //    write router path and use it to create the relevant `RpcWriteRouterServer` and
-    //    `RpcWriteRouterServerType`.
-    let grpc = RpcWriteGrpcDelegate::new(catalog, object_store, topic_id, query_id);
+    // Initialize the gRPC API delegate that creates the services relevant to the RPC
+    // write router path and use it to create the relevant `RpcWriteRouterServer` and
+    // `RpcWriteRouterServerType`.
+    let grpc = RpcWriteGrpcDelegate::new(catalog, object_store, sync_rpc_server);
 
     let router_server =
         RpcWriteRouterServer::new(http, grpc, metrics, common_state.trace_collector());
     let server_type = Arc::new(RpcWriteRouterServerType::new(router_server, common_state));
     Ok(server_type)
-    // 5. END
-}
-
-/// Instantiate a router server
-// NOTE!!! This needs to be kept in sync with `create_router2_server_type` until the
-// switch to the RPC write path/ingester2 is complete! See the numbered sections that annotate
-// where these two functions line up and where they diverge.
-pub async fn create_router_server_type(
-    common_state: &CommonServerState,
-    metrics: Arc<metric::Registry>,
-    catalog: Arc<dyn Catalog>,
-    object_store: Arc<DynObjectStore>,
-    authz: Option<Arc<dyn Authorizer>>,
-    write_buffer_config: &WriteBufferConfig,
-    router_config: &RouterConfig,
-) -> Result<Arc<dyn ServerType>> {
-    // 1. START: Different Setup Per Router Path: this part is only relevant to using a write
-    //    buffer and should not be added to `create_router2_server_type`.
-
-    // Initialise the sharded write buffer and instrument it with DML handler metrics.
-    let (write_buffer, sharder) = init_write_buffer(
-        write_buffer_config,
-        Arc::clone(&metrics),
-        common_state.trace_collector(),
-    )
-    .await?;
-    let write_buffer =
-        InstrumentationDecorator::new("sharded_write_buffer", &metrics, write_buffer);
-    // 1. END
-
-    // 2. START: Similar Setup: Both router paths use:
-    //    a. Namespace cache
-    //    b. Schema validator
-    //    c. Retention validator
-    //    d. Write partitioner
-    //    e. Namespace resolver
-    //    f. Parallel writer
-    //    g. Handler stack
-
-    // a. Namespace cache
-    // Initialise an instrumented namespace cache to be shared with the schema
-    // validator, and namespace auto-creator that reports cache hit/miss/update
-    // metrics.
-    let ns_cache = Arc::new(InstrumentedCache::new(
-        Arc::new(ShardedCache::new(
-            std::iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
-        )),
-        &metrics,
-    ));
-
-    pre_warm_schema_cache(&ns_cache, &*catalog)
-        .await
-        .expect("namespace cache pre-warming failed");
-
-    // b. Schema validator
-    // Initialise and instrument the schema validator
-    let schema_validator =
-        SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &metrics);
-    let schema_validator =
-        InstrumentationDecorator::new("schema_validator", &metrics, schema_validator);
-
-    // c. Retention validator
-    // Add a retention validator into handler stack to reject data outside the retention period
-    let retention_validator = RetentionValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
-    let retention_validator =
-        InstrumentationDecorator::new("retention_validator", &metrics, retention_validator);
-
-    // d. Write partitioner
-    // Add a write partitioner into the handler stack that splits by the date
-    // portion of the write's timestamp.
-    let partitioner = Partitioner::new(PartitionTemplate {
-        parts: vec![TemplatePart::TimeFormat("%Y-%m-%d".to_owned())],
-    });
-    let partitioner = InstrumentationDecorator::new("partitioner", &metrics, partitioner);
-
-    // e. Namespace resolver
-    // Initialise the Namespace ID lookup + cache
-    let namespace_resolver =
-        NamespaceSchemaResolver::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // THIS CODE IS FOR TESTING ONLY.
-    //
-    // The source of truth for the topics & query pools will be read from
-    // the DB, rather than CLI args for a prod deployment.
-    //
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Look up the topic ID needed to populate namespace creation
-    // requests.
-    //
-    // This code / auto-creation is for architecture testing purposes only - a
-    // prod deployment would expect namespaces to be explicitly created and this
-    // layer would be removed.
-    let mut txn = catalog.start_transaction().await?;
-    let topic_id = txn
-        .topics()
-        .get_by_name(write_buffer_config.topic())
-        .await?
-        .map(|v| v.id)
-        .unwrap_or_else(|| panic!("no topic named {} in catalog", write_buffer_config.topic()));
-    let query_id = txn
-        .query_pools()
-        .create_or_get(&router_config.query_pool_name)
-        .await
-        .map(|v| v.id)
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to upsert query pool {} in catalog: {}",
-                write_buffer_config.topic(),
-                e
-            )
-        });
-    txn.commit().await?;
-
-    let namespace_resolver = NamespaceAutocreation::new(
-        namespace_resolver,
-        Arc::clone(&ns_cache),
-        Arc::clone(&catalog),
-        topic_id,
-        query_id,
-        {
-            if router_config.namespace_autocreation_enabled {
-                MissingNamespaceAction::AutoCreate(
-                    router_config
-                        .new_namespace_retention_hours
-                        .map(|hours| hours as i64 * 60 * 60 * 1_000_000_000),
-                )
-            } else {
-                MissingNamespaceAction::Reject
-            }
-        },
-    );
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-    // f. Parallel writer (this function takes the write buffer as an argument)
-    let parallel_write = WriteSummaryAdapter::new(FanOutAdaptor::new(write_buffer));
-
-    // g. Handler stack
-    // Build the chain of DML handlers that forms the request processing
-    // pipeline, starting with the namespace creator (for testing purposes) and
-    // write partitioner that yields a set of partitioned batches.
-    let handler_stack = retention_validator
-        .and_then(schema_validator)
-        .and_then(partitioner)
-        // Once writes have been partitioned, they are processed in parallel.
-        //
-        // This block initialises a fan-out adaptor that parallelises partitioned
-        // writes into the handler chain it decorates (schema validation, and then
-        // into the sharded write buffer), and instruments the parallelised
-        // operation.
-        .and_then(InstrumentationDecorator::new(
-            "parallel_write",
-            &metrics,
-            parallel_write,
-        ));
-
-    // Record the overall request handling latency
-    let handler_stack = InstrumentationDecorator::new("request", &metrics, handler_stack);
-    // 2. END
-
-    // 3. START: Shard mapping setup: Only relevant to the write buffer router path
-    // Initialise the shard-mapping gRPC service.
-    let shard_service =
-        init_shard_service(sharder, write_buffer_config, Arc::clone(&catalog)).await?;
-    // 3. END
-
-    // 4. START: Initialize the HTTP API delegate, this is the same in both router paths
-    let http = HttpDelegate::new(
-        common_state.run_config().max_http_request_size,
-        router_config.http_request_limit,
-        namespace_resolver,
-        handler_stack,
-        authz,
-        &metrics,
-    );
-    // 4. END
-
-    // 5. START: Initialize the gRPC API delegate that creates the services relevant to the write
-    //    buffer router path and use it to create the relevant `RouterServer` and
-    //    `RouterServerType`.
-    let grpc = GrpcDelegate::new(topic_id, query_id, catalog, object_store, shard_service);
-
-    let router_server = RouterServer::new(http, grpc, metrics, common_state.trace_collector());
-    let server_type = Arc::new(RouterServerType::new(router_server, common_state));
-    Ok(server_type)
-    // 5. END
-}
-
-/// Initialise the [`ShardedWriteBuffer`] with one shard per Kafka partition,
-/// using [`JumpHash`] to shard operations by their destination namespace &
-/// table name.
-///
-/// Returns both the DML handler and the sharder it uses.
-async fn init_write_buffer(
-    write_buffer_config: &WriteBufferConfig,
-    metrics: Arc<metric::Registry>,
-    trace_collector: Option<Arc<dyn TraceCollector>>,
-) -> Result<(
-    ShardedWriteBuffer<Arc<JumpHash<Arc<Shard>>>>,
-    Arc<JumpHash<Arc<Shard>>>,
-)> {
-    let write_buffer = Arc::new(
-        write_buffer_config
-            .writing(Arc::clone(&metrics), None, trace_collector)
-            .await?,
-    );
-
-    // Construct the (ordered) set of shards.
-    //
-    // The sort order must be deterministic in order for all nodes to shard to
-    // the same shard indexes, therefore we type assert the returned set is of the
-    // ordered variety.
-    let shards: BTreeSet<_> = write_buffer.shard_indexes();
-    //          ^ don't change this to an unordered set
-
-    info!(
-        topic = write_buffer_config.topic(),
-        shards = shards.len(),
-        "connected to write buffer topic",
-    );
-
-    if shards.is_empty() {
-        return Err(Error::Sharder);
-    }
-
-    // Initialise the sharder that maps (table, namespace, payload) to shards.
-    let sharder = Arc::new(JumpHash::new(
-        shards
-            .into_iter()
-            .map(|shard_index| Shard::new(shard_index, Arc::clone(&write_buffer), &metrics))
-            .map(Arc::new),
-    ));
-
-    Ok((ShardedWriteBuffer::new(Arc::clone(&sharder)), sharder))
-}
-
-async fn init_shard_service<S>(
-    sharder: S,
-    write_buffer_config: &WriteBufferConfig,
-    catalog: Arc<dyn Catalog>,
-) -> Result<ShardService<S>>
-where
-    S: Send + Sync,
-{
-    // Get the TopicMetadata from the catalog for the configured topic.
-    let topic = catalog
-        .repositories()
-        .await
-        .topics()
-        .get_by_name(write_buffer_config.topic())
-        .await?
-        .ok_or_else(|| Error::TopicCatalogLookup {
-            topic_name: write_buffer_config.topic().to_string(),
-        })?;
-
-    // Initialise the sharder
-    ShardService::new(sharder, topic, catalog)
-        .await
-        .map_err(Error::ShardServiceInit)
 }
 
 /// Pre-populate `cache` with the all existing schemas in `catalog`.
 async fn pre_warm_schema_cache<T>(
     cache: &T,
     catalog: &dyn Catalog,
+    mst: &AntiEntropyHandle,
 ) -> Result<(), iox_catalog::interface::Error>
 where
     T: NamespaceCache,
 {
-    iox_catalog::interface::list_schemas(catalog)
-        .await?
-        .for_each(|(ns, schema)| {
-            let name = NamespaceName::try_from(ns.name)
-                .expect("cannot convert existing namespace string to a `NamespaceName` instance");
+    let mut n = 0;
+    for (ns, schema) in iox_catalog::interface::list_schemas(catalog).await? {
+        let name = NamespaceName::try_from(ns.name)
+            .expect("cannot convert existing namespace string to a `NamespaceName` instance");
 
-            cache.put_schema(name, schema);
-        });
+        cache.put_schema(name.clone(), schema);
+        mst.observe_update_blocking(name).await;
+        n += 1;
+    }
+
+    info!(n, "pre-warmed schema cache");
+
+    // Calculate the root hash after pre-warming.
+    //
+    // This causes the merkle tree pages to be pre-hashed ahead of first use,
+    // and is guaranteed to happen after the backlog of MST updates has
+    // completed (schema updates are processed before other operations).
+    let root_hash = mst.content_hash().await;
+
+    info!(%root_hash, "initialised anti-entropy merkle tree");
 
     Ok(())
 }
 
+// Initialise the gossip subsystem.
+//
+// The schema gossip primitives sit in the stack of NamespaceCache layers:
+//
+//                   ┌───────────────────────────┐
+//                   │     ReadThroughCache      │
+//                   └───────────────────────────┘
+//                                 │
+//                                 ▼
+//                   ┌───────────────────────────┐
+//                   │   SchemaChangeObserver    │◀ ─ ─ ─ ─
+//                   └───────────────────────────┘         │
+//                                 │                     peers
+//                                 ▼                       ▲
+//                   ┌───────────────────────────┐         │
+//                   │   Incoming Gossip Apply   │─ ─ ─ ─ ─
+//                   └───────────────────────────┘
+//                                 │
+//                                 ▼
+//                   ┌───────────────────────────┐
+//                   │      Underlying Impl      │
+//                   └───────────────────────────┘
+//
+//
+//   - SchemaChangeObserver: sends outgoing gossip schema diffs
+//   - NamespaceSchemaGossip: applies incoming gossip diffs locally
+//
+// The SchemaChangeObserver is responsible for gossiping any diffs that pass
+// through it - it MUST sit above the NamespaceSchemaGossip layer
+// responsible for applying gossip diffs from peers (otherwise the local
+// node will receive a gossip diff and apply it, which passes through the
+// diff layer, and causes the local node to gossip it again).
+//
+// These gossip layers sit below the catalog lookups, so that they do not
+// drive catalog queries themselves (defeating the point of the gossiping!).
+// If a local node has to perform a catalog lookup, it gossips the result to
+// other peers, helping converge them.
+async fn init_gossip<T>(
+    ns_cache: MerkleTree<T>,
+    bind_addr: SocketAddr,
+    seed_list: Vec<String>,
+    mst: AntiEntropyHandle,
+    local_rpc_port: u16,
+    metrics: &Arc<metric::Registry>,
+) -> Result<impl NamespaceCache<ReadError = CacheMissErr>, Error>
+where
+    T: NamespaceCache<ReadError = CacheMissErr> + 'static,
+{
+    let ns_cache = Arc::new(ns_cache);
+
+    // Initialise the NamespaceSchemaGossip responsible for applying the
+    // incoming gossip schema diffs (if any) and applying any schema updates
+    // received during anti-entropy syncs.
+    //
+    // This sits above / decorates the MerkleTree wrapper, so that any changes
+    // applied by NamespaceSchemaGossip are observed by the MerkleTree wrapper
+    // and in turn cause the MST to observe the new schema content.
+    let gossip_apply = Arc::new(NamespaceSchemaGossip::new(Arc::clone(&ns_cache)));
+
+    // Connect the gossip subsystem (via the "Dispatcher" trait) to the
+    // NamespaceSchemaGossip layer, which will apply any incoming gossip
+    // messages to the cache it decorates.
+    let schema_dispatcher = SchemaRx::new(Arc::clone(&gossip_apply), 100);
+
+    // Initialise the consistency probe dispatcher and layer it in a demuxer to
+    // route the topics to the correct dispatcher implementations.
+    let (probe_dispatcher, probe_rx) = ProbeDispatcher::new();
+    let dispatcher = GossipDemuxer::new(probe_dispatcher, schema_dispatcher);
+
+    // Initialise the gossip subsystem, delegating message processing to
+    // the above dispatcher.
+    let handle = gossip::Builder::<_, Topic>::new(seed_list, dispatcher, Arc::clone(metrics))
+        // Configure the router to listen to SchemaChange messages.
+        .with_topic_filter(
+            TopicInterests::default()
+                .with_topic(Topic::SchemaChanges)
+                .with_topic(Topic::SchemaCacheConsistency),
+        )
+        .bind(bind_addr)
+        .await
+        .map(Arc::new)
+        .map_err(Error::GossipBind)?;
+
+    // Initialise the local cache diff observer responsible for gossiping any
+    // local changes made to the cache content.
+    //
+    // This sits above / wraps the NamespaceSchemaGossip layer, ensuring
+    // incoming messages processed by that layer are not then broadcast by this
+    // node (creating a feedback loop).
+    let ns_cache = Arc::new(SchemaChangeObserver::new(
+        ns_cache,
+        SchemaTx::new(Arc::clone(&handle)),
+    ));
+
+    //
+    // At this point, the optimistic schema gossiping is fully configured.
+    //
+    // Enable the anti-entropy subsystem to ensure eventual consistency of the
+    // cache content.
+    //
+
+    // Adapt the incoming consistency probes such that after this layer
+    // processes them, they include the sender's socket address.
+    let (resolver, probe_rx) = SenderAddressResolver::new(Arc::clone(&handle), probe_rx);
+    tokio::spawn(resolver.run());
+
+    // Spawn the convergence actor, responsible for performing consistency
+    // probes of peers and driving convergence.
+    let convergence_actor = ConvergenceActor::new(
+        GrpcConnector::default(),
+        gossip_apply,
+        mst.clone(),
+        local_rpc_port,
+        handle,
+        probe_rx,
+    );
+    tokio::spawn(convergence_actor.run());
+
+    Ok(ns_cache)
+}
+
+struct GossipDemuxer {
+    consistency_probe: ProbeDispatcher,
+    schema_update: SchemaRx,
+}
+
+impl GossipDemuxer {
+    fn new(consistency_probe: ProbeDispatcher, schema_update: SchemaRx) -> Self {
+        Self {
+            consistency_probe,
+            schema_update,
+        }
+    }
+}
+
+#[async_trait]
+impl gossip::Dispatcher<Topic> for GossipDemuxer {
+    async fn dispatch(&self, topic: Topic, payload: Bytes, sender: Identity) {
+        match topic {
+            Topic::SchemaChanges => self.schema_update.dispatch(topic, payload, sender).await,
+            Topic::SchemaCacheConsistency => {
+                self.consistency_probe
+                    .dispatch(topic, payload, sender)
+                    .await
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use data_types::ColumnType;
-    use iox_catalog::mem::MemCatalog;
+    use iox_catalog::{
+        mem::MemCatalog,
+        test_helpers::{arbitrary_namespace, arbitrary_table},
+    };
 
     use super::*;
 
@@ -754,19 +661,8 @@ mod tests {
         let catalog = Arc::new(MemCatalog::new(Default::default()));
 
         let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("foo").await.unwrap();
-        let pool = repos.query_pools().create_or_get("foo").await.unwrap();
-        let namespace = repos
-            .namespaces()
-            .create("test_ns", None, topic.id, pool.id)
-            .await
-            .unwrap();
-
-        let table = repos
-            .tables()
-            .create_or_get("name", namespace.id)
-            .await
-            .unwrap();
+        let namespace = arbitrary_namespace(&mut *repos, "test_ns").await;
+        let table = arbitrary_table(&mut *repos, "name", &namespace).await;
         let _column = repos
             .columns()
             .create_or_get("name", table.id, ColumnType::U64)
@@ -776,13 +672,29 @@ mod tests {
         drop(repos); // Or it'll deadlock.
 
         let cache = Arc::new(MemoryNamespaceCache::default());
-        pre_warm_schema_cache(&cache, &*catalog)
+
+        let (actor, mst) = AntiEntropyActor::new(Arc::clone(&cache));
+        tokio::spawn(actor.run());
+
+        // Remember the initial hash of the merkle tree covering the cache
+        // content.
+        let initial_hash = mst.content_hash().await;
+
+        pre_warm_schema_cache(&cache, &*catalog, &mst)
             .await
             .expect("pre-warming failed");
 
         let name = NamespaceName::new("test_ns").unwrap();
-        let got = cache.get_schema(&name).expect("should contain a schema");
+        let got = cache
+            .get_schema(&name)
+            .await
+            .expect("should contain a schema");
 
         assert!(got.tables.get("name").is_some());
+
+        // Assert the MST has observed at least one cache update, causing the
+        // root hashes to diverge.
+        let now = mst.content_hash().await;
+        assert_ne!(initial_hash, now);
     }
 }

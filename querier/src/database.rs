@@ -1,18 +1,25 @@
 //! Database for the querier that contains all namespaces.
 
 use crate::{
-    cache::CatalogCache, ingester::IngesterConnection, namespace::QuerierNamespace,
-    parquet::ChunkAdapter, query_log::QueryLog, table::PruneMetrics,
+    cache::CatalogCache,
+    ingester::IngesterConnection,
+    namespace::{QuerierNamespace, QuerierNamespaceArgs},
+    parquet::ChunkAdapter,
+    query_log::QueryLog,
+    table::PruneMetrics,
+    QueryLogEntry,
 };
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
-use data_types::{Namespace, ShardIndex};
-use iox_catalog::interface::{Catalog, SoftDeletedRows};
+use data_types::Namespace;
+use iox_catalog::interface::SoftDeletedRows;
 use iox_query::exec::Executor;
 use service_common::QueryNamespaceProvider;
-use sharder::JumpHash;
 use snafu::Snafu;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 use trace::span::{Span, SpanRecorder};
 use tracker::{
     AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
@@ -30,8 +37,6 @@ pub enum Error {
     Catalog {
         source: iox_catalog::interface::Error,
     },
-    #[snafu(display("No shards loaded"))]
-    NoShards,
 }
 
 /// Database for the querier.
@@ -47,10 +52,6 @@ pub struct QuerierDatabase {
 
     /// Adapter to create chunks.
     chunk_adapter: Arc<ChunkAdapter>,
-
-    /// Metric registry
-    #[allow(dead_code)]
-    metric_registry: Arc<metric::Registry>,
 
     /// Executor for queries.
     exec: Arc<Executor>,
@@ -68,20 +69,24 @@ pub struct QuerierDatabase {
     /// If the same namespace is requested twice for different queries, it is counted twice.
     query_execution_semaphore: Arc<InstrumentedAsyncSemaphore>,
 
-    /// Sharder to determine which ingesters to query for a particular table and namespace.
-    /// Only relevant when using the write buffer; will be None if using RPC write ingesters.
-    sharder: Option<Arc<JumpHash<Arc<ShardIndex>>>>,
-
     /// Chunk prune metrics.
     prune_metrics: Arc<PruneMetrics>,
+
+    /// DataFusion config.
+    datafusion_config: Arc<HashMap<String, String>>,
 }
 
 #[async_trait]
 impl QueryNamespaceProvider for QuerierDatabase {
     type Db = QuerierNamespace;
 
-    async fn db(&self, name: &str, span: Option<Span>) -> Option<Arc<Self::Db>> {
-        self.namespace(name, span).await
+    async fn db(
+        &self,
+        name: &str,
+        span: Option<Span>,
+        include_debug_info_tables: bool,
+    ) -> Option<Arc<Self::Db>> {
+        self.namespace(name, span, include_debug_info_tables).await
     }
 
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit {
@@ -107,7 +112,7 @@ impl QuerierDatabase {
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
         max_concurrent_queries: usize,
-        rpc_write: bool,
+        datafusion_config: Arc<HashMap<String, String>>,
     ) -> Result<Self, Error> {
         assert!(
             max_concurrent_queries <= Self::MAX_CONCURRENT_QUERIES_MAX,
@@ -118,10 +123,10 @@ impl QuerierDatabase {
 
         let backoff_config = BackoffConfig::default();
 
+        let prune_metrics = Arc::new(PruneMetrics::new(&metric_registry));
         let chunk_adapter = Arc::new(ChunkAdapter::new(
             Arc::clone(&catalog_cache),
-            Arc::clone(&metric_registry),
-            rpc_write,
+            Arc::clone(&prune_metrics),
         ));
         let query_log = Arc::new(QueryLog::new(QUERY_LOG_SIZE, catalog_cache.time_provider()));
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
@@ -131,27 +136,16 @@ impl QuerierDatabase {
         let query_execution_semaphore =
             Arc::new(semaphore_metrics.new_semaphore(max_concurrent_queries));
 
-        let sharder = if rpc_write {
-            None
-        } else {
-            Some(Arc::new(
-                create_sharder(catalog_cache.catalog().as_ref(), backoff_config.clone()).await?,
-            ))
-        };
-
-        let prune_metrics = Arc::new(PruneMetrics::new(&metric_registry));
-
         Ok(Self {
             backoff_config,
             catalog_cache,
             chunk_adapter,
-            metric_registry,
             exec,
             ingester_connection,
             query_log,
             query_execution_semaphore,
-            sharder,
             prune_metrics,
+            datafusion_config,
         })
     }
 
@@ -159,7 +153,12 @@ impl QuerierDatabase {
     ///
     /// This will await the internal namespace semaphore. Existence of namespaces is checked AFTER
     /// a semaphore permit was acquired since this lowers the chance that we obtain stale data.
-    pub async fn namespace(&self, name: &str, span: Option<Span>) -> Option<Arc<QuerierNamespace>> {
+    pub async fn namespace(
+        &self,
+        name: &str,
+        span: Option<Span>,
+        include_debug_info_tables: bool,
+    ) -> Option<Arc<QuerierNamespace>> {
         let span_recorder = SpanRecorder::new(span);
         let name = Arc::from(name.to_owned());
         let ns = self
@@ -172,16 +171,17 @@ impl QuerierDatabase {
                 span_recorder.child_span("cache GET namespace schema"),
             )
             .await?;
-        Some(Arc::new(QuerierNamespace::new(
-            Arc::clone(&self.chunk_adapter),
+        Some(Arc::new(QuerierNamespace::new(QuerierNamespaceArgs {
+            chunk_adapter: Arc::clone(&self.chunk_adapter),
             ns,
             name,
-            Arc::clone(&self.exec),
-            self.ingester_connection.clone(),
-            Arc::clone(&self.query_log),
-            self.sharder.clone(),
-            Arc::clone(&self.prune_metrics),
-        )))
+            exec: Arc::clone(&self.exec),
+            ingester_connection: self.ingester_connection.clone(),
+            query_log: Arc::clone(&self.query_log),
+            prune_metrics: Arc::clone(&self.prune_metrics),
+            datafusion_config: Arc::clone(&self.datafusion_config),
+            include_debug_info_tables,
+        })))
     }
 
     /// Return all namespaces this querier knows about
@@ -200,44 +200,15 @@ impl QuerierDatabase {
             .expect("retry forever")
     }
 
-    /// Return connection to ingester(s) to get and aggregate information from them
-    pub fn ingester_connection(&self) -> Option<Arc<dyn IngesterConnection>> {
-        self.ingester_connection.clone()
-    }
-
     /// Executor
     pub(crate) fn exec(&self) -> &Executor {
         &self.exec
     }
-}
 
-pub async fn create_sharder(
-    catalog: &dyn Catalog,
-    backoff_config: BackoffConfig,
-) -> Result<JumpHash<Arc<ShardIndex>>, Error> {
-    let shards = Backoff::new(&backoff_config)
-        .retry_all_errors("get shards", || async {
-            catalog.repositories().await.shards().list().await
-        })
-        .await
-        .expect("retry forever");
-
-    // Construct the (ordered) set of shard indexes.
-    //
-    // The sort order must be deterministic in order for all nodes to shard to
-    // the same indexes, therefore we type assert the returned set is of the
-    // ordered variety.
-    let shard_indexes: BTreeSet<_> = shards
-        //             ^ don't change this to an unordered set
-        .into_iter()
-        .map(|shard| shard.shard_index)
-        .collect();
-
-    if shard_indexes.is_empty() {
-        return Err(Error::NoShards);
+    /// Get query log entries.
+    pub fn query_log(&self) -> VecDeque<Arc<QueryLogEntry>> {
+        self.query_log.entries()
     }
-
-    Ok(JumpHash::new(shard_indexes.into_iter().map(Arc::new)))
 }
 
 #[cfg(test)]
@@ -245,7 +216,6 @@ mod tests {
     use super::*;
     use crate::create_ingester_connection_for_testing;
     use iox_tests::TestCatalog;
-    use test_helpers::assert_error;
     use tokio::runtime::Handle;
 
     #[tokio::test]
@@ -268,91 +238,27 @@ mod tests {
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX.saturating_add(1),
-            true,
+            Arc::new(HashMap::default()),
         )
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn shards_in_catalog_are_required_for_startup() {
-        let catalog = TestCatalog::new();
-
-        let catalog_cache = Arc::new(CatalogCache::new_testing(
-            catalog.catalog(),
-            catalog.time_provider(),
-            catalog.metric_registry(),
-            catalog.object_store(),
-            &Handle::current(),
-        ));
-
-        assert_error!(
-            QuerierDatabase::new(
-                catalog_cache,
-                catalog.metric_registry(),
-                catalog.exec(),
-                Some(create_ingester_connection_for_testing()),
-                QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-                false, // this only applies to the kafka write path
-            )
-            .await,
-            Error::NoShards
-        );
     }
 
     #[tokio::test]
     async fn test_namespace() {
         let catalog = TestCatalog::new();
-        // QuerierDatabase::new returns an error if there are no shards in the catalog
-        catalog.create_shard(0).await;
-
-        let catalog_cache = Arc::new(CatalogCache::new_testing(
-            catalog.catalog(),
-            catalog.time_provider(),
-            catalog.metric_registry(),
-            catalog.object_store(),
-            &Handle::current(),
-        ));
-        let db = QuerierDatabase::new(
-            catalog_cache,
-            catalog.metric_registry(),
-            catalog.exec(),
-            Some(create_ingester_connection_for_testing()),
-            QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-            true,
-        )
-        .await
-        .unwrap();
+        let db = new_db(&catalog).await;
 
         catalog.create_namespace_1hr_retention("ns1").await;
 
-        assert!(db.namespace("ns1", None).await.is_some());
-        assert!(db.namespace("ns2", None).await.is_none());
+        assert!(db.namespace("ns1", None, true).await.is_some());
+        assert!(db.namespace("ns2", None, true).await.is_none());
     }
 
     #[tokio::test]
     async fn test_namespaces() {
         let catalog = TestCatalog::new();
-        // QuerierDatabase::new returns an error if there are no shards in the catalog
-        catalog.create_shard(0).await;
-
-        let catalog_cache = Arc::new(CatalogCache::new_testing(
-            catalog.catalog(),
-            catalog.time_provider(),
-            catalog.metric_registry(),
-            catalog.object_store(),
-            &Handle::current(),
-        ));
-        let db = QuerierDatabase::new(
-            catalog_cache,
-            catalog.metric_registry(),
-            catalog.exec(),
-            Some(create_ingester_connection_for_testing()),
-            QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-            true,
-        )
-        .await
-        .unwrap();
+        let db = new_db(&catalog).await;
 
         catalog.create_namespace_1hr_retention("ns1").await;
         catalog.create_namespace_1hr_retention("ns2").await;
@@ -362,5 +268,25 @@ mod tests {
         assert_eq!(namespaces.len(), 2);
         assert_eq!(namespaces[0].name, "ns1");
         assert_eq!(namespaces[1].name, "ns2");
+    }
+
+    async fn new_db(catalog: &Arc<TestCatalog>) -> QuerierDatabase {
+        let catalog_cache = Arc::new(CatalogCache::new_testing(
+            catalog.catalog(),
+            catalog.time_provider(),
+            catalog.metric_registry(),
+            catalog.object_store(),
+            &Handle::current(),
+        ));
+        QuerierDatabase::new(
+            catalog_cache,
+            catalog.metric_registry(),
+            catalog.exec(),
+            Some(create_ingester_connection_for_testing()),
+            QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
+            Arc::new(HashMap::default()),
+        )
+        .await
+        .unwrap()
     }
 }

@@ -1,745 +1,527 @@
-//! Test setups and data for ingester crate
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
-#![allow(missing_docs)]
-#![cfg(test)]
-
-use std::{sync::Arc, time::Duration};
-
-use arrow::record_batch::RecordBatch;
-use arrow_util::assert_batches_eq;
 use data_types::{
-    NamespaceId, PartitionKey, Sequence, SequenceNumber, ShardId, ShardIndex, TableId,
+    partition_template::TablePartitionTemplateOverride, ColumnId, ColumnSet, NamespaceId,
+    ParquetFile, ParquetFileId, PartitionHashId, PartitionId, PartitionKey, SequenceNumber,
+    TableId, Timestamp, TransitionPartitionId,
 };
-use dml::{DmlMeta, DmlOperation, DmlWrite};
-use iox_catalog::{interface::Catalog, mem::MemCatalog};
-use iox_query::test::{raw_data, TestChunk};
-use iox_time::{SystemProvider, Time};
+use hashbrown::HashSet;
+use iox_catalog::{interface::Catalog, test_helpers::arbitrary_namespace};
+use lazy_static::lazy_static;
 use mutable_batch_lp::lines_to_batches;
-use object_store::memory::InMemory;
+use schema::Projection;
+use trace::ctx::SpanContext;
 
 use crate::{
-    data::IngesterData,
-    lifecycle::{LifecycleConfig, LifecycleManager},
+    buffer_tree::{
+        namespace::{
+            name_resolver::{mock::MockNamespaceNameProvider, NamespaceNameProvider},
+            NamespaceName,
+        },
+        partition::{counter::PartitionCounter, PartitionData, SortKeyState},
+        table::{
+            metadata::{TableMetadata, TableName},
+            metadata_resolver::{mock::MockTableProvider, TableProvider},
+        },
+    },
+    deferred_load::DeferredLoad,
+    dml_payload::write::{PartitionedData, TableData, WriteOperation},
+    persist::completion_observer::CompletedPersist,
 };
 
-pub(crate) async fn create_one_row_record_batch_with_influxtype() -> Vec<Arc<RecordBatch>> {
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_one_row_of_data(),
-    );
-    let batches = raw_data(&[chunk1]).await;
+pub(crate) const ARBITRARY_CATALOG_PARTITION_ID: PartitionId = PartitionId::new(1);
+pub(crate) const ARBITRARY_NAMESPACE_ID: NamespaceId = NamespaceId::new(3);
+pub(crate) const ARBITRARY_TABLE_ID: TableId = TableId::new(4);
+pub(crate) const ARBITRARY_PARTITION_KEY_STR: &str = "platanos";
 
-    // Make sure all data in one record batch
-    assert_eq!(batches.len(), 1);
-
-    // verify data
-    let expected = vec![
-        "+-----------+------+-----------------------------+",
-        "| field_int | tag1 | time                        |",
-        "+-----------+------+-----------------------------+",
-        "| 1000      | MA   | 1970-01-01T00:00:00.000001Z |",
-        "+-----------+------+-----------------------------+",
-    ];
-    assert_batches_eq!(&expected, &batches);
-
-    let batches: Vec<_> = batches.iter().map(|r| Arc::new(r.clone())).collect();
-    batches
+pub(crate) fn defer_namespace_name_1_sec() -> Arc<DeferredLoad<NamespaceName>> {
+    Arc::new(DeferredLoad::new(
+        Duration::from_secs(1),
+        async { ARBITRARY_NAMESPACE_NAME.clone() },
+        &metric::Registry::default(),
+    ))
 }
 
-pub(crate) async fn create_one_record_batch_with_influxtype_no_duplicates() -> Vec<Arc<RecordBatch>>
-{
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_three_rows_of_data(),
-    );
-    let batches = raw_data(&[chunk1]).await;
-
-    // Make sure all data in one record batch
-    assert_eq!(batches.len(), 1);
-
-    // verify data
-    let expected = vec![
-        "+-----------+------+-----------------------------+",
-        "| field_int | tag1 | time                        |",
-        "+-----------+------+-----------------------------+",
-        "| 1000      | WA   | 1970-01-01T00:00:00.000008Z |",
-        "| 10        | VT   | 1970-01-01T00:00:00.000010Z |",
-        "| 70        | UT   | 1970-01-01T00:00:00.000020Z |",
-        "+-----------+------+-----------------------------+",
-    ];
-    assert_batches_eq!(&expected, &batches);
-
-    let batches: Vec<_> = batches.iter().map(|r| Arc::new(r.clone())).collect();
-    batches
+pub(crate) fn defer_namespace_name_1_ms() -> Arc<DeferredLoad<NamespaceName>> {
+    Arc::new(DeferredLoad::new(
+        Duration::from_millis(1),
+        async { ARBITRARY_NAMESPACE_NAME.clone() },
+        &metric::Registry::default(),
+    ))
 }
 
-pub(crate) async fn create_one_record_batch_with_influxtype_duplicates() -> Vec<Arc<RecordBatch>> {
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column() //_with_full_stats(
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_ten_rows_of_data_some_duplicates(),
-    );
-    let batches = raw_data(&[chunk1]).await;
-
-    // Make sure all data in one record batch
-    assert_eq!(batches.len(), 1);
-
-    // verify data
-    let expected = vec![
-        "+-----------+------+--------------------------------+",
-        "| field_int | tag1 | time                           |",
-        "+-----------+------+--------------------------------+",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000002Z    |",
-        "| 20        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000500Z |",
-        "| 10        | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 30        | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "+-----------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &batches);
-
-    let batches: Vec<_> = batches.iter().map(|r| Arc::new(r.clone())).collect();
-    batches
+pub(crate) fn defer_table_metadata_1_sec() -> Arc<DeferredLoad<TableMetadata>> {
+    Arc::new(DeferredLoad::new(
+        Duration::from_secs(1),
+        async {
+            TableMetadata::new_for_testing(
+                ARBITRARY_TABLE_NAME.clone(),
+                TablePartitionTemplateOverride::default(),
+            )
+        },
+        &metric::Registry::default(),
+    ))
 }
 
-/// RecordBatches with knowledge of influx metadata
-pub(crate) async fn create_batches_with_influxtype() -> Vec<Arc<RecordBatch>> {
-    // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
-    let mut batches = vec![];
-
-    // chunk1 with 10 rows and 3 columns
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_ten_rows_of_data_some_duplicates(),
-    );
-    let batch1 = raw_data(&[chunk1]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+--------------------------------+",
-        "| field_int | tag1 | time                           |",
-        "+-----------+------+--------------------------------+",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000002Z    |",
-        "| 20        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000500Z |",
-        "| 10        | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 30        | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "+-----------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch1.clone()]);
-    batches.push(Arc::new(batch1));
-
-    // chunk2 having duplicate data with chunk 1
-    let chunk2 = Arc::new(
-        TestChunk::new("t")
-            .with_id(2)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_five_rows_of_data(),
-    );
-    let batch2 = raw_data(&[chunk2]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+--------------------------------+",
-        "| field_int | tag1 | time                           |",
-        "+-----------+------+--------------------------------+",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | 1970-01-01T00:00:00.000005Z    |",
-        "+-----------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch2.clone()]);
-    batches.push(Arc::new(batch2));
-
-    // verify data from both batches
-    let expected = vec![
-        "+-----------+------+--------------------------------+",
-        "| field_int | tag1 | time                           |",
-        "+-----------+------+--------------------------------+",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000002Z    |",
-        "| 20        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000500Z |",
-        "| 10        | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 30        | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | 1970-01-01T00:00:00.000005Z    |",
-        "+-----------+------+--------------------------------+",
-    ];
-    let b: Vec<_> = batches.iter().map(|b| (**b).clone()).collect();
-    assert_batches_eq!(&expected, &b);
-
-    batches
+lazy_static! {
+    pub(crate) static ref ARBITRARY_PARTITION_KEY: PartitionKey =
+        PartitionKey::from(ARBITRARY_PARTITION_KEY_STR);
+    pub(crate) static ref ARBITRARY_NAMESPACE_NAME: NamespaceName =
+        NamespaceName::from("namespace-bananas");
+    pub(crate) static ref ARBITRARY_NAMESPACE_NAME_PROVIDER: Arc<dyn NamespaceNameProvider> =
+        Arc::new(MockNamespaceNameProvider::new(&**ARBITRARY_NAMESPACE_NAME));
+    pub(crate) static ref ARBITRARY_TABLE_NAME: TableName = TableName::from("bananas");
+    pub(crate) static ref ARBITRARY_TABLE_PROVIDER: Arc<dyn TableProvider> =
+        Arc::new(MockTableProvider::new(TableMetadata::new_for_testing(
+            ARBITRARY_TABLE_NAME.clone(),
+            TablePartitionTemplateOverride::default()
+        )));
+    pub(crate) static ref ARBITRARY_PARTITION_HASH_ID: PartitionHashId =
+        PartitionHashId::new(ARBITRARY_TABLE_ID, &ARBITRARY_PARTITION_KEY);
+    pub(crate) static ref ARBITRARY_TRANSITION_PARTITION_ID: TransitionPartitionId =
+        TransitionPartitionId::Deterministic(ARBITRARY_PARTITION_HASH_ID.clone());
 }
 
-/// RecordBatches with knowledge of influx metadata
-pub(crate) async fn create_batches_with_influxtype_different_columns() -> Vec<Arc<RecordBatch>> {
-    // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
-    let mut batches = vec![];
-
-    // chunk1 with 10 rows and 3 columns
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_ten_rows_of_data_some_duplicates(),
-    );
-    let batch1 = raw_data(&[chunk1]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+--------------------------------+",
-        "| field_int | tag1 | time                           |",
-        "+-----------+------+--------------------------------+",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "| 1000      | MT   | 1970-01-01T00:00:00.000002Z    |",
-        "| 20        | MT   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000500Z |",
-        "| 10        | AL   | 1970-01-01T00:00:00.000000050Z |",
-        "| 30        | MT   | 1970-01-01T00:00:00.000000005Z |",
-        "+-----------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch1.clone()]);
-    batches.push(Arc::new(batch1));
-
-    // chunk2 having duplicate data with chunk 1
-    // mmore columns
-    let chunk2 = Arc::new(
-        TestChunk::new("t")
-            .with_id(2)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_tag_column("tag2")
-            .with_i64_field_column("field_int2")
-            .with_five_rows_of_data(),
-    );
-    let batch2 = raw_data(&[chunk2]).await[0].clone();
-    let expected = vec![
-        "+-----------+------------+------+------+--------------------------------+",
-        "| field_int | field_int2 | tag1 | tag2 | time                           |",
-        "+-----------+------------+------+------+--------------------------------+",
-        "| 1000      | 1000       | MT   | CT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | 10         | MT   | AL   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | 70         | CT   | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | 100        | AL   | MA   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | 5          | MT   | AL   | 1970-01-01T00:00:00.000005Z    |",
-        "+-----------+------------+------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch2.clone()]);
-    batches.push(Arc::new(batch2));
-
-    batches
-}
-
-/// RecordBatches with knowledge of influx metadata
-pub(crate) async fn create_batches_with_influxtype_different_columns_different_order(
-) -> Vec<Arc<RecordBatch>> {
-    // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
-    let mut batches = vec![];
-
-    // chunk1 with 10 rows and 3 columns
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_tag_column("tag2")
-            .with_ten_rows_of_data_some_duplicates(),
-    );
-    let batch1 = raw_data(&[chunk1]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+------+--------------------------------+",
-        "| field_int | tag1 | tag2 | time                           |",
-        "+-----------+------+------+--------------------------------+",
-        "| 1000      | MT   | CT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | MT   | AL   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | AL   | MA   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | MT   | AL   | 1970-01-01T00:00:00.000000005Z |",
-        "| 1000      | MT   | CT   | 1970-01-01T00:00:00.000002Z    |",
-        "| 20        | MT   | AL   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | CT   | 1970-01-01T00:00:00.000000500Z |",
-        "| 10        | AL   | MA   | 1970-01-01T00:00:00.000000050Z |",
-        "| 30        | MT   | AL   | 1970-01-01T00:00:00.000000005Z |",
-        "+-----------+------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch1.clone()]);
-    batches.push(Arc::new(batch1.clone()));
-
-    // chunk2 having duplicate data with chunk 1
-    // mmore columns
-    let chunk2 = Arc::new(
-        TestChunk::new("t")
-            .with_id(2)
-            .with_time_column()
-            .with_tag_column("tag2")
-            .with_i64_field_column("field_int")
-            .with_five_rows_of_data(),
-    );
-    let batch2 = raw_data(&[chunk2]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+--------------------------------+",
-        "| field_int | tag2 | time                           |",
-        "+-----------+------+--------------------------------+",
-        "| 1000      | CT   | 1970-01-01T00:00:00.000001Z    |",
-        "| 10        | AL   | 1970-01-01T00:00:00.000007Z    |",
-        "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |",
-        "| 100       | MA   | 1970-01-01T00:00:00.000000050Z |",
-        "| 5         | AL   | 1970-01-01T00:00:00.000005Z    |",
-        "+-----------+------+--------------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch2.clone()]);
-    batches.push(Arc::new(batch2));
-
-    batches
-}
-
-/// Has 2 tag columns; tag1 has a lower cardinality (3) than tag3 (4)
-pub(crate) async fn create_batches_with_influxtype_different_cardinality() -> Vec<Arc<RecordBatch>>
-{
-    // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
-    let mut batches = vec![];
-
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_tag_column("tag3")
-            .with_four_rows_of_data(),
-    );
-    let batch1 = raw_data(&[chunk1]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+------+-----------------------------+",
-        "| field_int | tag1 | tag3 | time                        |",
-        "+-----------+------+------+-----------------------------+",
-        "| 1000      | WA   | TX   | 1970-01-01T00:00:00.000028Z |",
-        "| 10        | VT   | PR   | 1970-01-01T00:00:00.000210Z |",
-        "| 70        | UT   | OR   | 1970-01-01T00:00:00.000220Z |",
-        "| 50        | VT   | AL   | 1970-01-01T00:00:00.000210Z |",
-        "+-----------+------+------+-----------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch1.clone()]);
-    batches.push(Arc::new(batch1.clone()));
-
-    let chunk2 = Arc::new(
-        TestChunk::new("t")
-            .with_id(2)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_tag_column("tag3")
-            .with_i64_field_column("field_int")
-            .with_four_rows_of_data(),
-    );
-    let batch2 = raw_data(&[chunk2]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+------+-----------------------------+",
-        "| field_int | tag1 | tag3 | time                        |",
-        "+-----------+------+------+-----------------------------+",
-        "| 1000      | WA   | TX   | 1970-01-01T00:00:00.000028Z |",
-        "| 10        | VT   | PR   | 1970-01-01T00:00:00.000210Z |",
-        "| 70        | UT   | OR   | 1970-01-01T00:00:00.000220Z |",
-        "| 50        | VT   | AL   | 1970-01-01T00:00:00.000210Z |",
-        "+-----------+------+------+-----------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch2.clone()]);
-    batches.push(Arc::new(batch2));
-
-    batches
-}
-
-/// RecordBatches with knowledge of influx metadata
-pub(crate) async fn create_batches_with_influxtype_same_columns_different_type(
-) -> Vec<Arc<RecordBatch>> {
-    // Use the available TestChunk to create chunks and then convert them to raw RecordBatches
-    let mut batches = vec![];
-
-    // chunk1
-    let chunk1 = Arc::new(
-        TestChunk::new("t")
-            .with_id(1)
-            .with_time_column()
-            .with_tag_column("tag1")
-            .with_i64_field_column("field_int")
-            .with_three_rows_of_data(),
-    );
-    let batch1 = raw_data(&[chunk1]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+-----------------------------+",
-        "| field_int | tag1 | time                        |",
-        "+-----------+------+-----------------------------+",
-        "| 1000      | WA   | 1970-01-01T00:00:00.000008Z |",
-        "| 10        | VT   | 1970-01-01T00:00:00.000010Z |",
-        "| 70        | UT   | 1970-01-01T00:00:00.000020Z |",
-        "+-----------+------+-----------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch1.clone()]);
-    batches.push(Arc::new(batch1));
-
-    // chunk2 having duplicate data with chunk 1
-    // mmore columns
-    let chunk2 = Arc::new(
-        TestChunk::new("t")
-            .with_id(2)
-            .with_time_column()
-            .with_u64_column("field_int") //  u64 type but on existing name "field_int" used for i64 in chunk 1
-            .with_tag_column("tag2")
-            .with_three_rows_of_data(),
-    );
-    let batch2 = raw_data(&[chunk2]).await[0].clone();
-    let expected = vec![
-        "+-----------+------+-----------------------------+",
-        "| field_int | tag2 | time                        |",
-        "+-----------+------+-----------------------------+",
-        "| 1000      | SC   | 1970-01-01T00:00:00.000008Z |",
-        "| 10        | NC   | 1970-01-01T00:00:00.000010Z |",
-        "| 70        | RI   | 1970-01-01T00:00:00.000020Z |",
-        "+-----------+------+-----------------------------+",
-    ];
-    assert_batches_eq!(&expected, &[batch2.clone()]);
-    batches.push(Arc::new(batch2));
-
-    batches
-}
-
-pub(crate) const TEST_NAMESPACE: &str = "test_namespace";
-pub(crate) const TEST_TABLE: &str = "test_table";
-pub(crate) const TEST_PARTITION_1: &str = "test+partition_1";
-pub(crate) const TEST_PARTITION_2: &str = "test+partition_2";
-
-/// This function produces one scenario but with the parameter combination (2*7),
-/// you will be able to produce 14 scenarios by calling it in 2 loops
-pub(crate) async fn make_ingester_data(
-    two_partitions: bool,
-) -> (IngesterData, NamespaceId, TableId) {
-    // Whatever data because they won't be used in the tests
-    let metrics: Arc<metric::Registry> = Default::default();
-    let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-    let object_store = Arc::new(InMemory::new());
-    let exec = Arc::new(iox_query::exec::Executor::new_testing());
-    let lifecycle = LifecycleManager::new(
-        LifecycleConfig::new(
-            200_000_000,
-            100_000_000,
-            100_000_000,
-            Duration::from_secs(100_000_000),
-            Duration::from_secs(100_000_000),
-            100_000_000,
-        ),
-        Arc::clone(&metrics),
-        Arc::new(SystemProvider::default()),
-    );
-
-    // Make data for one shard and two tables
-    let shard_index = ShardIndex::new(1);
-    let (shard_id, ns_id, table_id) =
-        populate_catalog(&*catalog, shard_index, TEST_NAMESPACE, TEST_TABLE).await;
-
-    let ingester = IngesterData::new(
-        object_store,
-        Arc::clone(&catalog),
-        [(shard_id, shard_index)],
-        exec,
-        backoff::BackoffConfig::default(),
-        metrics,
-    )
-    .await
-    .expect("failed to initialise ingester");
-
-    // Make partitions per requested
-    let ops = make_partitions(two_partitions, shard_index, table_id, ns_id);
-
-    // Apply all ops
-    for op in ops {
-        ingester
-            .buffer_operation(shard_id, op, &lifecycle.handle())
-            .await
-            .unwrap();
-    }
-
-    (ingester, ns_id, table_id)
-}
-
-/// Make data for one or two partitions per requested
-pub(crate) fn make_partitions(
-    two_partitions: bool,
-    shard_index: ShardIndex,
+/// Build a [`PartitionData`] with mostly arbitrary-yet-valid values for tests.
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionDataBuilder {
+    partition_id: Option<TransitionPartitionId>,
+    partition_key: PartitionKey,
+    namespace_id: Option<NamespaceId>,
     table_id: TableId,
-    ns_id: NamespaceId,
-) -> Vec<DmlOperation> {
-    // In-memory data includes these rows but split between 4 groups go into
-    // different batches of parittion 1 or partittion 2  as requeted
-    // let expected = vec![
-    //         "+------------+-----+------+--------------------------------+",
-    //         "| city       | day | temp | time                           |",
-    //         "+------------+-----+------+--------------------------------+",
-    //         "| Andover    | tue | 56   | 1970-01-01T00:00:00.000000030Z |", // in group 1 - seq_num: 2
-    //         "| Andover    | mon |      | 1970-01-01T00:00:00.000000046Z |", // in group 2 - seq_num: 3
-    //         "| Boston     | sun | 60   | 1970-01-01T00:00:00.000000036Z |", // in group 1 - seq_num: 1
-    //         "| Boston     | mon |      | 1970-01-01T00:00:00.000000038Z |", // in group 3 - seq_num: 5
-    //         "| Medford    | sun | 55   | 1970-01-01T00:00:00.000000022Z |", // in group 4 - seq_num: 7
-    //         "| Medford    | wed |      | 1970-01-01T00:00:00.000000026Z |", // in group 2 - seq_num: 4
-    //         "| Reading    | mon | 58   | 1970-01-01T00:00:00.000000040Z |", // in group 4 - seq_num: 8
-    //         "| Wilmington | mon |      | 1970-01-01T00:00:00.000000035Z |", // in group 3 - seq_num: 6
-    //         "+------------+-----+------+--------------------------------+",
-    //     ];
-
-    // ------------------------------------------
-    // Build the first partition
-    let (mut ops, seq_num) = make_first_partition_data(
-        &PartitionKey::from(TEST_PARTITION_1),
-        shard_index,
-        table_id,
-        ns_id,
-    );
-
-    // ------------------------------------------
-    // Build the second partition if asked
-
-    let mut seq_num = seq_num.get();
-    if two_partitions {
-        // Group 4: in buffer of p2
-        ops.push(DmlOperation::Write(make_write_op(
-            &PartitionKey::from(TEST_PARTITION_2),
-            shard_index,
-            ns_id,
-            TEST_TABLE,
-            table_id,
-            seq_num,
-            r#"test_table,city=Medford day="sun",temp=55 22"#,
-        )));
-        seq_num += 1;
-
-        ops.push(DmlOperation::Write(make_write_op(
-            &PartitionKey::from(TEST_PARTITION_2),
-            shard_index,
-            ns_id,
-            TEST_TABLE,
-            table_id,
-            seq_num,
-            r#"test_table,city=Reading day="mon",temp=58 40"#,
-        )));
-    } else {
-        // Group 4: in buffer of p1
-        ops.push(DmlOperation::Write(make_write_op(
-            &PartitionKey::from(TEST_PARTITION_1),
-            shard_index,
-            ns_id,
-            TEST_TABLE,
-            table_id,
-            seq_num,
-            r#"test_table,city=Medford day="sun",temp=55 22"#,
-        )));
-        seq_num += 1;
-
-        ops.push(DmlOperation::Write(make_write_op(
-            &PartitionKey::from(TEST_PARTITION_1),
-            shard_index,
-            ns_id,
-            TEST_TABLE,
-            table_id,
-            seq_num,
-            r#"test_table,city=Reading day="mon",temp=58 40"#,
-        )));
-    }
-
-    ops
+    table_loader: Option<Arc<DeferredLoad<TableMetadata>>>,
+    namespace_loader: Option<Arc<DeferredLoad<NamespaceName>>>,
+    sort_key: Option<SortKeyState>,
+    partition_counter: Option<Arc<PartitionCounter>>,
 }
 
+impl Default for PartitionDataBuilder {
+    fn default() -> Self {
+        Self {
+            table_id: ARBITRARY_TABLE_ID,
+            partition_key: ARBITRARY_PARTITION_KEY.clone(),
+            partition_id: None,
+            namespace_id: None,
+            table_loader: None,
+            namespace_loader: None,
+            sort_key: None,
+            partition_counter: None,
+        }
+    }
+}
+
+impl PartitionDataBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn with_deprecated_partition_id(mut self, partition_id: PartitionId) -> Self {
+        self.partition_id = Some(TransitionPartitionId::Deprecated(partition_id));
+        self
+    }
+
+    pub(crate) fn with_partition_key(mut self, partition_key: PartitionKey) -> Self {
+        self.partition_key = partition_key;
+        self
+    }
+
+    pub(crate) fn partition_key(&self) -> &PartitionKey {
+        &self.partition_key
+    }
+
+    pub(crate) fn with_namespace_id(mut self, namespace_id: NamespaceId) -> Self {
+        self.namespace_id = Some(namespace_id);
+        self
+    }
+
+    pub(crate) fn with_table_id(mut self, table_id: TableId) -> Self {
+        self.table_id = table_id;
+        self
+    }
+
+    pub(crate) fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) fn with_table_loader(
+        mut self,
+        table_loader: Arc<DeferredLoad<TableMetadata>>,
+    ) -> Self {
+        self.table_loader = Some(table_loader);
+        self
+    }
+
+    pub(crate) fn table_loader(&self) -> Option<Arc<DeferredLoad<TableMetadata>>> {
+        self.table_loader.clone()
+    }
+
+    pub(crate) fn with_namespace_loader(
+        mut self,
+        namespace_loader: Arc<DeferredLoad<NamespaceName>>,
+    ) -> Self {
+        self.namespace_loader = Some(namespace_loader);
+        self
+    }
+
+    pub(crate) fn namespace_loader(&self) -> Option<Arc<DeferredLoad<NamespaceName>>> {
+        self.namespace_loader.clone()
+    }
+
+    pub(crate) fn with_sort_key_state(mut self, sort_key_state: SortKeyState) -> Self {
+        self.sort_key = Some(sort_key_state);
+        self
+    }
+
+    pub(crate) fn with_partition_counter(
+        mut self,
+        partition_counter: Arc<PartitionCounter>,
+    ) -> Self {
+        self.partition_counter = Some(partition_counter);
+        self
+    }
+
+    pub(crate) fn partition_counter(&self) -> Option<Arc<PartitionCounter>> {
+        self.partition_counter.clone()
+    }
+
+    /// Generate a valid [`PartitionData`] for use in tests where the exact values (or at least
+    /// some of them) don't particularly matter.
+    pub(crate) fn build(self) -> PartitionData {
+        let partition_id = self.partition_id.unwrap_or_else(|| {
+            TransitionPartitionId::Deterministic(PartitionHashId::new(
+                self.table_id,
+                &self.partition_key,
+            ))
+        });
+
+        PartitionData::new(
+            partition_id,
+            self.partition_key,
+            self.namespace_id.unwrap_or(ARBITRARY_NAMESPACE_ID),
+            self.namespace_loader
+                .unwrap_or_else(defer_namespace_name_1_sec),
+            self.table_id,
+            self.table_loader.unwrap_or_else(defer_table_metadata_1_sec),
+            self.sort_key.unwrap_or(SortKeyState::Provided(None, None)),
+            self.partition_counter
+                .unwrap_or_else(|| Arc::new(PartitionCounter::new(NonZeroUsize::MAX))),
+        )
+    }
+}
+
+/// Generate a [`RecordBatch`] & [`Schema`] with the specified columns and
+/// values:
+///
+/// ```
+/// // Generate a two column batch ("a" and "b") with the given types & values:
+/// let (batch, schema) = make_batch!(
+///     Int64Array("a" => vec![1, 2, 3, 4]),
+///     Float32Array("b" => vec![4.1, 4.2, 4.3, 4.4]),
+/// );
+/// ```
+///
+/// # Panics
+///
+/// Panics if the batch cannot be constructed from the provided inputs.
+///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
+/// [`RecordBatch`]: arrow::datatypes::Schema
+#[macro_export]
+macro_rules! make_batch {(
+        $(
+            $ty:tt($name:literal => $v:expr),
+        )+
+    ) => {{
+        use std::sync::Arc;
+        use arrow::{array::Array, datatypes::{Field, Schema}, record_batch::RecordBatch};
+
+        // Generate the data arrays
+        let data = vec![
+            $(Arc::new($ty::from($v)) as Arc<dyn Array>,)+
+        ];
+
+        // Generate the field types for the schema
+        let schema = Arc::new(Schema::new(vec![
+            $(Field::new($name, $ty::from($v).data_type().clone(), true),)+
+        ]));
+
+        (
+            RecordBatch::try_new(Arc::clone(&schema), data)
+                .expect("failed to make batch"),
+            schema
+        )
+    }}
+}
+
+/// Construct a [`PartitionStream`] from the given partitions & batches.
+///
+/// This example constructs a [`PartitionStream`] yielding two partitions
+/// (with IDs 1 & 2), the former containing two [`RecordBatch`] and the
+/// latter containing one.
+///
+/// See [`make_batch`] for a handy way to construct the [`RecordBatch`].
+///
+/// ```
+/// let stream = make_partition_stream!(
+///     PartitionId::new(1) => [
+///         make_batch!(
+///             Int64Array("a" => vec![1, 2, 3, 4, 5]),
+///             Float32Array("b" => vec![4.1, 4.2, 4.3, 4.4, 5.0]),
+///         ),
+///         make_batch!(
+///             Int64Array("c" => vec![1, 2, 3, 4, 5]),
+///         ),
+///     ],
+///     PartitionId::new(2) => [
+///         make_batch!(
+///             Float32Array("d" => vec![1.1, 2.2, 3.3, 4.4, 5.5]),
+///         ),
+///     ],
+/// );
+/// ```
+#[macro_export]
+macro_rules! make_partition_stream {
+        (
+            $(
+                $id:expr => [$($batch:expr,)+],
+            )+
+        ) => {{
+            use arrow::datatypes::Schema;
+            use $crate::{
+                query::{response::PartitionStream, partition_response::PartitionResponse},
+                test_util::ARBITRARY_PARTITION_KEY,
+            };
+            use data_types::{TableId, TransitionPartitionId};
+            use futures::stream;
+
+            PartitionStream::new(stream::iter([
+                $({
+                    let mut batches = vec![];
+                    let mut schema = Schema::empty();
+                    $(
+                        let (batch, this_schema) = $batch;
+                        batches.push(batch);
+                        schema = Schema::try_merge([
+                            schema,
+                            (*this_schema).clone()
+                        ]).expect("incompatible batch schemas");
+                    )+
+                    drop(schema);
+
+                    PartitionResponse::new(
+                        batches,
+                        TransitionPartitionId::new(
+                            TableId::new($id),
+                            &*ARBITRARY_PARTITION_KEY,
+                        ),
+                        42,
+                    )
+                },)+
+            ]))
+        }};
+    }
+
+/// Construct a [`WriteOperation`] with the specified parameters, for LP that contains
+/// a single table identified by `table_id`.
+///
+/// # Panics
+///
+/// This method panics if `lines` contains data for more than one table.
+#[track_caller]
 pub(crate) fn make_write_op(
     partition_key: &PartitionKey,
-    shard_index: ShardIndex,
     namespace_id: NamespaceId,
     table_name: &str,
     table_id: TableId,
-    sequence_number: i64,
+    sequence_number: u64,
     lines: &str,
-) -> DmlWrite {
-    let mut tables_by_name = lines_to_batches(lines, 0).unwrap();
-    assert_eq!(tables_by_name.len(), 1);
+    span_ctx: Option<SpanContext>,
+) -> WriteOperation {
+    let mut tables_by_name = lines_to_batches(lines, 0).expect("invalid LP");
+    assert_eq!(
+        tables_by_name.len(),
+        1,
+        "make_write_op only supports 1 table in the LP"
+    );
 
-    let tables_by_id = [(table_id, tables_by_name.remove(table_name).unwrap())]
-        .into_iter()
-        .collect();
-    DmlWrite::new(
-        namespace_id,
-        tables_by_id,
-        partition_key.clone(),
-        DmlMeta::sequenced(
-            Sequence {
-                shard_index,
-                sequence_number: SequenceNumber::new(sequence_number),
-            },
-            Time::MIN,
-            None,
-            42,
-        ),
-    )
+    let tables_by_id = [(
+        table_id,
+        tables_by_name
+            .remove(table_name)
+            .expect("table_name does not exist in LP"),
+    )]
+    .into_iter()
+    .map(|(table_id, mutable_batch)| {
+        (
+            table_id,
+            TableData::new(
+                table_id,
+                PartitionedData::new(SequenceNumber::new(sequence_number), mutable_batch),
+            ),
+        )
+    })
+    .collect();
+
+    WriteOperation::new(namespace_id, tables_by_id, partition_key.clone(), span_ctx)
 }
 
-fn make_first_partition_data(
+/// Construct a [`WriteOperation`] with the specified parameters for LP covering
+/// multiple separately sequenced table writes.
+///
+/// # Panics
+///
+/// This method panics if `table_sequence_numbers` contains a different number
+/// of tables to the batches derived from `lines` OR if a [`SequenceNumber`]
+/// is re-used within the write.
+#[track_caller]
+pub(crate) fn make_multi_table_write_op<
+    'a,
+    I: ExactSizeIterator<Item = (&'a str, TableId, SequenceNumber)>,
+>(
     partition_key: &PartitionKey,
-    shard_index: ShardIndex,
-    table_id: TableId,
-    ns_id: NamespaceId,
-) -> (Vec<DmlOperation>, SequenceNumber) {
-    // In-memory data includes these rows but split between 3 groups go into
-    // different batches of parittion p1
-    // let expected = vec![
-    //         "+------------+-----+------+--------------------------------+",
-    //         "| city       | day | temp | time                           |",
-    //         "+------------+-----+------+--------------------------------+",
-    //         "| Andover    | tue | 56   | 1970-01-01T00:00:00.000000030Z |", // in group 1 - seq_num: 2
-    //         "| Andover    | mon |      | 1970-01-01T00:00:00.000000046Z |", // in group 2 - seq_num: 3
-    //         "| Boston     | sun | 60   | 1970-01-01T00:00:00.000000036Z |", // in group 1 - seq_num: 1
-    //         "| Boston     | mon |      | 1970-01-01T00:00:00.000000038Z |", // in group 3 - seq_num: 5
-    //         "| Medford    | wed |      | 1970-01-01T00:00:00.000000026Z |", // in group 2 - seq_num: 4
-    //         "| Wilmington | mon |      | 1970-01-01T00:00:00.000000035Z |", // in group 3 - seq_num: 6
-    //         "+------------+-----+------+--------------------------------+",
-    //     ];
+    namespace_id: NamespaceId,
+    table_sequence_numbers: I,
+    lines: &str,
+) -> WriteOperation {
+    let mut tables_by_name = lines_to_batches(lines, 0).expect("invalid LP");
+    assert_eq!(
+        tables_by_name.len(),
+        table_sequence_numbers.len(),
+        "number of tables in LP does not match number of table_sequence_numbers"
+    );
 
-    let mut out = Vec::default();
+    let mut seen_sequence_numbers = HashSet::<SequenceNumber>::new();
 
-    // ------------------------------------------
-    // Build the first partition
-    let mut seq_num = 0;
+    let tables_by_id = table_sequence_numbers
+        .map(|(table_name, table_id, sequence_number)| {
+            let mb = tables_by_name
+                .remove(table_name)
+                .expect("table name does not exist in LP");
+            assert!(
+                seen_sequence_numbers.insert(sequence_number),
+                "duplicate sequence number {sequence_number:?} observed"
+            );
+            (
+                table_id,
+                TableData::new(table_id, PartitionedData::new(sequence_number, mb)),
+            )
+        })
+        .collect();
 
-    // --------------------
-    // Group 1
-    out.push(DmlOperation::Write(make_write_op(
-        partition_key,
-        shard_index,
-        ns_id,
-        TEST_TABLE,
-        table_id,
-        seq_num,
-        r#"test_table,city=Boston day="sun",temp=60 36"#,
-    )));
-    seq_num += 1;
+    WriteOperation::new(namespace_id, tables_by_id, partition_key.clone(), None)
+}
 
-    out.push(DmlOperation::Write(make_write_op(
-        partition_key,
-        shard_index,
-        ns_id,
-        TEST_TABLE,
-        table_id,
-        seq_num,
-        r#"test_table,city=Andover day="tue",temp=56 30"#,
-    )));
-    seq_num += 1;
-
-    // --------------------
-    // Group 2
-    out.push(DmlOperation::Write(make_write_op(
-        partition_key,
-        shard_index,
-        ns_id,
-        TEST_TABLE,
-        table_id,
-        seq_num,
-        r#"test_table,city=Andover day="mon" 46"#,
-    )));
-    seq_num += 1;
-
-    out.push(DmlOperation::Write(make_write_op(
-        partition_key,
-        shard_index,
-        ns_id,
-        TEST_TABLE,
-        table_id,
-        seq_num,
-        r#"test_table,city=Medford day="wed" 26"#,
-    )));
-    seq_num += 1;
-
-    // --------------------
-    // Group 3: always in buffer
-    // Fill `buffer`
-    out.push(DmlOperation::Write(make_write_op(
-        partition_key,
-        shard_index,
-        ns_id,
-        TEST_TABLE,
-        table_id,
-        seq_num,
-        r#"test_table,city=Boston day="mon" 38"#,
-    )));
-    seq_num += 1;
-
-    out.push(DmlOperation::Write(make_write_op(
-        partition_key,
-        shard_index,
-        ns_id,
-        TEST_TABLE,
-        table_id,
-        seq_num,
-        r#"test_table,city=Wilmington day="mon" 35"#,
-    )));
-    seq_num += 1;
-
-    (out, SequenceNumber::new(seq_num))
+/// Return a persist completion notification for the given
+/// sequence numbers.
+pub(crate) fn new_persist_notification<T>(sequence_numbers: T) -> Arc<CompletedPersist>
+where
+    T: IntoIterator<Item = u64>,
+{
+    Arc::new(CompletedPersist::new(
+        ParquetFile {
+            id: ParquetFileId::new(42),
+            to_delete: None,
+            namespace_id: NamespaceId::new(1),
+            table_id: TableId::new(2),
+            partition_id: ARBITRARY_TRANSITION_PARTITION_ID.clone(),
+            object_store_id: Default::default(),
+            min_time: Timestamp::new(42),
+            max_time: Timestamp::new(42),
+            file_size_bytes: 42424242,
+            row_count: 24,
+            compaction_level: data_types::CompactionLevel::Initial,
+            created_at: Timestamp::new(1234),
+            column_set: ColumnSet::new([1, 2, 3, 4].into_iter().map(ColumnId::new)),
+            max_l0_created_at: Timestamp::new(42),
+        },
+        sequence_numbers
+            .into_iter()
+            .map(SequenceNumber::new)
+            .collect(),
+    ))
 }
 
 pub(crate) async fn populate_catalog(
     catalog: &dyn Catalog,
-    shard_index: ShardIndex,
     namespace: &str,
     table: &str,
-) -> (ShardId, NamespaceId, TableId) {
+) -> (NamespaceId, TableId) {
     let mut c = catalog.repositories().await;
-    let topic = c.topics().create_or_get("kafka-topic").await.unwrap();
-    let query_pool = c.query_pools().create_or_get("query-pool").await.unwrap();
-    let ns_id = c
-        .namespaces()
-        .create(namespace, None, topic.id, query_pool.id)
+    let ns_id = arbitrary_namespace(&mut *c, namespace).await.id;
+    let table_id = c
+        .tables()
+        .create(table, Default::default(), ns_id)
         .await
         .unwrap()
         .id;
-    let table_id = c.tables().create_or_get(table, ns_id).await.unwrap().id;
-    let shard_id = c
-        .shards()
-        .create_or_get(&topic, shard_index)
+
+    (ns_id, table_id)
+}
+
+pub(crate) async fn populate_catalog_with_table_columns(
+    catalog: &dyn Catalog,
+    namespace: &str,
+    table: &str,
+    columns: &[&str],
+) -> (NamespaceId, TableId, Vec<ColumnId>) {
+    let mut c = catalog.repositories().await;
+    let ns_id = arbitrary_namespace(&mut *c, namespace).await.id;
+    let table_id = c
+        .tables()
+        .create(table, Default::default(), ns_id)
         .await
         .unwrap()
         .id;
-    (shard_id, ns_id, table_id)
+
+    let mut column_ids = Vec::with_capacity(columns.len());
+    for column in columns {
+        column_ids.push(
+            c.columns()
+                .create_or_get(column, table_id, data_types::ColumnType::Tag)
+                .await
+                .expect("create column failed")
+                .id,
+        );
+    }
+
+    (ns_id, table_id, column_ids)
+}
+
+/// Assert `a` and `b` have identical metadata, and that when converting
+/// them to Arrow batches they produces identical output.
+#[track_caller]
+pub(crate) fn assert_write_ops_eq(a: WriteOperation, b: WriteOperation) {
+    assert_eq!(a.namespace(), b.namespace(), "namespace");
+    assert_eq!(a.tables().count(), b.tables().count(), "table count");
+    assert_eq!(a.partition_key(), b.partition_key(), "partition key");
+
+    // Assert sequence numbers were reassigned
+    for (a_table, b_table) in a.tables().zip(b.tables()) {
+        assert_eq!(a_table.0, b_table.0, "table id mismatch");
+        assert_eq!(
+            a_table.1.partitioned_data().sequence_number(),
+            b_table.1.partitioned_data().sequence_number(),
+            "sequence number mismatch"
+        );
+    }
+
+    let a = a.into_tables().collect::<BTreeMap<_, _>>();
+    let b = b.into_tables().collect::<BTreeMap<_, _>>();
+
+    a.into_iter().zip(b).for_each(|(a, b)| {
+        assert_eq!(a.0, b.0, "table IDs differ - a table is missing!");
+        assert_eq!(
+            a.1.partitioned_data()
+                .data()
+                .clone()
+                .to_arrow(Projection::All)
+                .expect("failed projection for a"),
+            b.1.partitioned_data()
+                .data()
+                .clone()
+                .to_arrow(Projection::All)
+                .expect("failed projection for b"),
+            "table data differs"
+        );
+    })
 }

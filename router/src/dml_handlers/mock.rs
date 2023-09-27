@@ -1,10 +1,9 @@
-use std::{collections::VecDeque, fmt::Debug};
+use std::{collections::VecDeque, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use data_types::{NamespaceName, NamespaceSchema};
 use parking_lot::Mutex;
 use trace::ctx::SpanContext;
-use write_summary::WriteSummary;
 
 use super::{DmlError, DmlHandler};
 
@@ -14,22 +13,15 @@ use super::{DmlError, DmlHandler};
 pub enum MockDmlHandlerCall<W> {
     Write {
         namespace: String,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         write_input: W,
-    },
-    Delete {
-        namespace: String,
-        namespace_id: NamespaceId,
-        table: String,
-        predicate: DeletePredicate,
     },
 }
 
 #[derive(Debug)]
 struct Inner<W> {
     calls: Vec<MockDmlHandlerCall<W>>,
-    write_return: VecDeque<Result<WriteSummary, DmlError>>,
-    delete_return: VecDeque<Result<(), DmlError>>,
+    write_return: VecDeque<Result<(), DmlError>>,
 }
 
 impl<W> Default for Inner<W> {
@@ -37,7 +29,6 @@ impl<W> Default for Inner<W> {
         Self {
             calls: Default::default(),
             write_return: Default::default(),
-            delete_return: Default::default(),
         }
     }
 }
@@ -61,16 +52,8 @@ impl<W> MockDmlHandler<W>
 where
     W: Clone,
 {
-    pub fn with_write_return(
-        self,
-        ret: impl Into<VecDeque<Result<WriteSummary, DmlError>>>,
-    ) -> Self {
+    pub fn with_write_return(self, ret: impl Into<VecDeque<Result<(), DmlError>>>) -> Self {
         self.0.lock().write_return = ret.into();
-        self
-    }
-
-    pub fn with_delete_return(self, ret: impl Into<VecDeque<Result<(), DmlError>>>) -> Self {
-        self.0.lock().delete_return = ret.into();
         self
     }
 
@@ -97,14 +80,13 @@ where
     W: Debug + Send + Sync,
 {
     type WriteError = DmlError;
-    type DeleteError = DmlError;
     type WriteInput = W;
-    type WriteOutput = WriteSummary;
+    type WriteOutput = ();
 
     async fn write(
         &self,
         namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         write_input: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
@@ -112,30 +94,10 @@ where
             self,
             MockDmlHandlerCall::Write {
                 namespace: namespace.into(),
-                namespace_id,
+                namespace_schema,
                 write_input,
             },
             write_return
-        )
-    }
-
-    async fn delete(
-        &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
-        table_name: &str,
-        predicate: &DeletePredicate,
-        _span_ctx: Option<SpanContext>,
-    ) -> Result<(), Self::DeleteError> {
-        record_and_return!(
-            self,
-            MockDmlHandlerCall::Delete {
-                namespace: namespace.into(),
-                namespace_id,
-                table: table_name.to_owned(),
-                predicate: predicate.clone(),
-            },
-            delete_return
         )
     }
 }

@@ -90,8 +90,6 @@ public class Main {
         System.out.println("----- Connecting -------");
         System.out.println("URL: " + url);
         Properties props = new Properties();
-        props.put("user", "test");
-        props.put("password", "**token**");
         Connection conn = DriverManager.getConnection(url, props);
         return conn;
     }
@@ -128,9 +126,30 @@ public class Main {
         print_result_set(md.getCatalogs());
 
         System.out.println("**************");
+        System.out.println("CrossReference");
+        System.out.println("**************");
+        print_result_set(md.getCrossReference(null, null, "system", null, null, "iox"));
+
+        System.out.println("**************");
         System.out.println("Schemas:");
         System.out.println("**************");
         print_result_set(md.getSchemas());
+
+        System.out.println("**************");
+        System.out.println("ExportedKeys");
+        System.out.println("**************");
+        print_result_set(md.getExportedKeys(null, null, "system"));
+
+
+        System.out.println("**************");
+        System.out.println("ImportedKeys");
+        System.out.println("**************");
+        print_result_set(md.getImportedKeys(null, null, "system"));
+
+        System.out.println("**************");
+        System.out.println("PrimaryKeys:");
+        System.out.println("**************");
+        print_result_set(md.getPrimaryKeys(null, null, "system"));
 
         System.out.println("**************");
         System.out.println("Tables:");
@@ -148,12 +167,15 @@ public class Main {
         System.out.println("**************");
         print_result_set(md.getTableTypes());
 
+        System.out.println("**************");
+        System.out.println("getColumns:");
+        System.out.println("**************");
+        print_result_set(md.getColumns(null, null, null, null));
 
-        // TODO uncomment when GetTables is implemented
-        //System.out.println("**************");
-        //System.out.println("getColumns:");
-        //System.out.println("**************");
-        //print_result_set(md.getColumns(null, null, null, null));
+        System.out.println("**************");
+        System.out.println("Type Info:");
+        System.out.println("**************");
+        print_result_set(md.getTypeInfo());
 
         System.out.println("**************");
         System.out.println("getFunctions:");
@@ -216,7 +238,6 @@ public class Main {
         System.out.println("getSystemFunctions: " + md.getSystemFunctions());
         System.out.println("getTimeDateFunctions: " + md.getTimeDateFunctions());
         System.out.println("getURL: " + md.getURL());
-        System.out.println("getUserName: " + md.getUserName());
         System.out.println("isCatalogAtStart: " + md.isCatalogAtStart());
         System.out.println("isReadOnly: " + md.isReadOnly());
         System.out.println("locatorsUpdateCopy: " + md.locatorsUpdateCopy());

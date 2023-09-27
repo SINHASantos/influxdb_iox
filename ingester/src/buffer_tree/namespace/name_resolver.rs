@@ -18,6 +18,7 @@ pub(crate) struct NamespaceNameResolver {
     max_smear: Duration,
     catalog: Arc<dyn Catalog>,
     backoff_config: BackoffConfig,
+    metrics: Arc<metric::Registry>,
 }
 
 impl NamespaceNameResolver {
@@ -25,11 +26,13 @@ impl NamespaceNameResolver {
         max_smear: Duration,
         catalog: Arc<dyn Catalog>,
         backoff_config: BackoffConfig,
+        metrics: Arc<metric::Registry>,
     ) -> Self {
         Self {
             max_smear,
             catalog,
             backoff_config,
+            metrics,
         }
     }
 
@@ -51,7 +54,11 @@ impl NamespaceNameResolver {
                     // will prevent new writes to the deleted namespace.
                     .get_by_id(namespace_id, SoftDeletedRows::AllRows)
                     .await?
-                    .expect("resolving namespace name for non-existent namespace id")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "resolving namespace name for non-existent namespace id {namespace_id}"
+                        )
+                    })
                     .name
                     .into();
 
@@ -67,6 +74,7 @@ impl NamespaceNameProvider for NamespaceNameResolver {
         DeferredLoad::new(
             self.max_smear,
             Self::fetch(id, Arc::clone(&self.catalog), self.backoff_config.clone()),
+            &metric::Registry::default(),
         )
     }
 }
@@ -86,16 +94,14 @@ pub(crate) mod mock {
         }
     }
 
-    impl Default for MockNamespaceNameProvider {
-        fn default() -> Self {
-            Self::new("bananas")
-        }
-    }
-
     impl NamespaceNameProvider for MockNamespaceNameProvider {
         fn for_namespace(&self, _id: NamespaceId) -> DeferredLoad<NamespaceName> {
             let name = self.name.clone();
-            DeferredLoad::new(Duration::from_secs(1), async { name })
+            DeferredLoad::new(
+                Duration::from_secs(1),
+                async { name },
+                &metric::Registry::default(),
+            )
         }
     }
 }
@@ -104,13 +110,11 @@ pub(crate) mod mock {
 mod tests {
     use std::sync::Arc;
 
-    use data_types::ShardIndex;
     use test_helpers::timeout::FutureTimeout;
 
     use super::*;
     use crate::test_util::populate_catalog;
 
-    const SHARD_INDEX: ShardIndex = ShardIndex::new(24);
     const TABLE_NAME: &str = "bananas";
     const NAMESPACE_NAME: &str = "platanos";
 
@@ -121,14 +125,14 @@ mod tests {
         let catalog: Arc<dyn Catalog> =
             Arc::new(iox_catalog::mem::MemCatalog::new(Arc::clone(&metrics)));
 
-        // Populate the catalog with the shard / namespace / table
-        let (_shard_id, ns_id, _table_id) =
-            populate_catalog(&*catalog, SHARD_INDEX, NAMESPACE_NAME, TABLE_NAME).await;
+        // Populate the catalog with the namespace / table
+        let (ns_id, _table_id) = populate_catalog(&*catalog, NAMESPACE_NAME, TABLE_NAME).await;
 
         let fetcher = Arc::new(NamespaceNameResolver::new(
             Duration::from_secs(10),
             Arc::clone(&catalog),
             backoff_config.clone(),
+            metrics,
         ));
 
         let got = fetcher

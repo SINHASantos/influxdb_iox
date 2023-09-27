@@ -65,7 +65,7 @@ impl<'a> StepTestState<'a> {
         let retry_duration = Duration::from_secs(MAX_QUERY_RETRY_TIME_SEC);
         let num_parquet_files = self.num_parquet_files.expect(
             "No previous number of Parquet files recorded! \
-                Use `Step::RecordNumParquetFiles` before `Step::WaitForPersisted2`.",
+                Use `Step::RecordNumParquetFiles` before `Step::WaitForPersisted`.",
         );
         let expected_count = num_parquet_files + expected_increase;
 
@@ -100,10 +100,39 @@ impl<'a> StepTestState<'a> {
         let mut catalog_client = influxdb_iox_client::catalog::Client::new(connection);
 
         catalog_client
-            .get_parquet_files_by_namespace(self.cluster.namespace().into())
+            .get_parquet_files_by_namespace(self.cluster.namespace())
             .await
             .map(|parquet_files| parquet_files.len())
             .unwrap_or_default()
+    }
+
+    /// waits for `MAX_QUERY_RETRY_TIME_SEC` for the database to
+    /// report exactly `expected` for its partition keys
+    async fn wait_for_partition_keys(
+        &self,
+        table_name: &str,
+        namespace_name: &Option<String>,
+        expected: &[&str],
+    ) {
+        let retry_duration = Duration::from_secs(MAX_QUERY_RETRY_TIME_SEC);
+        let partition_keys = tokio::time::timeout(retry_duration, async {
+            loop {
+                let mut partition_keys = self
+                    .cluster()
+                    .partition_keys(table_name, namespace_name.clone())
+                    .await;
+                partition_keys.sort();
+                info!("====Read partition keys: {partition_keys:?}");
+
+                if partition_keys == *expected {
+                    return partition_keys;
+                }
+            }
+        })
+        .await
+        .expect("did not get expected partition keys before timeout");
+
+        assert_eq!(partition_keys, *expected);
     }
 }
 
@@ -141,21 +170,34 @@ pub enum Step {
     WriteLineProtocolExpectingError {
         line_protocol: String,
         expected_error_code: StatusCode,
+        expected_error_message: String,
+        expected_line_number: Option<usize>,
+    },
+
+    /// Writes the specified line protocol to the `/api/v2/write` endpoint
+    /// using the specified authorization header, assert the data was
+    /// written successfully.
+    WriteLineProtocolWithAuthorization {
+        line_protocol: String,
+        authorization: String,
     },
 
     /// Ask the catalog service how many Parquet files it has for this cluster's namespace. Do this
     /// before a write where you're interested in when the write has been persisted to Parquet;
-    /// then after the write use `WaitForPersisted2` to observe the change in the number of Parquet
+    /// then after the write use `WaitForPersisted` to observe the change in the number of Parquet
     /// files from the value this step recorded.
     RecordNumParquetFiles,
+
+    /// Query the catalog service for how many parquet files it has for this
+    /// cluster's namespace, asserting the value matches expected.
+    AssertNumParquetFiles { expected: usize },
 
     /// Ask the ingester to persist immediately through the persist service gRPC API
     Persist,
 
     /// Wait for all previously written data to be persisted by observing an increase in the number
-    /// of Parquet files in the catalog as specified for this cluster's namespace. Needed for
-    /// router2/ingester2/querier2.
-    WaitForPersisted2 { expected_increase: usize },
+    /// of Parquet files in the catalog as specified for this cluster's namespace.
+    WaitForPersisted { expected_increase: usize },
 
     /// Set the namespace retention interval to a retention period,
     /// specified in ns relative to `now()`.  `None` represents infinite retention
@@ -193,6 +235,25 @@ pub enum Step {
         expected_message: String,
     },
 
+    /// Run a SQL query using the FlightSQL interface authorized by the
+    /// authorization header. Verify that the
+    /// results match the expected results using the `assert_batches_eq!`
+    /// macro
+    QueryWithAuthorization {
+        sql: String,
+        authorization: String,
+        expected: Vec<&'static str>,
+    },
+
+    /// Run a SQL query using the FlightSQL interface with the `iox-debug` header set.
+    /// Verify that the
+    /// results match the expected results using the `assert_batches_eq!`
+    /// macro
+    QueryWithDebug {
+        sql: String,
+        expected: Vec<&'static str>,
+    },
+
     /// Run a SQL query using the FlightSQL interface, and then verifies
     /// the results using the provided validation function on the
     /// results.
@@ -227,6 +288,31 @@ pub enum Step {
         expected_error_code: tonic::Code,
         expected_message: String,
     },
+
+    /// Run an InfluxQL query using the FlightSQL interface including an
+    /// authorization header. Verify that the results match the expected
+    /// results using the `assert_batches_eq!` macro.
+    InfluxQLQueryWithAuthorization {
+        query: String,
+        authorization: String,
+        expected: Vec<&'static str>,
+    },
+
+    /// Read and verify partition keys for a given table
+    PartitionKeys {
+        table_name: String,
+        namespace_name: Option<String>,
+        expected: Vec<&'static str>,
+    },
+
+    /// Attempt to gracefully shutdown all running ingester instances.
+    ///
+    /// This step blocks until all ingesters have gracefully stopped, or at
+    /// least [`GRACEFUL_SERVER_STOP_TIMEOUT`] elapses before they are killed.
+    ///
+    /// [`GRACEFUL_SERVER_STOP_TIMEOUT`]:
+    ///     crate::server_fixture::GRACEFUL_SERVER_STOP_TIMEOUT
+    GracefulStopIngesters,
 
     /// Retrieve the metrics and verify the results using the provided
     /// validation function.
@@ -280,32 +366,98 @@ where
                         "====Begin writing line protocol to v2 HTTP API:\n{}",
                         line_protocol
                     );
-                    let response = state.cluster.write_to_router(line_protocol).await;
-                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    let response = state.cluster.write_to_router(line_protocol, None).await;
+                    let status = response.status();
+                    let body = hyper::body::to_bytes(response.into_body())
+                        .await
+                        .expect("reading response body");
+                    assert!(
+                        status == StatusCode::NO_CONTENT,
+                        "Invalid response code while writing line protocol:\n\nLine Protocol:\n{}\n\nExpected Status: {}\nActual Status: {}\n\nBody:\n{:?}",
+                        line_protocol,
+                        StatusCode::NO_CONTENT,
+                        status,
+                        body,
+                    );
                     info!("====Done writing line protocol");
                 }
                 Step::WriteLineProtocolExpectingError {
                     line_protocol,
                     expected_error_code,
+                    expected_error_message,
+                    expected_line_number,
                 } => {
                     info!(
                         "====Begin writing line protocol expecting error to v2 HTTP API:\n{}",
                         line_protocol
                     );
-                    let response = state.cluster.write_to_router(line_protocol).await;
+                    let response = state.cluster.write_to_router(line_protocol, None).await;
                     assert_eq!(response.status(), *expected_error_code);
+
+                    let body: serde_json::Value = serde_json::from_slice(
+                        &hyper::body::to_bytes(response.into_body())
+                            .await
+                            .expect("should be able to read response body"),
+                    )
+                    .expect("response body should be valid json");
+
+                    assert_matches::assert_matches!(
+                        body["message"],
+                        serde_json::Value::String(ref s) if s.contains(expected_error_message),
+                        "error message did not match: expected '{}' to contain '{}'",
+                        body["message"],
+                        expected_error_message
+                    );
+
+                    match expected_line_number {
+                        Some(line) => {
+                            assert_matches::assert_matches!(
+                                body["line"],
+                                serde_json::Value::Number(ref n) if n == &serde_json::Number::from(*line),
+                                "error line did not match: expected '{}' to be '{}'",
+                                body["line"],
+                                line
+                            );
+                        }
+                        None => {
+                            assert!(
+                                !body.as_object().unwrap().contains_key("line"),
+                                "error line should not be present"
+                            );
+                        }
+                    };
+
                     info!("====Done writing line protocol expecting error");
+                }
+                Step::WriteLineProtocolWithAuthorization {
+                    line_protocol,
+                    authorization,
+                } => {
+                    info!(
+                        "====Begin writing line protocol (authenticated) to v2 HTTP API:\n{}",
+                        line_protocol
+                    );
+                    let response = state
+                        .cluster
+                        .write_to_router(line_protocol, Some(authorization))
+                        .await;
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    info!("====Done writing line protocol");
                 }
                 // Get the current number of Parquet files in the cluster's namespace before
                 // starting a new write so we can observe a change when waiting for persistence.
                 Step::RecordNumParquetFiles => {
                     state.record_num_parquet_files().await;
                 }
+                Step::AssertNumParquetFiles { expected } => {
+                    let have_files = state.get_num_parquet_files().await;
+                    assert_eq!(have_files, *expected);
+                }
                 // Ask the ingesters to persist immediately through the persist service gRPC API
                 Step::Persist => {
                     state.cluster().persist_ingesters().await;
                 }
-                Step::WaitForPersisted2 { expected_increase } => {
+                Step::WaitForPersisted { expected_increase } => {
                     info!("====Begin waiting for a change in the number of Parquet files");
                     state
                         .wait_for_num_parquet_file_change(*expected_increase)
@@ -340,12 +492,15 @@ where
                 Step::Query { sql, expected } => {
                     info!("====Begin running SQL query: {}", sql);
                     // run query
-                    let batches = run_sql(
+                    let (mut batches, schema) = run_sql(
                         sql,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
+                        None,
+                        false,
                     )
                     .await;
+                    batches.push(RecordBatch::new_empty(schema));
                     assert_batches_sorted_eq!(expected, &batches);
                     info!("====Done running");
                 }
@@ -380,6 +535,8 @@ where
                         sql,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        false,
                     )
                     .await
                     .unwrap_err();
@@ -388,13 +545,49 @@ where
 
                     info!("====Done running");
                 }
+                Step::QueryWithAuthorization {
+                    sql,
+                    authorization,
+                    expected,
+                } => {
+                    info!("====Begin running SQL query (authenticated): {}", sql);
+                    // run query
+                    let (mut batches, schema) = run_sql(
+                        sql,
+                        state.cluster.namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                        Some(authorization.as_str()),
+                        false,
+                    )
+                    .await;
+                    batches.push(RecordBatch::new_empty(schema));
+                    assert_batches_sorted_eq!(expected, &batches);
+                    info!("====Done running");
+                }
+                Step::QueryWithDebug { sql, expected } => {
+                    info!("====Begin running SQL query (w/ iox-debug): {}", sql);
+                    // run query
+                    let (mut batches, schema) = run_sql(
+                        sql,
+                        state.cluster.namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        true,
+                    )
+                    .await;
+                    batches.push(RecordBatch::new_empty(schema));
+                    assert_batches_sorted_eq!(expected, &batches);
+                    info!("====Done running");
+                }
                 Step::VerifiedQuery { sql, verify } => {
                     info!("====Begin running SQL verified query: {}", sql);
                     // run query
-                    let batches = run_sql(
+                    let (batches, _schema) = run_sql(
                         sql,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
+                        None,
+                        true,
                     )
                     .await;
                     verify(batches);
@@ -403,12 +596,14 @@ where
                 Step::InfluxQLQuery { query, expected } => {
                     info!("====Begin running InfluxQL query: {}", query);
                     // run query
-                    let batches = run_influxql(
+                    let (mut batches, schema) = run_influxql(
                         query,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
+                        None,
                     )
                     .await;
+                    batches.push(RecordBatch::new_empty(schema));
                     assert_batches_sorted_eq!(expected, &batches);
                     info!("====Done running");
                 }
@@ -446,6 +641,7 @@ where
                         query,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
                     )
                     .await
                     .unwrap_err();
@@ -453,6 +649,46 @@ where
                     check_flight_error(err, *expected_error_code, Some(expected_message));
 
                     info!("====Done running");
+                }
+                Step::InfluxQLQueryWithAuthorization {
+                    query,
+                    authorization,
+                    expected,
+                } => {
+                    info!("====Begin running InfluxQL query: {}", query);
+                    // run query
+                    let (mut batches, schema) = run_influxql(
+                        query,
+                        state.cluster.namespace(),
+                        state.cluster.querier().querier_grpc_connection(),
+                        Some(authorization),
+                    )
+                    .await;
+                    batches.push(RecordBatch::new_empty(schema));
+                    assert_batches_sorted_eq!(expected, &batches);
+                    info!("====Done running");
+                }
+                Step::PartitionKeys {
+                    table_name,
+                    namespace_name,
+                    expected,
+                } => {
+                    info!("====Persist ingesters to ensure catalog partition records exist");
+                    state
+                        .cluster()
+                        .persist_ingesters_by_namespace(namespace_name.clone())
+                        .await;
+
+                    info!("====Begin reading partition keys for table: {}", table_name);
+                    state
+                        .wait_for_partition_keys(table_name, namespace_name, expected)
+                        .await;
+                    info!("====Done reading partition keys");
+                }
+                Step::GracefulStopIngesters => {
+                    info!("====Gracefully stop all ingesters");
+
+                    state.cluster_mut().gracefully_stop_ingesters();
                 }
                 Step::VerifiedMetrics(verify) => {
                     info!("====Begin validating metrics");

@@ -8,7 +8,7 @@ use test_helpers_end_to_end::{maybe_skip_integration, MiniCluster, Step, StepTes
 #[tokio::test]
 pub async fn test_panic() {
     let database_url = maybe_skip_integration!();
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_shared(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -37,6 +37,6 @@ async fn assert_panic_logging(connection: Connection, log_path: Box<Path>) {
 
     // check logs
     let logs = std::fs::read_to_string(log_path).unwrap();
-    let expected_error = "'This is a test panic', service_grpc_testing/src/lib.rs:18:9";
+    let expected_error = "'This is a test panic', service_grpc_testing/src/lib.rs:";
     assert_contains!(logs, expected_error);
 }

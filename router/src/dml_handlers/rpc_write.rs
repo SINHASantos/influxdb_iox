@@ -5,27 +5,32 @@ pub mod client;
 pub mod lazy_connector;
 mod upstream_snapshot;
 
-use crate::dml_handlers::rpc_write::client::WriteClient;
+use std::fmt::Debug;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
-use self::{
-    balancer::Balancer,
-    circuit_breaker::CircuitBreaker,
-    circuit_breaking_client::{CircuitBreakerState, CircuitBreakingClient},
-    upstream_snapshot::UpstreamSnapshot,
-};
-
-use super::{DmlHandler, Partitioned};
 use async_trait::async_trait;
-use data_types::{DeletePredicate, NamespaceId, NamespaceName, TableId};
+use data_types::{NamespaceName, NamespaceSchema, TableId};
 use dml::{DmlMeta, DmlWrite};
+use futures::{stream::FuturesUnordered, StreamExt};
 use generated_types::influxdata::iox::ingester::v1::WriteRequest;
 use hashbrown::HashMap;
 use mutable_batch::MutableBatch;
 use mutable_batch_pb::encode::encode_write;
 use observability_deps::tracing::*;
-use std::{fmt::Debug, num::NonZeroUsize, sync::Arc, time::Duration};
 use thiserror::Error;
 use trace::ctx::SpanContext;
+
+use self::{
+    balancer::Balancer,
+    circuit_breaker::CircuitBreaker,
+    circuit_breaking_client::{CircuitBreakerState, CircuitBreakingClient},
+    client::RpcWriteClientError,
+    upstream_snapshot::UpstreamSnapshot,
+};
+use super::{DmlHandler, Partitioned};
+use crate::dml_handlers::rpc_write::client::WriteClient;
 
 /// The bound on RPC request duration.
 ///
@@ -35,9 +40,9 @@ pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Errors experienced when submitting an RPC write request to an Ingester.
 #[derive(Debug, Error)]
 pub enum RpcWriteError {
-    /// The upstream ingester returned an error response.
-    #[error("upstream ingester error: {0}")]
-    Upstream(#[from] tonic::Status),
+    /// The RPC client returned an error.
+    #[error(transparent)]
+    Client(#[from] RpcWriteClientError),
 
     /// The RPC call timed out after [`RPC_TIMEOUT`] length of time.
     #[error("timeout writing to upstream ingester")]
@@ -45,15 +50,7 @@ pub enum RpcWriteError {
 
     /// There are no healthy ingesters to route a write to.
     #[error("no healthy upstream ingesters available")]
-    NoUpstreams,
-
-    /// The upstream connection is not established.
-    #[error("upstream {0} is not connected")]
-    UpstreamNotConnected(String),
-
-    /// A delete request was rejected (not supported).
-    #[error("deletes are not supported")]
-    DeletesUnsupported,
+    NoHealthyUpstreams,
 
     /// The write request was not attempted, because not enough upstream
     /// ingesters needed to satisfy the configured replication factor are
@@ -119,7 +116,9 @@ pub struct RpcWrite<T, C = CircuitBreaker> {
 
 impl<T> RpcWrite<T> {
     /// Initialise a new [`RpcWrite`] that sends requests to an arbitrary
-    /// downstream Ingester, using a round-robin strategy.
+    /// downstream Ingester, using a round-robin strategy. Health checks are
+    /// configured by `error_window` and `num_probes` as laid out by the
+    /// documentation for [`CircuitBreaker`].
     ///
     /// If [`Some`], `replica_copies` specifies the number of additional
     /// upstream ingesters that must receive and acknowledge the write for it to
@@ -131,8 +130,9 @@ impl<T> RpcWrite<T> {
     /// needed than the number of `endpoints`; doing so will cause a panic.
     pub fn new<N>(
         endpoints: impl IntoIterator<Item = (T, N)>,
-        replica_copies: Option<NonZeroUsize>,
+        n_copies: NonZeroUsize,
         metrics: &metric::Registry,
+        num_probes: u64,
     ) -> Self
     where
         T: Send + Sync + Debug + 'static,
@@ -141,13 +141,13 @@ impl<T> RpcWrite<T> {
         let endpoints = Balancer::new(
             endpoints
                 .into_iter()
-                .map(|(client, name)| CircuitBreakingClient::new(client, name.into())),
+                .map(|(client, name)| CircuitBreakingClient::new(client, name.into(), num_probes)),
             Some(metrics),
         );
 
-        // Map the "replication factor" into the total number of distinct data
-        // copies necessary to consider a write a success.
-        let n_copies = replica_copies.map(NonZeroUsize::get).unwrap_or(1);
+        // Read the total number of distinct data copies necessary to consider a
+        // write a success.
+        let n_copies = n_copies.get();
 
         debug!(n_copies, "write replication factor");
 
@@ -176,15 +176,15 @@ where
     type WriteOutput = Vec<DmlMeta>;
 
     type WriteError = RpcWriteError;
-    type DeleteError = RpcWriteError;
 
     async fn write(
         &self,
         namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         writes: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, RpcWriteError> {
+        let namespace_id = namespace_schema.id;
         // Extract the partition key & DML writes.
         let (partition_key, writes) = writes.into_parts();
 
@@ -199,7 +199,9 @@ where
             namespace_id,
             writes,
             partition_key.clone(),
-            DmlMeta::unsequenced(span_ctx.clone()),
+            // The downstream ingester does not receive the [`DmlMeta`] type,
+            // so the span context must be passed in the request.
+            DmlMeta::unsequenced(None),
         );
 
         // Serialise this write into the wire format.
@@ -208,50 +210,82 @@ where
         };
 
         // Obtain a snapshot of currently-healthy upstreams (and potentially
-        // some that need probing)
-        let mut snap = self
+        // some that need probing).
+        let snap = self
             .endpoints
             .endpoints()
-            .ok_or(RpcWriteError::NoUpstreams)?;
+            .ok_or(RpcWriteError::NoHealthyUpstreams)?;
 
-        // Validate the required number of writes is possible given the current
-        // number of healthy endpoints.
-        if snap.len() < self.n_copies {
+        // It's possible the set of endpoints may contain fewer upstreams than
+        // necessary for the write request to succeed (N < replication factor).
+        //
+        // If this occurs, the write can be aborted early, placing no load on
+        // the upstreams that appear in the snapshot iff the snapshot contains
+        // no probe requests.
+        //
+        // If the snapshot contains upstreams selected for health probe
+        // requests, the probes MUST be sent to drive recovery of the upstream,
+        // even if this write request is doomed to fail due to insufficient
+        // upstreams.
+        if snap.initial_len() < self.n_copies && !snap.contains_probe() {
             return Err(RpcWriteError::NotEnoughReplicas);
         }
 
-        // Write the desired number of copies of `req`.
-        for i in 0..self.n_copies {
-            // Perform the gRPC write to an ingester.
-            //
-            // This call is bounded to at most RPC_TIMEOUT duration of time.
-            write_loop(&mut snap, &req).await.map_err(|e| {
-                // In all cases, if at least one write succeeded, then this
-                // becomes a partial write error.
-                if i > 0 {
-                    return RpcWriteError::PartialWrite {
+        // Concurrently write to the required number of replicas to reach the
+        // desired replication factor.
+        //
+        // These write attempts are coupled to the client - if the client
+        // disconnects, the writes are aborted (potentially after already
+        // succeeding).
+        //
+        // While probe requests MUST be sent to drive recovery detection, and an
+        // early disconnect aborts the writes and prevents this process from
+        // completing, the probability game saves us from having to optimise
+        // this further - for a meaningful write workload, eventually enough
+        // client will perform probe writes to completion and drive health
+        // discovery.
+        let mut result_stream = (0..self.n_copies)
+            .map(|_| {
+                // Acquire a request-scoped snapshot that synchronises with
+                // other clone instances to uphold the disjoint replica hosts
+                // invariant.
+                let mut snap = snap.clone();
+                let req = req.clone();
+                let span_ctx = span_ctx.clone();
+                async move { write_loop(&mut snap, &req, span_ctx).await }
+            })
+            .collect::<FuturesUnordered<_>>()
+            .enumerate();
+
+        // Consume the result stream, eagerly returning if an error is observed.
+        //
+        // Because partial writes have different semantics to outright failures
+        // (principally that you may expect your write to turn up in queries,
+        // even though the overall request failed), return a PartialWrite error
+        // if at least one write success has been observed.
+        //
+        // This is best-effort! It's always possible that PartialWrite is not
+        // returned, even though a partial write has occurred (for example, the
+        // next result in the stream is an already-completed write ACK).
+        while let Some((i, res)) = result_stream.next().await {
+            match res {
+                Ok(_) => {}
+                Err(_e) if i > 0 => {
+                    // In all cases, if at least one write succeeded, then this
+                    // becomes a partial write error.
+                    return Err(RpcWriteError::PartialWrite {
                         want_n_copies: self.n_copies,
                         acks: i,
-                    };
+                    });
                 }
-
-                // This error was for the first request - there have been no
-                // ACKs received.
-                match e {
+                Err(RpcWriteError::Client(_)) => {
                     // This error is an internal implementation detail - the
                     // meaningful error for the user is "there's no healthy
                     // upstreams".
-                    RpcWriteError::UpstreamNotConnected(_) => RpcWriteError::NoUpstreams,
-                    // The number of upstreams no longer satisfies the desired
-                    // replication factor.
-                    RpcWriteError::NoUpstreams => RpcWriteError::NotEnoughReplicas,
-                    // All other errors pass through.
-                    v => v,
+                    return Err(RpcWriteError::NoHealthyUpstreams);
                 }
-            })?;
-            // Remove the upstream that was successfully wrote to from the
-            // candidates
-            snap.remove_last_unstable();
+                Err(e) => return Err(e),
+            }
         }
 
         debug!(
@@ -265,24 +299,6 @@ where
 
         Ok(vec![op.meta().clone()])
     }
-
-    async fn delete(
-        &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
-        table_name: &str,
-        _predicate: &DeletePredicate,
-        _span_ctx: Option<SpanContext>,
-    ) -> Result<(), RpcWriteError> {
-        warn!(
-            %namespace,
-            %namespace_id,
-            %table_name,
-            "dropping delete request"
-        );
-
-        Err(RpcWriteError::DeletesUnsupported)
-    }
 }
 
 /// Perform an RPC write with `req` against one of the upstream ingesters in
@@ -292,9 +308,15 @@ where
 ///
 /// If at least one upstream request has failed (returning an error), the most
 /// recent error is returned.
+///
+/// # Panics
+///
+/// This function panics if `endpoints.next()` returns [`None`] (the number of
+/// upstreams should be validated before starting the write loop).
 async fn write_loop<T>(
-    endpoints: &mut UpstreamSnapshot<'_, T>,
+    endpoints: &mut UpstreamSnapshot<T>,
     req: &WriteRequest,
+    span_ctx: Option<SpanContext>,
 ) -> Result<(), RpcWriteError>
 where
     T: WriteClient,
@@ -307,18 +329,24 @@ where
         // request succeeds or this async call times out.
         let mut delay = Duration::from_millis(50);
         loop {
-            match endpoints
-                .next()
-                .ok_or(RpcWriteError::NoUpstreams)?
-                .write(req.clone())
-                .await
-            {
-                Ok(()) => return Ok(()),
+            // Obtain the next upstream client to try.
+            let client = endpoints.next().ok_or(RpcWriteError::NotEnoughReplicas)?;
+
+            match client.write(req.clone(), span_ctx.clone()).await {
+                Ok(()) => {
+                    endpoints.remove(client);
+                    return Ok(());
+                }
                 Err(e) => {
                     warn!(error=%e, "failed ingester rpc write");
                     last_err = Some(e);
                 }
             };
+
+            // Drop the client so that it is returned to the UpstreamSet and may
+            // be retried by another thread before the sleep expires.
+            drop(client);
+
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2);
         }
@@ -326,7 +354,7 @@ where
     .await
     .map_err(|e| match last_err {
         // Any other error is returned as-is.
-        Some(v) => v,
+        Some(v) => RpcWriteError::Client(v),
         // If the entire write attempt fails during the first RPC write
         // request, then the per-request timeout is greater than the write
         // attempt timeout, and therefore only one upstream is ever tried.
@@ -349,10 +377,15 @@ mod tests {
     use std::{collections::HashSet, iter, sync::Arc};
 
     use assert_matches::assert_matches;
-    use data_types::PartitionKey;
+    use data_types::{NamespaceId, PartitionKey};
+    use proptest::{prelude::*, prop_compose, proptest};
     use rand::seq::SliceRandom;
+    use tokio::runtime;
 
-    use crate::dml_handlers::rpc_write::circuit_breaking_client::mock::MockCircuitBreaker;
+    use crate::{
+        dml_handlers::rpc_write::circuit_breaking_client::mock::MockCircuitBreaker,
+        test_helpers::new_empty_namespace_schema,
+    };
 
     use super::{client::mock::MockWriteClient, *};
 
@@ -370,6 +403,7 @@ mod tests {
 
     const NAMESPACE_NAME: &str = "bananas";
     const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
+    const ARBITRARY_TEST_NUM_PROBES: u64 = 10;
 
     /// A helper function to perform an arbitrary write against `endpoints`,
     /// with the given number of desired distinct data copies.
@@ -407,7 +441,7 @@ mod tests {
         handler
             .write(
                 &NamespaceName::new(NAMESPACE_NAME).unwrap(),
-                NAMESPACE_ID,
+                Arc::new(new_empty_namespace_schema(NAMESPACE_ID.get())),
                 input,
                 None,
             )
@@ -433,15 +467,16 @@ mod tests {
         let client = Arc::new(MockWriteClient::default());
         let handler = RpcWrite::new(
             [(Arc::clone(&client), "mock client")],
-            None,
+            1.try_into().unwrap(),
             &metric::Registry::default(),
+            ARBITRARY_TEST_NUM_PROBES,
         );
 
         // Drive the RPC writer
         let got = handler
             .write(
                 &NamespaceName::new(NAMESPACE_NAME).unwrap(),
-                NAMESPACE_ID,
+                Arc::new(new_empty_namespace_schema(NAMESPACE_ID.get())),
                 input,
                 None,
             )
@@ -485,7 +520,7 @@ mod tests {
 
         // Init the write handler with a mock client to capture the rpc calls.
         let client1 = Arc::new(MockWriteClient::default().with_ret(iter::once(Err(
-            RpcWriteError::Upstream(tonic::Status::internal("")),
+            RpcWriteClientError::Upstream(tonic::Status::internal("")),
         ))));
         let client2 = Arc::new(MockWriteClient::default());
         let client3 = Arc::new(MockWriteClient::default());
@@ -495,15 +530,16 @@ mod tests {
                 (Arc::clone(&client2), "client2"),
                 (Arc::clone(&client3), "client3"),
             ],
-            None,
+            1.try_into().unwrap(),
             &metric::Registry::default(),
+            ARBITRARY_TEST_NUM_PROBES,
         );
 
         // Drive the RPC writer
         let got = handler
             .write(
                 &NamespaceName::new(NAMESPACE_NAME).unwrap(),
-                NAMESPACE_ID,
+                Arc::new(new_empty_namespace_schema(NAMESPACE_ID.get())),
                 input,
                 None,
             )
@@ -550,12 +586,12 @@ mod tests {
         // The first client in line fails the first request, but will succeed
         // the second try.
         let client1 = Arc::new(MockWriteClient::default().with_ret([
-            Err(RpcWriteError::Upstream(tonic::Status::internal(""))),
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal(""))),
             Ok(()),
         ]));
         // This client always errors.
         let client2 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::Upstream(tonic::Status::internal("")))
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal("")))
         })));
 
         let handler = RpcWrite::new(
@@ -563,15 +599,16 @@ mod tests {
                 (Arc::clone(&client1), "client1"),
                 (Arc::clone(&client2), "client2"),
             ],
-            None,
+            1.try_into().unwrap(),
             &metric::Registry::default(),
+            ARBITRARY_TEST_NUM_PROBES,
         );
 
         // Drive the RPC writer
         let got = handler
             .write(
                 &NamespaceName::new(NAMESPACE_NAME).unwrap(),
-                NAMESPACE_ID,
+                Arc::new(new_empty_namespace_schema(NAMESPACE_ID.get())),
                 input,
                 None,
             )
@@ -615,12 +652,15 @@ mod tests {
         circuit_1.set_healthy(false);
 
         let got = make_request(
-            [CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1)],
+            [
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+            ],
             1,
         )
         .await;
 
-        assert_matches!(got, Err(RpcWriteError::NoUpstreams));
+        assert_matches!(got, Err(RpcWriteError::NoHealthyUpstreams));
     }
 
     /// Assert the error response when the only upstream continuously returns an
@@ -628,40 +668,47 @@ mod tests {
     #[tokio::test]
     async fn test_write_upstream_error() {
         let client_1 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::Upstream(tonic::Status::internal("bananas")))
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal(
+                "bananas",
+            )))
         })));
         let circuit_1 = Arc::new(MockCircuitBreaker::default());
         circuit_1.set_healthy(true);
 
         let got = make_request(
-            [CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1)],
+            [
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+            ],
             1,
         )
         .await;
 
-        assert_matches!(got, Err(RpcWriteError::Upstream(s)) => {
-            assert_eq!(s.code(), tonic::Code::Internal);
-            assert_eq!(s.message(), "bananas");
-        });
+        assert_matches!(got, Err(RpcWriteError::NoHealthyUpstreams));
     }
 
-    /// Assert that an [`RpcWriteError::UpstreamNotConnected`] error is mapped
+    /// Assert that an [`RpcWriteClientError::UpstreamNotConnected`] error is mapped
     /// to a user-friendly [`RpcWriteError::NoUpstreams`] for consistency.
     #[tokio::test]
     async fn test_write_map_upstream_not_connected_error() {
         let client_1 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::UpstreamNotConnected("bananas".to_string()))
+            Err(RpcWriteClientError::UpstreamNotConnected(
+                "bananas".to_string(),
+            ))
         })));
         let circuit_1 = Arc::new(MockCircuitBreaker::default());
         circuit_1.set_healthy(true);
 
         let got = make_request(
-            [CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1)],
+            [
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+            ],
             1,
         )
         .await;
 
-        assert_matches!(got, Err(RpcWriteError::NoUpstreams));
+        assert_matches!(got, Err(RpcWriteError::NoHealthyUpstreams));
     }
 
     /// Assert that an error is returned without any RPC request being made when
@@ -671,21 +718,27 @@ mod tests {
     async fn test_write_not_enough_upstreams_for_replication() {
         // Initialise two upstreams, 1 healthy, 1 not.
         let client_1 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::UpstreamNotConnected("bananas".to_string()))
+            Err(RpcWriteClientError::UpstreamNotConnected(
+                "bananas".to_string(),
+            ))
         })));
         let circuit_1 = Arc::new(MockCircuitBreaker::default());
         circuit_1.set_healthy(true);
 
         let client_2 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::UpstreamNotConnected("bananas".to_string()))
+            Err(RpcWriteClientError::UpstreamNotConnected(
+                "bananas".to_string(),
+            ))
         })));
         let circuit_2 = Arc::new(MockCircuitBreaker::default());
         circuit_2.set_healthy(false);
 
         let got = make_request(
             [
-                CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1),
-                CircuitBreakingClient::new(client_2, "client_2").with_circuit_breaker(circuit_2),
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+                CircuitBreakingClient::new(client_2, "client_2", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_2),
             ],
             2, // 2 copies required
         )
@@ -708,10 +761,18 @@ mod tests {
 
         let got = make_request(
             [
-                CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                    .with_circuit_breaker(circuit_1),
-                CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                    .with_circuit_breaker(circuit_2),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_1),
+                    "client_1",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_1),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_2),
+                    "client_2",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_2),
             ],
             2, // 2 copies required
         )
@@ -736,16 +797,26 @@ mod tests {
         circuit_1.set_healthy(true);
 
         let client_2 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::Upstream(tonic::Status::internal("bananas")))
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal(
+                "bananas",
+            )))
         })));
         let circuit_2 = Arc::new(MockCircuitBreaker::default());
         circuit_2.set_healthy(true);
 
         let mut clients = vec![
-            CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                .with_circuit_breaker(circuit_1),
-            CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                .with_circuit_breaker(circuit_2),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_1),
+                "client_1",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_1),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_2),
+                "client_2",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_2),
         ];
 
         // The order should never affect the outcome.
@@ -778,7 +849,9 @@ mod tests {
         circuit_1.set_healthy(true);
 
         let client_2 = Arc::new(MockWriteClient::default().with_ret([
-            Err(RpcWriteError::Upstream(tonic::Status::internal("bananas"))),
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal(
+                "bananas",
+            ))),
             Ok(()),
         ]));
         let circuit_2 = Arc::new(MockCircuitBreaker::default());
@@ -786,10 +859,18 @@ mod tests {
 
         let got = make_request(
             [
-                CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                    .with_circuit_breaker(circuit_1),
-                CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                    .with_circuit_breaker(circuit_2),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_1),
+                    "client_1",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_1),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_2),
+                    "client_2",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_2),
             ],
             2, // 2 copies required
         )
@@ -821,8 +902,12 @@ mod tests {
 
         // This client sometimes errors (2 times)
         let client_2 = Arc::new(MockWriteClient::default().with_ret([
-            Err(RpcWriteError::Upstream(tonic::Status::internal("bananas"))),
-            Err(RpcWriteError::Upstream(tonic::Status::internal("bananas"))),
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal(
+                "bananas",
+            ))),
+            Err(RpcWriteClientError::Upstream(tonic::Status::internal(
+                "bananas",
+            ))),
             Ok(()),
         ]));
         let circuit_2 = Arc::new(MockCircuitBreaker::default());
@@ -830,18 +915,32 @@ mod tests {
 
         // This client always errors
         let client_3 = Arc::new(MockWriteClient::default().with_ret(iter::repeat_with(|| {
-            Err(RpcWriteError::UpstreamNotConnected("bananas".to_string()))
+            Err(RpcWriteClientError::UpstreamNotConnected(
+                "bananas".to_string(),
+            ))
         })));
         let circuit_3 = Arc::new(MockCircuitBreaker::default());
         circuit_3.set_healthy(true);
 
         let mut clients = vec![
-            CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                .with_circuit_breaker(circuit_1),
-            CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                .with_circuit_breaker(circuit_2),
-            CircuitBreakingClient::new(Arc::clone(&client_3), "client_3")
-                .with_circuit_breaker(circuit_3),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_1),
+                "client_1",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_1),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_2),
+                "client_2",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_2),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_3),
+                "client_3",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_3),
         ];
 
         // The order should never affect the outcome.
@@ -868,5 +967,209 @@ mod tests {
             .chain(calls_2.iter())
             .chain(client_3.calls().iter())
             .all(|v| *v == calls_1[0]));
+    }
+
+    /// Assert that the RPC writes are sufficient to drive recovery detection
+    /// for at least one upstream, when all upstreams are offline.
+    #[tokio::test]
+    async fn test_write_replication_all_unhealthy_one_probe() {
+        // Initialise three unhealthy upstreams with one selected for probing.
+        let client_1 = Arc::new(MockWriteClient::default().with_ret([Ok(())]));
+        let circuit_1 = Arc::new(MockCircuitBreaker::default());
+        circuit_1.set_healthy(false);
+        circuit_1.set_should_probe(true);
+
+        // This client sometimes errors (2 times)
+        let client_2 = Arc::new(MockWriteClient::default().with_ret([Ok(())]));
+        let circuit_2 = Arc::new(MockCircuitBreaker::default());
+        circuit_2.set_healthy(false);
+        circuit_2.set_should_probe(false);
+
+        // This client always errors
+        let client_3 = Arc::new(MockWriteClient::default().with_ret([Ok(())]));
+        let circuit_3 = Arc::new(MockCircuitBreaker::default());
+        circuit_3.set_healthy(false);
+        circuit_3.set_should_probe(false);
+
+        // Configure the clients to use the mocked circuit breakers.
+        let mut clients = vec![
+            CircuitBreakingClient::new(Arc::clone(&client_1), "client_1", 1)
+                .with_circuit_breaker(circuit_1),
+            CircuitBreakingClient::new(Arc::clone(&client_2), "client_2", 1)
+                .with_circuit_breaker(circuit_2),
+            CircuitBreakingClient::new(Arc::clone(&client_3), "client_3", 1)
+                .with_circuit_breaker(circuit_3),
+        ];
+
+        // The order should never affect the outcome.
+        clients.shuffle(&mut rand::thread_rng());
+
+        let got = make_request(
+            clients, 2, // 2 copies required
+        )
+        .await;
+
+        assert_matches!(
+            got,
+            Err(RpcWriteError::PartialWrite {
+                want_n_copies: 2,
+                acks: 1, // Probe success
+            })
+        );
+
+        let reqs = [client_1, client_2, client_3]
+            .iter()
+            .filter(|v| v.calls().len() == 1)
+            .count();
+        assert_eq!(reqs, 1);
+    }
+
+    prop_compose! {
+        /// Return an arbitrary results containing [`RpcWriteError`] from a
+        /// subset of easily constructed errors, or [`Ok`].
+        fn arbitrary_write_result()(which in 0..3) -> Result<(), RpcWriteClientError> {
+            match which {
+                0 => Ok(()),
+                1 => Err(RpcWriteClientError::Upstream(tonic::Status::internal("bananas"))),
+                2 => Err(RpcWriteClientError::UpstreamNotConnected("bananas".to_string())),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    prop_compose! {
+        /// Generate an upstream that is arbitrarily healthy/unhealthy, and will
+        /// arbitrarily succeed or fail when a write is attempted (a bounded
+        /// number of times).
+        fn arbitrary_mock_upstream()(
+            healthy in any::<bool>(),
+            responses in proptest::collection::vec(arbitrary_write_result(), 0..5)
+        ) ->  (Arc<MockCircuitBreaker>, Arc<MockWriteClient>) {
+
+            // Generate a mock client that returns all the errors/successes in
+            // the arbitrarily generated set, and then always succeeds.
+            let client = Arc::new(MockWriteClient::default().with_ret(
+                responses.into_iter().chain(iter::repeat_with(|| Ok(()))))
+            );
+
+            // Mark the upstream as arbitrarily healthy or unhealthy.
+            let circuit = Arc::new(MockCircuitBreaker::default());
+            circuit.set_healthy(healthy);
+
+            (circuit, client)
+        }
+    }
+
+    proptest! {
+        /// The invariants this property test asserts are:
+        ///
+        ///   1. If the number of healthy upstreams is 0, NoHealthyUpstreams is
+        ///      returned and no requests are attempted.
+        ///
+        ///   2. Given N healthy upstreams (> 0) and a replication factor of R:
+        ///      if N < R, "not enough replicas" is returned and no requests are
+        ///      attempted.
+        ///
+        ///   3. Upstreams that return an error are retried until the entire
+        ///      write succeeds or times out.
+        ///
+        ///   4. Writes are replicated to R distinct upstreams successfully, or
+        ///      an error is returned.
+        ///
+        ///   5. One an upstream write is ack'd as successful, it is never
+        ///      requested again.
+        ///
+        ///   6. An upstream reporting as unhealthy at the start of the write is
+        ///      never requested (excluding probe requests).
+        ///
+        #[test]
+        fn prop_distinct_upstreams(
+            upstreams in proptest::collection::vec(arbitrary_mock_upstream(), 1_usize..5),
+            n_copies in 1_usize..5,
+        ) {
+            // Disallow invalid configurations
+            prop_assume!(n_copies <= upstreams.len());
+
+            // Run the request with the given upstreams and desired replication
+            // factor in an async context.
+            let res = runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on({
+                let upstreams = upstreams.clone();
+                async move {
+                    let endpoints = upstreams.into_iter()
+                        .map(|(circuit, client)| {
+                            CircuitBreakingClient::new(
+                                client,
+                                "bananas",
+                                ARBITRARY_TEST_NUM_PROBES,
+                            )
+                            .with_circuit_breaker(circuit)
+                        });
+
+                    make_request(endpoints, n_copies).await
+                }
+            });
+
+            // Compute the number of upstreams that were healthy at the time the
+            // request was made.
+            let healthy = upstreams.iter()
+                .filter(|(circuit, _client)| circuit.is_healthy())
+                .count();
+
+            if healthy == 0 {
+                // Invariant 1: no healthy upstreams yeilds the appropriate
+                // error.
+                assert_matches!(res, Err(RpcWriteError::NoHealthyUpstreams));
+            } else if healthy < n_copies {
+                // Invariant 2: if N < R yields a "not enough replicas" error
+                assert_matches!(res, Err(RpcWriteError::NotEnoughReplicas));
+            }
+            // For either 1 or 2, no requests should be sent as the unhappy case
+            // can be computed before performing network I/O.
+            if healthy < n_copies {
+                // Assert no upstream requests are made.
+                assert!(
+                    upstreams.iter()
+                        .all(|(_circuit, client)| client.calls().is_empty())
+                );
+            }
+
+            // Invariant 3 is validated by asserting that in the case of a write
+            // timing out, at least one upstream was tried more than once.
+            //
+            // This works because the number of distinct upstreams that will be
+            // requested is small enough that the timeout happens after having
+            // attempted each at least once.
+            if matches!(res, Err(RpcWriteError::Timeout(_) | RpcWriteError::PartialWrite {..})) {
+                assert!(upstreams.iter().any(|(_circuit, client)| client.calls().len() > 1));
+            }
+
+            // Invariant 4 is upheld by ensuring at least R upstreams returned
+            // success if the overall write succeeded, otherwise the result is
+            // an error.
+            let acks = upstreams.iter()
+                .filter(|(_circuit, client)| client.success_count() == 1)
+                .count();
+            assert_eq!(res.is_ok(), acks >= n_copies);
+
+
+            // Invariant 5 is validated by ensuring each mock only returned at
+            // most one Ok response.
+            //
+            // This property should hold regardless of the overall write
+            // succeeding or failing.
+            assert!(
+                upstreams.iter()
+                    .all(|(_circuit, client)| client.success_count() <= 1)
+            );
+
+
+            // Invariant 6 is validated by ensuring all clients with unhealthy
+            // circuits never see a write request.
+            assert!(
+                upstreams.iter()
+                    .filter(|(circuit, _client)| !circuit.is_healthy())
+                    .all(|(_circuit, client)| client.calls().is_empty())
+            );
+        }
     }
 }

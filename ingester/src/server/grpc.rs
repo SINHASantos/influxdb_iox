@@ -3,84 +3,129 @@
 mod persist;
 mod query;
 mod rpc_write;
-mod write_info;
 
-use std::sync::{atomic::AtomicU64, Arc};
+use std::{fmt::Debug, sync::Arc};
 
-use arrow_flight::flight_service_server::{
-    FlightService as Flight, FlightServiceServer as FlightServer,
-};
-use generated_types::influxdata::iox::{
-    catalog::v1::*,
-    ingester::v1::{
-        persist_service_server::{PersistService, PersistServiceServer},
-        write_info_service_server::{WriteInfoService, WriteInfoServiceServer},
-    },
-};
 use iox_catalog::interface::Catalog;
 use service_grpc_catalog::CatalogService;
 
-use crate::handler::IngestHandler;
+use crate::{
+    dml_sink::DmlSink,
+    ingest_state::IngestState,
+    ingester_id::IngesterId,
+    init::IngesterRpcInterface,
+    partition_iter::PartitionIter,
+    persist::queue::PersistQueue,
+    query::{response::QueryResponse, QueryExec},
+    timestamp_oracle::TimestampOracle,
+};
 
-/// This type is responsible for managing all gRPC services exposed by `ingester`.
+use self::{persist::PersistHandler, rpc_write::RpcWrite};
+
+/// This type is responsible for injecting internal dependencies that SHOULD NOT
+/// leak outside of the ingester crate into public gRPC handlers.
+///
+/// Configuration and external dependencies SHOULD be injected through the
+/// respective gRPC handler constructor method.
 #[derive(Debug)]
-pub struct GrpcDelegate<I: IngestHandler> {
+pub(crate) struct GrpcDelegate<D, Q, T, P> {
+    dml_sink: Arc<D>,
+    query_exec: Arc<Q>,
+    timestamp: Arc<TimestampOracle>,
+    ingest_state: Arc<IngestState>,
+    ingester_id: IngesterId,
     catalog: Arc<dyn Catalog>,
-    ingest_handler: Arc<I>,
-
-    /// How many `do_get` flight requests should panic for testing purposes.
-    ///
-    /// Every panic will decrease the counter until it reaches zero. At zero, no panics will occur.
-    test_flight_do_get_panic: Arc<AtomicU64>,
+    metrics: Arc<metric::Registry>,
+    buffer: Arc<T>,
+    persist_handle: Arc<P>,
 }
 
-impl<I: IngestHandler + Send + Sync + 'static> GrpcDelegate<I> {
-    /// Initialise a new [`GrpcDelegate`] passing valid requests to the specified `ingest_handler`.
-    pub fn new(
+impl<D, Q, T, P> GrpcDelegate<D, Q, T, P>
+where
+    D: DmlSink + 'static,
+    Q: QueryExec<Response = QueryResponse> + 'static,
+    T: PartitionIter + Sync + 'static,
+    P: PersistQueue + Sync + 'static,
+{
+    /// Initialise a new [`GrpcDelegate`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        dml_sink: Arc<D>,
+        query_exec: Arc<Q>,
+        timestamp: Arc<TimestampOracle>,
+        ingest_state: Arc<IngestState>,
+        ingester_id: IngesterId,
         catalog: Arc<dyn Catalog>,
-        ingest_handler: Arc<I>,
-        test_flight_do_get_panic: Arc<AtomicU64>,
+        metrics: Arc<metric::Registry>,
+        buffer: Arc<T>,
+        persist_handle: Arc<P>,
     ) -> Self {
         Self {
+            dml_sink,
+            query_exec,
+            timestamp,
+            ingest_state,
+            ingester_id,
             catalog,
-            ingest_handler,
-            test_flight_do_get_panic,
+            metrics,
+            buffer,
+            persist_handle,
         }
     }
+}
 
-    /// Acquire an Arrow Flight gRPC service implementation.
-    pub fn flight_service(&self) -> FlightServer<impl Flight> {
-        FlightServer::new(query::FlightService::new(
-            Arc::clone(&self.ingest_handler),
-            Arc::clone(&self.test_flight_do_get_panic),
-        ))
-    }
-
-    /// Acquire an WriteInfo gRPC service implementation.
-    pub fn write_info_service(&self) -> WriteInfoServiceServer<impl WriteInfoService> {
-        WriteInfoServiceServer::new(write_info::WriteInfoServiceImpl::new(Arc::clone(
-            &self.ingest_handler,
-        ) as _))
-    }
+/// Implement the type-erasure trait to hide internal types from crate-external
+/// callers.
+impl<D, Q, T, P> IngesterRpcInterface for GrpcDelegate<D, Q, T, P>
+where
+    D: DmlSink + 'static,
+    Q: QueryExec<Response = QueryResponse> + 'static,
+    T: PartitionIter + Sync + 'static,
+    P: PersistQueue + Sync + 'static,
+{
+    type CatalogHandler = CatalogService;
+    type WriteHandler = RpcWrite<Arc<D>>;
+    type PersistHandler = PersistHandler<Arc<T>, Arc<P>>;
+    type FlightHandler = query::FlightService<Arc<Q>>;
 
     /// Acquire a [`CatalogService`] gRPC service implementation.
     ///
     /// [`CatalogService`]: generated_types::influxdata::iox::catalog::v1::catalog_service_server::CatalogService.
-    pub fn catalog_service(
-        &self,
-    ) -> catalog_service_server::CatalogServiceServer<impl catalog_service_server::CatalogService>
-    {
-        catalog_service_server::CatalogServiceServer::new(CatalogService::new(Arc::clone(
-            &self.catalog,
-        )))
+    fn catalog_service(&self) -> Self::CatalogHandler {
+        CatalogService::new(Arc::clone(&self.catalog))
+    }
+
+    /// Return a [`WriteService`] gRPC implementation.
+    ///
+    /// [`WriteService`]: generated_types::influxdata::iox::ingester::v1::write_service_server::WriteService.
+    fn write_service(&self) -> Self::WriteHandler {
+        RpcWrite::new(
+            Arc::clone(&self.dml_sink),
+            Arc::clone(&self.timestamp),
+            Arc::clone(&self.ingest_state),
+        )
     }
 
     /// Return a [`PersistService`] gRPC implementation.
     ///
     /// [`PersistService`]: generated_types::influxdata::iox::ingester::v1::persist_service_server::PersistService.
-    pub fn persist_service(&self) -> PersistServiceServer<impl PersistService> {
-        PersistServiceServer::new(persist::PersistHandler::new(Arc::clone(
-            &self.ingest_handler,
-        )))
+    fn persist_service(&self) -> Self::PersistHandler {
+        PersistHandler::new(
+            Arc::clone(&self.buffer),
+            Arc::clone(&self.persist_handle),
+            Arc::clone(&self.catalog),
+        )
+    }
+
+    /// Return an Arrow [`FlightService`] gRPC implementation.
+    ///
+    /// [`FlightService`]: arrow_flight::flight_service_server::FlightService
+    fn query_service(&self, max_simultaneous_requests: usize) -> Self::FlightHandler {
+        query::FlightService::new(
+            Arc::clone(&self.query_exec),
+            self.ingester_id,
+            max_simultaneous_requests,
+            &self.metrics,
+        )
     }
 }

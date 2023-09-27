@@ -4,12 +4,17 @@
     missing_copy_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use datafusion::{
     execution::FunctionRegistry,
@@ -17,6 +22,8 @@ use datafusion::{
 };
 use group_by::WindowDuration;
 use window::EncodedWindowDuration;
+
+pub mod coalesce_struct;
 
 /// Grouping by structs
 pub mod group_by;
@@ -111,6 +118,7 @@ mod test {
     };
     use datafusion::{assert_batches_eq, prelude::col};
     use datafusion_util::context_with_table;
+    use schema::TIME_DATA_TIMEZONE;
     use std::sync::Arc;
 
     use super::*;
@@ -180,7 +188,10 @@ mod test {
     async fn test_make_window_bound_expr() {
         let batch = RecordBatch::try_from_iter(vec![(
             "time",
-            Arc::new(TimestampNanosecondArray::from(vec![Some(1000), Some(2000)])) as ArrayRef,
+            Arc::new(
+                TimestampNanosecondArray::from(vec![Some(1000), Some(2000)])
+                    .with_timezone_opt(TIME_DATA_TIMEZONE()),
+            ) as ArrayRef,
         )])
         .unwrap();
 

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use data_types::{NamespaceName, NamespaceSchema};
+use std::sync::Arc;
 use trace::ctx::SpanContext;
 
 use super::{DmlError, DmlHandler};
@@ -53,50 +54,28 @@ where
     // All errors are converted into DML errors before returning to the caller
     // in order to present a consistent error type for chained handlers.
     type WriteError = DmlError;
-    type DeleteError = DmlError;
 
     /// Write `batches` to `namespace`.
     async fn write(
         &self,
         namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
         let output = self
             .first
-            .write(namespace, namespace_id, input, span_ctx.clone())
-            .await
-            .map_err(Into::into)?;
-
-        self.second
-            .write(namespace, namespace_id, output, span_ctx)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Delete the data specified in `delete`.
-    async fn delete(
-        &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
-        table_name: &str,
-        predicate: &DeletePredicate,
-        span_ctx: Option<SpanContext>,
-    ) -> Result<(), Self::DeleteError> {
-        self.first
-            .delete(
+            .write(
                 namespace,
-                namespace_id,
-                table_name,
-                predicate,
+                Arc::clone(&namespace_schema),
+                input,
                 span_ctx.clone(),
             )
             .await
             .map_err(Into::into)?;
 
         self.second
-            .delete(namespace, namespace_id, table_name, predicate, span_ctx)
+            .write(namespace, namespace_schema, output, span_ctx)
             .await
             .map_err(Into::into)
     }

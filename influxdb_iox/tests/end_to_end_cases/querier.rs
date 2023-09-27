@@ -13,7 +13,7 @@ use generated_types::{
 use influxdb_iox_client::flight::IOxRecordBatchStream;
 use test_helpers_end_to_end::{
     check_flight_error, check_tonic_status, maybe_skip_integration, run_sql, try_run_sql,
-    GrpcRequestBuilder, MiniCluster, Step, StepTest, StepTestState, TestConfig,
+    Authorizer, GrpcRequestBuilder, MiniCluster, Step, StepTest, StepTestState, TestConfig,
 };
 
 #[tokio::test]
@@ -24,7 +24,7 @@ async fn basic_ingester() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2_never_persist(database_url).await;
+    let mut cluster = MiniCluster::create_shared_never_persist(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -62,7 +62,7 @@ async fn never_persist_really_never_persists() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2_never_persist(database_url).await;
+    let mut cluster = MiniCluster::create_shared_never_persist(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -73,7 +73,7 @@ async fn never_persist_really_never_persists() {
                  {table_name},tag1=A,tag2=C val=43i 123457"
             )),
             // This should_panic if the ingester setup is correct
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
         ],
@@ -90,7 +90,7 @@ async fn basic_on_parquet() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_shared(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -98,7 +98,7 @@ async fn basic_on_parquet() {
             Step::RecordNumParquetFiles,
             Step::WriteLineProtocol(format!("{table_name},tag1=A,tag2=B val=42i 123456")),
             // Wait for data to be persisted to parquet
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             Step::Query {
@@ -125,10 +125,10 @@ async fn basic_empty() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let ingester_config = TestConfig::new_ingester2(&database_url);
-    let router_config = TestConfig::new_router2(&ingester_config);
-    // specially create a querier2 config that is NOT connected to the ingester2
-    let querier_config = TestConfig::new_querier2_without_ingester2(&ingester_config);
+    let ingester_config = TestConfig::new_ingester(&database_url);
+    let router_config = TestConfig::new_router(&ingester_config);
+    // specially create a querier config that is NOT connected to the ingester
+    let querier_config = TestConfig::new_querier_without_ingester(&ingester_config);
 
     let mut cluster = MiniCluster::new()
         .with_ingester(ingester_config)
@@ -147,7 +147,7 @@ async fn basic_empty() {
                  {table_name},tag1=A,tag2=C val=43i 123457"
             )),
             // Wait for data to be persisted to parquet
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             Step::Custom(Box::new(move |state: &mut StepTestState| {
@@ -196,10 +196,10 @@ async fn basic_no_ingester_connection() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let ingester_config = TestConfig::new_ingester2(&database_url);
-    let router_config = TestConfig::new_router2(&ingester_config);
-    // specially create a querier2 config that is NOT connected to the ingester2
-    let querier_config = TestConfig::new_querier2_without_ingester2(&ingester_config);
+    let ingester_config = TestConfig::new_ingester(&database_url);
+    let router_config = TestConfig::new_router(&ingester_config);
+    // specially create a querier config that is NOT connected to the ingester
+    let querier_config = TestConfig::new_querier_without_ingester(&ingester_config);
 
     let mut cluster = MiniCluster::new()
         .with_ingester(ingester_config)
@@ -215,7 +215,7 @@ async fn basic_no_ingester_connection() {
         vec![
             Step::RecordNumParquetFiles,
             Step::WriteLineProtocol(format!("{table_name},tag1=A,tag2=B val=42i 123456")),
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             Step::Query {
@@ -236,23 +236,22 @@ async fn basic_no_ingester_connection() {
 
 #[tokio::test]
 async fn query_after_persist_sees_new_files() {
-    // https://github.com/influxdata/influxdb_iox/issues/4634 added
-    // caching of tombstones and parquet files in the querier. This
-    // test ensures that a query issued after new parquet files are
-    // persisted correctly picks up the new parquet files
+    // https://github.com/influxdata/influxdb_iox/issues/4634 added caching of Parquet files in the
+    // querier. This test ensures that a query issued after new Parquet files are persisted
+    // correctly picks up the new Parquet files.
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_shared(database_url).await;
 
     let steps = vec![
         Step::RecordNumParquetFiles,
         Step::WriteLineProtocol(format!("{table_name},tag1=A,tag2=B val=42i 123456")),
         // Wait for data to be persisted to parquet
-        Step::WaitForPersisted2 {
+        Step::WaitForPersisted {
             expected_increase: 1,
         },
         Step::Query {
@@ -280,7 +279,7 @@ async fn query_after_persist_sees_new_files() {
         // write another parquet file that has non duplicated data
         Step::WriteLineProtocol(format!("{table_name},tag1=B,tag2=A val=43i 789101112")),
         // Wait for data to be persisted to parquet
-        Step::WaitForPersisted2 {
+        Step::WaitForPersisted {
             expected_increase: 1,
         },
         // query should correctly see the data in the second parquet file
@@ -301,6 +300,48 @@ async fn query_after_persist_sees_new_files() {
 }
 
 #[tokio::test]
+async fn query_after_shutdown_sees_new_files() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    // Configure a cluster such that the ingester never persists (until
+    // shutdown)
+    let ingester_config = TestConfig::new_ingester_never_persist(&database_url);
+    let router_config = TestConfig::new_router(&ingester_config);
+    // Querier configured to quickly consider ingesters dead to speed up the
+    // test.
+    let querier_config =
+        TestConfig::new_querier(&ingester_config).with_querier_circuit_breaker_threshold(1);
+
+    let mut cluster = MiniCluster::new()
+        .with_ingester(ingester_config)
+        .await
+        .with_router(router_config)
+        .await
+        .with_querier(querier_config)
+        .await;
+
+    let steps = vec![
+        Step::WriteLineProtocol("bananas,tag1=A,tag2=B val=42i 123456".to_string()),
+        Step::AssertNumParquetFiles { expected: 0 }, // test invariant
+        Step::GracefulStopIngesters,
+        Step::AssertNumParquetFiles { expected: 1 },
+        Step::Query {
+            sql: "select * from bananas".to_string(),
+            expected: vec![
+                "+------+------+--------------------------------+-----+",
+                "| tag1 | tag2 | time                           | val |",
+                "+------+------+--------------------------------+-----+",
+                "| A    | B    | 1970-01-01T00:00:00.000123456Z | 42  |",
+                "+------+------+--------------------------------+-----+",
+            ],
+        },
+    ];
+
+    StepTest::new(&mut cluster, steps).run().await
+}
+
+#[tokio::test]
 async fn table_not_found_on_ingester() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
@@ -309,19 +350,19 @@ async fn table_not_found_on_ingester() {
 
     // Set up the cluster  ====================================
     // cannot use shared cluster because we're restarting the ingester
-    let mut cluster = MiniCluster::create_non_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_non_shared(database_url).await;
 
     StepTest::new(
         &mut cluster,
         vec![
             Step::RecordNumParquetFiles,
             Step::WriteLineProtocol(format!("{table_name},tag1=A,tag2=B val=42i 123456")),
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             Step::RecordNumParquetFiles,
             Step::WriteLineProtocol(String::from("other_table,tag1=A,tag2=B val=42i 123456")),
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             // Restart the ingesters so that they don't have any table data in memory
@@ -364,7 +405,7 @@ async fn issue_4631_a() {
 
     let database_url = maybe_skip_integration!();
     // Set up a cluster configured to never persist automatically
-    let mut cluster = MiniCluster::create_shared2_never_persist(database_url).await;
+    let mut cluster = MiniCluster::create_shared_never_persist(database_url).await;
 
     let steps = vec![
         Step::RecordNumParquetFiles,
@@ -392,7 +433,7 @@ async fn issue_4631_a() {
         // Persist ingester data
         Step::Persist,
         // Here the ingester calculates the partition sort key.
-        Step::WaitForPersisted2 {
+        Step::WaitForPersisted {
             expected_increase: 1,
         },
         Step::RecordNumParquetFiles,
@@ -403,7 +444,7 @@ async fn issue_4631_a() {
             "{table_name},tag=A val=\"bar\" 1\n{table_name},tag=B val=\"arglebargle\" 2\n"
         )),
         Step::Persist,
-        Step::WaitForPersisted2 {
+        Step::WaitForPersisted {
             expected_increase: 1,
         },
         // query
@@ -435,7 +476,7 @@ async fn issue_4631_b() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_shared(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -443,7 +484,7 @@ async fn issue_4631_b() {
             Step::RecordNumParquetFiles,
             // create persisted chunk with a single tag column
             Step::WriteLineProtocol(format!("{table_name},tag=A val=\"foo\" 1")),
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             // query to prime the querier caches with partition sort key
@@ -461,7 +502,7 @@ async fn issue_4631_b() {
             // create 2nd chunk with an additional tag column (which will be included in the
             // partition sort key)
             Step::WriteLineProtocol(format!("{table_name},tag=A,tag2=B val=\"bar\" 1\n")),
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             // in the original bug the querier would now panic with:
@@ -471,7 +512,10 @@ async fn issue_4631_b() {
             // chunk sort key tag, tag2, time,
             // ```
             //
-            // Note that we cannot query tag2 because the schema is cached for a while.
+            // Note that:
+            // 1. We cannot query tag2 because the schema is cached for a while.
+            // 2. Because tag2 is not part of the schema, it is also not used de-dup. Under the cached schema, we do NOT
+            //    produce any primary-key duplicates.
             Step::Query {
                 sql: format!("select tag, val from {table_name} where tag='A' order by val"),
                 expected: vec![
@@ -479,55 +523,8 @@ async fn issue_4631_b() {
                     "| tag | val |",
                     "+-----+-----+",
                     "| A   | bar |",
-                    "| A   | foo |",
                     "+-----+-----+",
                 ],
-            },
-        ],
-    )
-    .run()
-    .await
-}
-
-#[tokio::test]
-async fn unsupported_sql_returns_error() {
-    test_helpers::maybe_start_logging();
-    let database_url = maybe_skip_integration!();
-
-    // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
-
-    StepTest::new(
-        &mut cluster,
-        vec![
-            Step::WriteLineProtocol("this_table_does_exist,tag=A val=\"foo\" 1".into()),
-            Step::QueryExpectingError {
-                sql: "drop table this_table_doesnt_exist".into(),
-                expected_error_code: tonic::Code::InvalidArgument,
-                expected_message: "Error while planning query: This feature is not implemented: \
-                    DropTable"
-                    .into(),
-            },
-            Step::QueryExpectingError {
-                sql: "create view some_view as select * from this_table_does_exist".into(),
-                expected_error_code: tonic::Code::InvalidArgument,
-                expected_message: "Error while planning query: This feature is not implemented: \
-                    CreateView"
-                    .into(),
-            },
-            Step::QueryExpectingError {
-                sql: "create database my_new_database".into(),
-                expected_error_code: tonic::Code::InvalidArgument,
-                expected_message: "Error while planning query: This feature is not implemented: \
-                    CreateCatalog"
-                    .into(),
-            },
-            Step::QueryExpectingError {
-                sql: "create schema foo".into(),
-                expected_error_code: tonic::Code::InvalidArgument,
-                expected_message: "Error while planning query: This feature is not implemented: \
-                                    CreateCatalogSchema"
-                    .into(),
             },
         ],
     )
@@ -541,7 +538,7 @@ async fn table_or_namespace_not_found() {
     let database_url = maybe_skip_integration!();
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared2(database_url).await;
+    let mut cluster = MiniCluster::create_shared(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -564,6 +561,8 @@ async fn table_or_namespace_not_found() {
                         "select * from this_table_does_exist;",
                         format!("{}_suffix", state.cluster().namespace()),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        true,
                     )
                     .await
                     .unwrap_err();
@@ -628,9 +627,9 @@ async fn oom_protection() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let ingester_config = TestConfig::new_ingester2(&database_url);
-    let router_config = TestConfig::new_router2(&ingester_config);
-    let querier_config = TestConfig::new_querier2(&ingester_config).with_querier_mem_pool_bytes(1);
+    let ingester_config = TestConfig::new_ingester(&database_url);
+    let router_config = TestConfig::new_router(&ingester_config);
+    let querier_config = TestConfig::new_querier(&ingester_config).with_querier_mem_pool_bytes(1);
     let mut cluster = MiniCluster::new()
         .with_router(router_config)
         .await
@@ -652,6 +651,8 @@ async fn oom_protection() {
                         &sql,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        true,
                     )
                     .await
                     .unwrap_err();
@@ -662,6 +663,8 @@ async fn oom_protection() {
                         format!("EXPLAIN {sql}"),
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        true,
                     )
                     .await;
                 }
@@ -687,6 +690,180 @@ async fn oom_protection() {
                 }
                 .boxed()
             })),
+        ],
+    )
+    .run()
+    .await
+}
+
+#[tokio::test]
+async fn authz() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    let table_name = "the_table";
+
+    // Set up the authorizer  =================================
+    let mut authz = Authorizer::create().await;
+
+    // Set up the cluster  ====================================
+    let mut cluster = MiniCluster::create_non_shared_with_authz(database_url, authz.addr()).await;
+
+    let write_token = authz.create_token_for(cluster.namespace(), &["ACTION_WRITE"]);
+    let read_token = authz.create_token_for(cluster.namespace(), &["ACTION_READ"]);
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::WriteLineProtocolWithAuthorization {
+                line_protocol: format!(
+                    "{table_name},tag1=A,tag2=B val=42i 123456\n\
+                 {table_name},tag1=A,tag2=C val=43i 123457"
+                ),
+                authorization: format!("Token {}", write_token.clone()),
+            },
+            Step::QueryExpectingError {
+                sql: "SELECT 1".to_string(),
+                expected_error_code: tonic::Code::Unauthenticated,
+                expected_message: "Unauthenticated".to_string(),
+            },
+            Step::Custom(Box::new(move |state: &mut StepTestState| {
+                let token = write_token.clone();
+                async move {
+                    let cluster = state.cluster();
+                    let err = try_run_sql(
+                        "SELECT 1",
+                        cluster.namespace(),
+                        cluster.querier().querier_grpc_connection(),
+                        Some(format!("Bearer {}", token.clone()).as_str()),
+                        true,
+                    )
+                    .await
+                    .unwrap_err();
+                    check_flight_error(
+                        err,
+                        tonic::Code::PermissionDenied,
+                        Some("Permission denied"),
+                    );
+                }
+                .boxed()
+            })),
+            Step::QueryWithAuthorization {
+                sql: "SELECT 1".to_string(),
+                authorization: format!("Bearer {read_token}").to_string(),
+                expected: vec![
+                    "+----------+",
+                    "| Int64(1) |",
+                    "+----------+",
+                    "| 1        |",
+                    "+----------+",
+                ],
+            },
+        ],
+    )
+    .run()
+    .await;
+
+    authz.close().await;
+}
+
+#[tokio::test]
+async fn iox_debug_header() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    let table_name = "the_table";
+
+    // Set up the cluster  ====================================
+    let mut cluster = MiniCluster::create_shared(database_url).await;
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::RecordNumParquetFiles,
+            Step::WriteLineProtocol(format!("{table_name},tag1=A,tag2=B val=42i 123456")),
+            // Wait for data to be persisted to parquet
+            Step::WaitForPersisted {
+                expected_increase: 1,
+            },
+            Step::Query {
+                sql: String::from(
+                    "SELECT * from information_schema.tables where table_schema = 'system'",
+                ),
+                expected: vec![
+                    "+---------------+--------------+------------+------------+",
+                    "| table_catalog | table_schema | table_name | table_type |",
+                    "+---------------+--------------+------------+------------+",
+                    "+---------------+--------------+------------+------------+",
+                ],
+            },
+            Step::QueryWithDebug {
+                sql: String::from(
+                    "SELECT * from information_schema.tables where table_schema = 'system'",
+                ),
+                expected: vec![
+                    "+---------------+--------------+------------+------------+",
+                    "| table_catalog | table_schema | table_name | table_type |",
+                    "+---------------+--------------+------------+------------+",
+                    "| public        | system       | queries    | BASE TABLE |",
+                    "+---------------+--------------+------------+------------+",
+                ],
+            },
+            Step::Query {
+                sql: String::from("SHOW TABLES"),
+                expected: vec![
+                    "+---------------+--------------------+-------------+------------+",
+                    "| table_catalog | table_schema       | table_name  | table_type |",
+                    "+---------------+--------------------+-------------+------------+",
+                    "| public        | information_schema | columns     | VIEW       |",
+                    "| public        | information_schema | df_settings | VIEW       |",
+                    "| public        | information_schema | tables      | VIEW       |",
+                    "| public        | information_schema | views       | VIEW       |",
+                    "| public        | iox                | the_table   | BASE TABLE |",
+                    "+---------------+--------------------+-------------+------------+",
+                ],
+            },
+            Step::QueryWithDebug {
+                sql: String::from("SHOW TABLES"),
+                expected: vec![
+                    "+---------------+--------------------+-------------+------------+",
+                    "| table_catalog | table_schema       | table_name  | table_type |",
+                    "+---------------+--------------------+-------------+------------+",
+                    "| public        | information_schema | columns     | VIEW       |",
+                    "| public        | information_schema | df_settings | VIEW       |",
+                    "| public        | information_schema | tables      | VIEW       |",
+                    "| public        | information_schema | views       | VIEW       |",
+                    "| public        | iox                | the_table   | BASE TABLE |",
+                    "| public        | system             | queries     | BASE TABLE |",
+                    "+---------------+--------------------+-------------+------------+",
+                ],
+            },
+            Step::QueryExpectingError {
+                sql: String::from("SELECT * FROM system.queries"),
+                expected_error_code: tonic::Code::InvalidArgument,
+                expected_message: String::from("Error while planning query: Error during planning: table 'public.system.queries' not found"),
+            },
+            Step::QueryExpectingError {
+                sql: String::from("SELECT query_type, query_text FROM system.queries"),
+                expected_error_code: tonic::Code::InvalidArgument,
+                expected_message: String::from("Error while planning query: Error during planning: table 'public.system.queries' not found"),
+            },
+            Step::QueryWithDebug {
+                sql: String::from("SELECT query_type, query_text FROM system.queries"),
+                expected: vec![
+                    "+------------+-----------------------------------------------------------------------+",
+                    "| query_type | query_text                                                            |",
+                    "+------------+-----------------------------------------------------------------------+",
+                    "| sql        | SELECT * FROM system.queries                                          |",
+                    "| sql        | SELECT * from information_schema.tables where table_schema = 'system' |",
+                    "| sql        | SELECT * from information_schema.tables where table_schema = 'system' |",
+                    "| sql        | SELECT query_type, query_text FROM system.queries                     |",
+                    "| sql        | SELECT query_type, query_text FROM system.queries                     |",
+                    "| sql        | SHOW TABLES                                                           |",
+                    "| sql        | SHOW TABLES                                                           |",
+                    "+------------+-----------------------------------------------------------------------+",
+                ],
+            },
         ],
     )
     .run()

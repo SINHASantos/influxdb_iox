@@ -186,7 +186,7 @@ impl SortKey {
 
         // Go over short key and check its right-order availability in the long key
         let mut prev_long_idx: Option<usize> = None;
-        for (col, sort_options) in short_key.columns.iter() {
+        for (col, sort_options) in &*short_key.columns {
             if let Some(long_idx) = long_key.find_index(col, sort_options) {
                 match prev_long_idx {
                     None => prev_long_idx = Some(long_idx),
@@ -248,6 +248,18 @@ impl SortKey {
         std::mem::size_of_val(self)
             + self.size_columns()
             + self.columns.keys().map(|k| k.len()).sum::<usize>()
+    }
+}
+
+impl From<SortKey> for Vec<String> {
+    fn from(val: SortKey) -> Self {
+        val.columns.iter().map(|(id, _)| id.to_string()).collect()
+    }
+}
+
+impl From<Vec<String>> for SortKey {
+    fn from(val: Vec<String>) -> Self {
+        Self::from_columns(val)
     }
 }
 

@@ -64,7 +64,7 @@ where
             .read_to_end(&mut data)
             .context(UnableToReadDataSnafu)?;
 
-        let (actual_compressed_len, actual_checksum) = decompressing_read.get_mut().checksum();
+        let (actual_compressed_len, actual_checksum) = decompressing_read.into_inner().checksum();
 
         ensure!(
             expected_len == actual_compressed_len,
@@ -118,13 +118,8 @@ impl<R> CrcReader<R> {
         }
     }
 
-    fn checksum(&mut self) -> (u64, u32) {
-        // FIXME: If rust-snappy added an `into_inner`, we should
-        // take `self` by value
-        (
-            std::mem::take(&mut self.bytes_seen),
-            std::mem::take(&mut self.hasher).finalize(),
-        )
+    fn checksum(self) -> (u64, u32) {
+        (self.bytes_seen, self.hasher.finalize())
     }
 }
 
@@ -195,6 +190,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 mod tests {
     use super::*;
     use crate::{SegmentId, FILE_TYPE_IDENTIFIER};
+    use assert_matches::assert_matches;
     use byteorder::WriteBytesExt;
     use std::io::Write;
     use test_helpers::assert_error;
@@ -261,7 +257,9 @@ mod tests {
         assert_eq!(uuid, segment_file.id.as_bytes());
 
         let read_fail = reader.one_entry();
-        assert_error!(read_fail, Error::UnableToReadData { .. });
+        assert_matches!(read_fail, Err(Error::UnableToReadData { source: e }) => {
+            assert_matches!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
         // Trying to continue reading will fail as well, see:
         // <https://github.com/influxdata/influxdb_iox/issues/6222>
         assert_error!(reader.one_entry(), Error::UnableToReadData { .. });
@@ -286,7 +284,9 @@ mod tests {
         assert_eq!(uuid, segment_file.id.as_bytes());
 
         let read_fail = reader.one_entry();
-        assert_error!(read_fail, Error::UnableToReadData { .. });
+        assert_matches!(read_fail, Err(Error::UnableToReadData { source: e }) => {
+            assert_matches!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
         // Trying to continue reading will fail as well, see:
         // <https://github.com/influxdata/influxdb_iox/issues/6222>
         assert_error!(reader.one_entry(), Error::UnableToReadData { .. });

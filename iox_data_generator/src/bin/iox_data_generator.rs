@@ -5,13 +5,13 @@
     missing_debug_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr
 )]
 
 use chrono::prelude::*;
-use chrono_english::{parse_date_string, Dialect};
 use iox_data_generator::{specification::DataSpec, write::PointsWriterBuilder};
 use std::{
     fs::File,
@@ -38,7 +38,7 @@ Examples:
 
     # Generate data points starting from an hour ago until now, generating the historical data as
     # fast as possible. Then generate data according to the sampling interval until terminated.
-    iox_data_generator -s spec.toml -o lp --start "1 hr ago" --continue
+    iox_data_generator -s spec.toml -o lp --start "1 hr" --continue
 
 Logging:
     Use the RUST_LOG environment variable to configure the desired logging level.
@@ -103,14 +103,14 @@ struct Config {
     /// The date and time at which to start the timestamps of the generated data.
     ///
     /// Can be an exact datetime like `2020-01-01T01:23:45-05:00` or a fuzzy
-    /// specification like `1 hour ago`. If not specified, defaults to no.
+    /// specification like `1 hour`. If not specified, defaults to no.
     #[clap(long, action)]
     start: Option<String>,
 
     /// The date and time at which to stop the timestamps of the generated data.
     ///
     /// Can be an exact datetime like `2020-01-01T01:23:45-05:00` or a fuzzy
-    /// specification like `1 hour ago`. If not specified, defaults to now.
+    /// specification like `1 hour`. If not specified, defaults to now.
     #[clap(long, action)]
     end: Option<String>,
 
@@ -139,12 +139,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let execution_start_time = Local::now();
+    let execution_start_time_nanos = execution_start_time
+        .timestamp_nanos_opt()
+        .expect("'now' is in nano range");
 
     let start_datetime = datetime_nanoseconds(config.start.as_deref(), execution_start_time);
     let end_datetime = datetime_nanoseconds(config.end.as_deref(), execution_start_time);
 
-    let start_display = start_datetime.unwrap_or_else(|| execution_start_time.timestamp_nanos());
-    let end_display = end_datetime.unwrap_or_else(|| execution_start_time.timestamp_nanos());
+    let start_display = start_datetime.unwrap_or(execution_start_time_nanos);
+    let end_display = end_datetime.unwrap_or(execution_start_time_nanos);
 
     let continue_on = config.do_continue;
 
@@ -201,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut points_writer_builder,
         start_datetime,
         end_datetime,
-        execution_start_time.timestamp_nanos(),
+        execution_start_time_nanos,
         continue_on,
         config.batch_size,
         config.print,
@@ -222,8 +225,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn datetime_nanoseconds(arg: Option<&str>, now: DateTime<Local>) -> Option<i64> {
     arg.map(|s| {
-        let datetime = parse_date_string(s, now, Dialect::Us).expect("Could not parse time");
-        datetime.timestamp_nanos()
+        let datetime = humantime::parse_rfc3339(s)
+            .map(Into::into)
+            .unwrap_or_else(|_| {
+                let std_duration = humantime::parse_duration(s).expect("Could not parse time");
+                let chrono_duration = chrono::Duration::from_std(std_duration)
+                    .expect("Could not convert std::time::Duration to chrono::Duration");
+                now - chrono_duration
+            });
+
+        datetime
+            .timestamp_nanos_opt()
+            .expect("timestamp out of range")
     })
 }
 
@@ -238,17 +251,18 @@ mod test {
     }
 
     #[test]
-    #[ignore] // TODO: I think chrono-english isn't handling timezones the way I'd expect
     fn rfc3339() {
-        let ns = datetime_nanoseconds(Some("2020-01-01T01:23:45-05:00"), Local::now());
-        assert_eq!(ns, Some(1577859825000000000));
+        let ns = datetime_nanoseconds(Some("2020-01-01T01:23:45Z"), Local::now());
+        assert_eq!(ns, Some(1_577_841_825_000_000_000));
     }
 
     #[test]
     fn relative() {
         let fixed_now = Local::now();
-        let ns = datetime_nanoseconds(Some("1hr ago"), fixed_now);
-        let expected = (fixed_now - chrono::Duration::hours(1)).timestamp_nanos();
+        let ns = datetime_nanoseconds(Some("1hr"), fixed_now);
+        let expected = (fixed_now - chrono::Duration::hours(1))
+            .timestamp_nanos_opt()
+            .unwrap();
         assert_eq!(ns, Some(expected));
     }
 }

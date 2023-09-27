@@ -1,15 +1,16 @@
 use crate::delete_expr::{df_to_expr, expr_to_df};
 use chrono::DateTime;
-use data_types::{DeleteExpr, DeletePredicate, TimestampRange, Tombstone};
-use datafusion::logical_expr::Operator;
-use datafusion::prelude::{binary_expr, lit, Column, Expr};
+use data_types::{DeleteExpr, DeletePredicate, TimestampRange};
+use datafusion::{
+    logical_expr::Operator,
+    prelude::{binary_expr, lit, Column, Expr},
+};
 use snafu::Snafu;
 use sqlparser::{
     ast::{BinaryOperator, Expr as SqlParserExpr, Ident, Statement, Value},
     dialect::GenericDialect,
     parser::Parser,
 };
-use std::sync::Arc;
 
 /// Parse Delete Predicates
 /// Parse Error
@@ -48,27 +49,6 @@ impl From<DeletePredicate> for crate::Predicate {
             value_expr: vec![],
         }
     }
-}
-
-/// Convert tombstones to delete predicates
-pub fn tombstones_to_delete_predicates(tombstones: &[Tombstone]) -> Vec<Arc<DeletePredicate>> {
-    tombstones_to_delete_predicates_iter(tombstones).collect()
-}
-
-/// Return Iterator of delete predicates
-pub fn tombstones_to_delete_predicates_iter(
-    tombstones: &[Tombstone],
-) -> impl Iterator<Item = Arc<DeletePredicate>> + '_ {
-    tombstones.iter().map(|tombstone| {
-        Arc::new(
-            parse_delete_predicate(
-                &tombstone.min_time.get().to_string(),
-                &tombstone.max_time.get().to_string(),
-                &tombstone.serialized_predicate,
-            )
-            .expect("Error building delete predicate"),
-        )
-    })
 }
 
 /// Parse and convert the delete grpc API into ParseDeletePredicate to send to server
@@ -121,7 +101,6 @@ fn parse_predicate(predicate: &str) -> Result<Vec<DeleteExpr>> {
             let stmt = stmt.pop();
             match stmt {
                 Some(Statement::Delete {
-                    table_name: _,
                     selection: Some(expr),
                     ..
                 }) => {
@@ -227,7 +206,11 @@ fn parse_time(input: &str) -> Result<i64> {
     // See examples here https://docs.influxdata.com/influxdb/v2.0/reference/cli/influx/delete/#delete-all-points-within-a-specified-time-frame
     let datetime_result = DateTime::parse_from_rfc3339(input);
     match datetime_result {
-        Ok(datetime) => Ok(datetime.timestamp_nanos()),
+        Ok(datetime) => datetime
+            .timestamp_nanos_opt()
+            .ok_or_else(|| Error::InvalidTimestamp {
+                value: datetime.to_string(),
+            }),
         Err(timestamp_err) => {
             // See if it is in nanosecond form
             let time_result = input.parse::<i64>();

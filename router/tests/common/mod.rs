@@ -1,4 +1,6 @@
-use data_types::{PartitionTemplate, QueryPoolId, TableId, TemplatePart, TopicId};
+use std::{iter, string::String, sync::Arc, time::Duration};
+
+use data_types::TableId;
 use generated_types::influxdata::iox::ingester::v1::WriteRequest;
 use hashbrown::HashMap;
 use hyper::{Body, Request, Response};
@@ -12,21 +14,16 @@ use router::{
     dml_handlers::{
         client::mock::MockWriteClient, Chain, DmlHandlerChainExt, FanOutAdaptor,
         InstrumentationDecorator, Partitioned, Partitioner, RetentionValidator, RpcWrite,
-        SchemaValidator, WriteSummaryAdapter,
     },
-    namespace_cache::{MemoryNamespaceCache, ShardedCache},
+    gossip::anti_entropy::{mst::actor::AntiEntropyActor, sync::rpc_server::AntiEntropyService},
+    namespace_cache::{MemoryNamespaceCache, ReadThroughCache, ShardedCache},
     namespace_resolver::{MissingNamespaceAction, NamespaceAutocreation, NamespaceSchemaResolver},
-    server::{grpc::RpcWriteGrpcDelegate, http::HttpDelegate},
+    schema_validator::SchemaValidator,
+    server::{
+        grpc::RpcWriteGrpcDelegate,
+        http::{write::multi_tenant::MultiTenantRequestUnifier, HttpDelegate},
+    },
 };
-use std::{iter, string::String, sync::Arc, time::Duration};
-
-/// The topic catalog ID assigned by the namespace auto-creator in the
-/// handler stack for namespaces it has not yet observed.
-pub const TEST_TOPIC_ID: i64 = 1;
-
-/// The query pool catalog ID assigned by the namespace auto-creator in the
-/// handler stack for namespaces it has not yet observed.
-pub const TEST_QUERY_POOL_ID: i64 = 1;
 
 /// Common retention period value we'll use in tests
 pub const TEST_RETENTION_PERIOD: Duration = Duration::from_secs(3600);
@@ -37,12 +34,18 @@ pub const TEST_RETENTION_PERIOD: Duration = Duration::from_secs(3600);
 #[derive(Debug)]
 pub struct TestContextBuilder {
     namespace_autocreation: MissingNamespaceAction,
+    single_tenancy: bool,
+    rpc_write_error_window: Duration,
+    rpc_write_num_probes: u64,
 }
 
 impl Default for TestContextBuilder {
     fn default() -> Self {
         Self {
             namespace_autocreation: MissingNamespaceAction::Reject,
+            single_tenancy: false,
+            rpc_write_error_window: Duration::from_secs(5),
+            rpc_write_num_probes: 10,
         }
     }
 }
@@ -65,13 +68,26 @@ impl TestContextBuilder {
         self
     }
 
+    pub fn with_single_tenancy(mut self) -> Self {
+        self.single_tenancy = true;
+        self
+    }
+
     pub async fn build(self) -> TestContext {
         test_helpers::maybe_start_logging();
 
         let metrics: Arc<metric::Registry> = Default::default();
         let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
 
-        TestContext::new(self.namespace_autocreation, catalog, metrics).await
+        TestContext::new(
+            self.namespace_autocreation,
+            self.single_tenancy,
+            catalog,
+            metrics,
+            self.rpc_write_error_window,
+            self.rpc_write_num_probes,
+        )
+        .await
     }
 }
 
@@ -79,12 +95,17 @@ impl TestContextBuilder {
 pub struct TestContext {
     client: Arc<MockWriteClient>,
     http_delegate: HttpDelegateStack,
-    grpc_delegate: RpcWriteGrpcDelegate,
+    grpc_delegate: RpcWriteGrpcDelegate<CacheImpl>,
     catalog: Arc<dyn Catalog>,
     metrics: Arc<metric::Registry>,
 
     namespace_autocreation: MissingNamespaceAction,
+    single_tenancy: bool,
+    rpc_write_error_window: Duration,
+    rpc_write_num_probes: u64,
 }
+
+type CacheImpl = Arc<ShardedCache<MemoryNamespaceCache>>;
 
 // This mass of words is certainly a downside of chained handlers.
 //
@@ -94,23 +115,18 @@ type HttpDelegateStack = HttpDelegate<
     InstrumentationDecorator<
         Chain<
             Chain<
-                Chain<
-                    RetentionValidator<Arc<ShardedCache<Arc<MemoryNamespaceCache>>>>,
-                    SchemaValidator<Arc<ShardedCache<Arc<MemoryNamespaceCache>>>>,
-                >,
+                Chain<RetentionValidator, SchemaValidator<Arc<ReadThroughCache<CacheImpl>>>>,
                 Partitioner,
             >,
-            WriteSummaryAdapter<
-                FanOutAdaptor<
-                    RpcWrite<Arc<MockWriteClient>>,
-                    Vec<Partitioned<HashMap<TableId, (String, MutableBatch)>>>,
-                >,
+            FanOutAdaptor<
+                RpcWrite<Arc<MockWriteClient>>,
+                Vec<Partitioned<HashMap<TableId, (String, MutableBatch)>>>,
             >,
         >,
     >,
     NamespaceAutocreation<
-        Arc<ShardedCache<Arc<MemoryNamespaceCache>>>,
-        NamespaceSchemaResolver<Arc<ShardedCache<Arc<MemoryNamespaceCache>>>>,
+        Arc<ReadThroughCache<CacheImpl>>,
+        NamespaceSchemaResolver<Arc<ReadThroughCache<CacheImpl>>>,
     >,
 >;
 
@@ -118,38 +134,47 @@ type HttpDelegateStack = HttpDelegate<
 impl TestContext {
     async fn new(
         namespace_autocreation: MissingNamespaceAction,
+        single_tenancy: bool,
         catalog: Arc<dyn Catalog>,
         metrics: Arc<metric::Registry>,
+        rpc_write_error_window: Duration,
+        rpc_write_num_probes: u64,
     ) -> Self {
         let client = Arc::new(MockWriteClient::default());
-        let rpc_writer = RpcWrite::new([(Arc::clone(&client), "mock client")], None, &metrics);
+        let rpc_writer = RpcWrite::new(
+            [(Arc::clone(&client), "mock client")],
+            1.try_into().unwrap(),
+            &metrics,
+            rpc_write_num_probes,
+        );
 
         let ns_cache = Arc::new(ShardedCache::new(
-            iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
+            iter::repeat_with(MemoryNamespaceCache::default).take(10),
         ));
+
+        // TODO: wire this up with the correct cache decorators
+        let (actor, mst) = AntiEntropyActor::new(Arc::clone(&ns_cache));
+        tokio::spawn(actor.run());
+        let sync_rpc_service = AntiEntropyService::new(mst, Arc::clone(&ns_cache));
+
+        let ns_cache = Arc::new(ReadThroughCache::new(ns_cache, Arc::clone(&catalog)));
 
         let schema_validator =
             SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &metrics);
 
-        let retention_validator =
-            RetentionValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
+        let retention_validator = RetentionValidator::new();
 
-        let partitioner = Partitioner::new(PartitionTemplate {
-            parts: vec![TemplatePart::TimeFormat("%Y-%m-%d".to_owned())],
-        });
+        let partitioner = Partitioner::default();
 
-        let namespace_resolver =
-            NamespaceSchemaResolver::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
+        let namespace_resolver = NamespaceSchemaResolver::new(Arc::clone(&ns_cache));
         let namespace_resolver = NamespaceAutocreation::new(
             namespace_resolver,
             Arc::clone(&ns_cache),
             Arc::clone(&catalog),
-            TopicId::new(TEST_TOPIC_ID),
-            QueryPoolId::new(TEST_QUERY_POOL_ID),
             namespace_autocreation,
         );
 
-        let parallel_write = WriteSummaryAdapter::new(FanOutAdaptor::new(rpc_writer));
+        let parallel_write = FanOutAdaptor::new(rpc_writer);
 
         let handler_stack = retention_validator
             .and_then(schema_validator)
@@ -158,14 +183,21 @@ impl TestContext {
 
         let handler_stack = InstrumentationDecorator::new("request", &metrics, handler_stack);
 
-        let http_delegate =
-            HttpDelegate::new(1024, 100, namespace_resolver, handler_stack, None, &metrics);
+        let write_request_unifier = Box::<MultiTenantRequestUnifier>::default();
+
+        let http_delegate = HttpDelegate::new(
+            1024,
+            100,
+            namespace_resolver,
+            handler_stack,
+            &metrics,
+            write_request_unifier,
+        );
 
         let grpc_delegate = RpcWriteGrpcDelegate::new(
             Arc::clone(&catalog),
             Arc::new(InMemory::default()),
-            TopicId::new(TEST_TOPIC_ID),
-            QueryPoolId::new(TEST_QUERY_POOL_ID),
+            sync_rpc_service,
         );
 
         Self {
@@ -176,6 +208,9 @@ impl TestContext {
             metrics,
 
             namespace_autocreation,
+            single_tenancy,
+            rpc_write_error_window,
+            rpc_write_num_probes,
         }
     }
 
@@ -184,7 +219,15 @@ impl TestContext {
     pub async fn restart(self) -> Self {
         let catalog = self.catalog();
         let metrics = Arc::clone(&self.metrics);
-        Self::new(self.namespace_autocreation, catalog, metrics).await
+        Self::new(
+            self.namespace_autocreation,
+            self.single_tenancy,
+            catalog,
+            metrics,
+            self.rpc_write_error_window,
+            self.rpc_write_num_probes,
+        )
+        .await
     }
 
     /// Get a reference to the test context's http delegate.
@@ -193,7 +236,7 @@ impl TestContext {
     }
 
     /// Get a reference to the test context's grpc delegate.
-    pub fn grpc_delegate(&self) -> &RpcWriteGrpcDelegate {
+    pub fn grpc_delegate(&self) -> &RpcWriteGrpcDelegate<CacheImpl> {
         &self.grpc_delegate
     }
 

@@ -100,6 +100,7 @@ macro_rules! setup_builder {
                 $server_type.metric_registry(),
                 $server_type.trace_collector(),
                 true,
+                $server_type.name(),
             ))
             .layer(
                 $crate::reexport::tower_http::catch_panic::CatchPanicLayer::custom(
@@ -129,7 +130,6 @@ macro_rules! setup_builder {
 #[macro_export]
 macro_rules! serve_builder {
     ($builder:ident) => {{
-        use $crate::reexport::tokio_stream::wrappers::TcpListenerStream;
         use $crate::rpc::RpcBuilder;
 
         let RpcBuilder {
@@ -139,7 +139,10 @@ macro_rules! serve_builder {
             ..
         } = $builder;
 
-        let stream = TcpListenerStream::new(socket);
+        let stream = $crate::reexport::tonic::transport::server::TcpIncoming::from_listener(
+            socket, true, None,
+        )
+        .expect("failed to initialise tcp socket");
         inner
             .serve_with_incoming_shutdown(stream, shutdown.cancelled())
             .await?;

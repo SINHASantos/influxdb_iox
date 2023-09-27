@@ -1,4 +1,9 @@
 use arrow::datatypes::SchemaRef;
+use datafusion::physical_expr::execution_props::ExecutionProps;
+use influxdb_influxql_parser::show_field_keys::ShowFieldKeysStatement;
+use influxdb_influxql_parser::show_measurements::ShowMeasurementsStatement;
+use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
+use influxdb_influxql_parser::show_tag_values::ShowTagValuesStatement;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -12,7 +17,9 @@ use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};
 use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::physical_plan::{Partitioning, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Partitioning, SendableRecordBatchStream,
+};
 use datafusion::{
     error::{DataFusionError, Result},
     physical_plan::ExecutionPlan,
@@ -57,6 +64,10 @@ impl<'a> SchemaProvider for ContextSchemaProvider<'a> {
     fn table_schema(&self, name: &str) -> Option<Schema> {
         self.tables.get(name).map(|(_, s)| s.clone())
     }
+
+    fn execution_props(&self) -> &ExecutionProps {
+        self.state.execution_props()
+    }
 }
 
 /// A physical operator that overrides the `schema` API,
@@ -69,7 +80,7 @@ struct SchemaExec {
 
 impl Debug for SchemaExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SchemaExec")
+        self.fmt_as(DisplayFormatType::Default, f)
     }
 }
 
@@ -91,7 +102,7 @@ impl ExecutionPlan for SchemaExec {
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        vec![Arc::clone(&self.input)]
     }
 
     fn with_new_children(
@@ -111,6 +122,16 @@ impl ExecutionPlan for SchemaExec {
 
     fn statistics(&self) -> Statistics {
         self.input.statistics()
+    }
+}
+
+impl DisplayAs for SchemaExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "SchemaExec")
+            }
+        }
     }
 }
 
@@ -196,15 +217,15 @@ impl InfluxQLQueryPlanner {
             }
         }
 
-        let planner = InfluxQLToLogicalPlan::new(&sp);
+        let planner = InfluxQLToLogicalPlan::new(&sp, ctx);
         let logical_plan = planner.statement_to_plan(statement)?;
         debug!(plan=%logical_plan.display_graphviz(), "logical plan");
         Ok(logical_plan)
     }
 
     fn query_to_statement(&self, query: &str) -> Result<Statement> {
-        let mut statements = parse_statements(query)
-            .map_err(|e| DataFusionError::External(format!("{e}").into()))?;
+        let mut statements =
+            parse_statements(query).map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
         if statements.len() != 1 {
             return Err(DataFusionError::NotImplemented(
@@ -242,6 +263,50 @@ fn find_all_measurements(stmt: &Statement, tables: &[String]) -> Result<HashSet<
                             self.0.insert(table.into());
                         });
                 }
+            }
+
+            Ok(self)
+        }
+
+        fn post_visit_show_measurements_statement(
+            self,
+            sm: &ShowMeasurementsStatement,
+        ) -> Result<Self, Self::Error> {
+            if sm.with_measurement.is_none() {
+                self.0.extend(self.1.iter().cloned());
+            }
+
+            Ok(self)
+        }
+
+        fn post_visit_show_field_keys_statement(
+            self,
+            sfk: &ShowFieldKeysStatement,
+        ) -> Result<Self, Self::Error> {
+            if sfk.from.is_none() {
+                self.0.extend(self.1.iter().cloned());
+            }
+
+            Ok(self)
+        }
+
+        fn post_visit_show_tag_values_statement(
+            self,
+            stv: &ShowTagValuesStatement,
+        ) -> Result<Self, Self::Error> {
+            if stv.from.is_none() {
+                self.0.extend(self.1.iter().cloned());
+            }
+
+            Ok(self)
+        }
+
+        fn post_visit_show_tag_keys_statement(
+            self,
+            stk: &ShowTagKeysStatement,
+        ) -> std::result::Result<Self, Self::Error> {
+            if stk.from.is_none() {
+                self.0.extend(self.1.iter().cloned());
             }
 
             Ok(self)
@@ -303,6 +368,35 @@ mod test {
             find("SELECT * FROM foo, (SELECT * FROM /bar/)"),
             vec!["bar", "foo", "foobar"]
         );
+
+        // Find all measurements in `SHOW MEASUREMENTS`
+        assert_eq!(find("SHOW MEASUREMENTS"), vec!["bar", "foo", "foobar"]);
+        assert_eq!(
+            find("SHOW MEASUREMENTS WITH MEASUREMENT = foo"),
+            vec!["foo"]
+        );
+        assert_eq!(
+            find("SHOW MEASUREMENTS WITH MEASUREMENT =~ /^foo/"),
+            vec!["foo", "foobar"]
+        );
+
+        // Find all measurements in `SHOW FIELD KEYS`
+        assert_eq!(find("SHOW FIELD KEYS"), vec!["bar", "foo", "foobar"]);
+        assert_eq!(find("SHOW FIELD KEYS FROM /^foo/"), vec!["foo", "foobar"]);
+
+        // Find all measurements in `SHOW TAG VALUES`
+        assert_eq!(
+            find("SHOW TAG VALUES WITH KEY = \"k\""),
+            vec!["bar", "foo", "foobar"]
+        );
+        assert_eq!(
+            find("SHOW TAG VALUES FROM /^foo/ WITH KEY = \"k\""),
+            vec!["foo", "foobar"]
+        );
+
+        // Find all measurements in `SHOW TAG KEYS`
+        assert_eq!(find("SHOW TAG KEYS"), vec!["bar", "foo", "foobar"]);
+        assert_eq!(find("SHOW TAG KEYS FROM /^foo/"), vec!["foo", "foobar"]);
 
         // Finds no measurements
         assert!(find("SELECT * FROM none").is_empty());

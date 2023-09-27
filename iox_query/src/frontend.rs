@@ -1,4 +1,3 @@
-pub mod common;
 pub mod reorg;
 pub mod sql;
 
@@ -6,21 +5,20 @@ pub mod sql;
 mod test {
     use std::sync::Arc;
 
-    use arrow_util::assert_batches_eq;
     use datafusion::physical_plan::{
         metrics::{self, MetricValue},
         ExecutionPlan, ExecutionPlanVisitor,
     };
-    use datafusion_util::{test_collect_partition, test_execute_partition};
+    use datafusion_util::test_execute_partition;
     use futures::StreamExt;
     use schema::{merge::SchemaMerger, sort::SortKey, Schema};
 
     use crate::{
-        exec::{split::StreamSplitExec, Executor, ExecutorType, IOxSessionContext},
+        exec::{split::StreamSplitExec, Executor, ExecutorType},
         frontend::reorg::ReorgPlanner,
         provider::{DeduplicateExec, RecordBatchesExec},
         test::TestChunk,
-        QueryChunk, QueryChunkMeta, ScanPlanBuilder,
+        QueryChunk,
     };
 
     /// A macro to asserts the contents of the extracted metrics is reasonable
@@ -41,12 +39,14 @@ mod test {
                 .start_timestamp
                 .value()
                 .expect("start timestamp")
-                .timestamp_nanos();
+                .timestamp_nanos_opt()
+                .expect("start timestamp in range");
             let end_ts = $EXTRACTED
                 .end_timestamp
                 .value()
                 .expect("end timestamp")
-                .timestamp_nanos();
+                .timestamp_nanos_opt()
+                .expect("end timestamp in range");
 
             assert!(start_ts > 0, "start timestamp was non zero");
             assert!(end_ts > 0, "end timestamp was non zero");
@@ -58,176 +58,13 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_scan_plan_deduplication() {
-        // Create 2 overlapped chunks
-        let (schema, chunks) = get_test_overlapped_chunks();
-        let ctx = IOxSessionContext::with_testing();
-
-        // Build a logical plan with deduplication
-        let scan_plan = ScanPlanBuilder::new(Arc::from("t"), &schema, ctx.child_ctx("scan_plan"))
-            .with_chunks(chunks)
-            .build()
-            .unwrap();
-        let logical_plan = scan_plan.plan_builder.build().unwrap();
-
-        // Build physical plan
-        let executor = Executor::new_testing();
-        let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
-            .create_physical_plan(&logical_plan)
-            .await
-            .unwrap();
-
-        // Verify output data
-        // Since data is merged due to deduplication, the two input chunks will be merged into one output chunk
-        assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
-            1,
-            "{:?}",
-            physical_plan.output_partitioning()
-        );
-        let batches0 = test_collect_partition(Arc::clone(&physical_plan), 0).await;
-        // Data is sorted on tag1 & time. One row is removed due to deduplication
-        let expected = vec![
-            "+-----------+------------+------+--------------------------------+",
-            "| field_int | field_int2 | tag1 | time                           |",
-            "+-----------+------------+------+--------------------------------+",
-            "| 100       |            | AL   | 1970-01-01T00:00:00.000000050Z |",
-            "| 70        |            | CT   | 1970-01-01T00:00:00.000000100Z |",
-            "| 1000      |            | MT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 5         |            | MT   | 1970-01-01T00:00:00.000005Z    |",
-            "| 10        |            | MT   | 1970-01-01T00:00:00.000007Z    |",
-            "| 70        | 70         | UT   | 1970-01-01T00:00:00.000220Z    |",
-            "| 50        | 50         | VT   | 1970-01-01T00:00:00.000210Z    |", // other row with the same tag1 and time is removed
-            "| 1000      | 1000       | WA   | 1970-01-01T00:00:00.000028Z    |",
-            "+-----------+------------+------+--------------------------------+",
-        ];
-        assert_batches_eq!(&expected, &batches0);
-    }
-
-    #[tokio::test]
-    async fn test_scan_plan_without_deduplication() {
-        // Create 2 overlapped chunks
-        let (schema, chunks) = get_test_chunks();
-        let ctx = IOxSessionContext::with_testing();
-
-        // Build a logical plan without deduplication
-        let scan_plan = ScanPlanBuilder::new(Arc::from("t"), &schema, ctx.child_ctx("scan_plan"))
-            .with_chunks(chunks)
-            // force it to not deduplicate
-            .enable_deduplication(false)
-            .build()
-            .unwrap();
-        let logical_plan = scan_plan.plan_builder.build().unwrap();
-
-        // Build physical plan
-        let executor = Executor::new_testing();
-        let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
-            .create_physical_plan(&logical_plan)
-            .await
-            .unwrap();
-
-        // Verify output data: 2 input chunks are pushed out as 2 output chunks
-        assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
-            2,
-            "{:?}",
-            physical_plan.output_partitioning()
-        );
-        //
-        // First chunk has 5 rows
-        let batches0 = test_collect_partition(Arc::clone(&physical_plan), 0).await;
-        // Data is not sorted on anything
-        let expected = vec![
-            "+-----------+------------+------+--------------------------------+",
-            "| field_int | field_int2 | tag1 | time                           |",
-            "+-----------+------------+------+--------------------------------+",
-            "| 1000      |            | MT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 10        |            | MT   | 1970-01-01T00:00:00.000007Z    |",
-            "| 70        |            | CT   | 1970-01-01T00:00:00.000000100Z |",
-            "| 100       |            | AL   | 1970-01-01T00:00:00.000000050Z |",
-            "| 5         |            | MT   | 1970-01-01T00:00:00.000005Z    |",
-            "+-----------+------------+------+--------------------------------+",
-        ];
-        assert_batches_eq!(&expected, &batches0);
-        //
-        // Second chunk has 4 rows with duplicates
-        let batches1 = test_collect_partition(Arc::clone(&physical_plan), 1).await;
-        // Data is not sorted on anything
-        let expected = vec![
-            "+-----------+------------+------+-----------------------------+",
-            "| field_int | field_int2 | tag1 | time                        |",
-            "+-----------+------------+------+-----------------------------+",
-            "| 1000      | 1000       | WA   | 1970-01-01T00:00:00.000028Z |",
-            "| 10        | 10         | VT   | 1970-01-01T00:00:00.000210Z |", // duplicate 1
-            "| 70        | 70         | UT   | 1970-01-01T00:00:00.000220Z |",
-            "| 50        | 50         | VT   | 1970-01-01T00:00:00.000210Z |", // duplicate 2
-            "+-----------+------------+------+-----------------------------+",
-        ];
-        assert_batches_eq!(&expected, &batches1);
-    }
-
-    #[tokio::test]
-    async fn test_scan_plan_without_deduplication_but_sort() {
-        // Create 2 overlapped chunks
-        let (schema, chunks) = get_test_chunks();
-        let sort_key = SortKey::from_columns(vec!["time", "tag1"]);
-        let ctx = IOxSessionContext::with_testing();
-
-        // Build a logical plan without deduplication but sort
-        let scan_plan = ScanPlanBuilder::new(Arc::from("t"), &schema, ctx.child_ctx("scan_plan"))
-            .with_chunks(chunks)
-            // force it to not deduplicate
-            .enable_deduplication(false)
-            // force to sort on time & tag1
-            .with_output_sort_key(sort_key)
-            .build()
-            .unwrap();
-        let logical_plan = scan_plan.plan_builder.build().unwrap();
-
-        // Build physical plan
-        let executor = Executor::new_testing();
-        let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
-            .create_physical_plan(&logical_plan)
-            .await
-            .unwrap();
-
-        // Verify output data: 2 input chunks merged into one output chunk
-        assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
-            1,
-            "{:?}",
-            physical_plan.output_partitioning()
-        );
-        let batches0 = test_collect_partition(Arc::clone(&physical_plan), 0).await;
-        // Data is sorted on time & tag1 without deduplication
-        let expected = vec![
-            "+-----------+------------+------+--------------------------------+",
-            "| field_int | field_int2 | tag1 | time                           |",
-            "+-----------+------------+------+--------------------------------+",
-            "| 100       |            | AL   | 1970-01-01T00:00:00.000000050Z |",
-            "| 70        |            | CT   | 1970-01-01T00:00:00.000000100Z |",
-            "| 1000      |            | MT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 5         |            | MT   | 1970-01-01T00:00:00.000005Z    |",
-            "| 10        |            | MT   | 1970-01-01T00:00:00.000007Z    |",
-            "| 1000      | 1000       | WA   | 1970-01-01T00:00:00.000028Z    |",
-            "| 10        | 10         | VT   | 1970-01-01T00:00:00.000210Z    |", // duplicate 1
-            "| 50        | 50         | VT   | 1970-01-01T00:00:00.000210Z    |", // duplicate 2
-            "| 70        | 70         | UT   | 1970-01-01T00:00:00.000220Z    |",
-            "+-----------+------------+------+--------------------------------+",
-        ];
-        assert_batches_eq!(&expected, &batches0);
-    }
-
-    #[tokio::test]
     async fn test_metrics() {
+        test_helpers::maybe_start_logging();
         let (schema, chunks) = get_test_chunks();
         let sort_key = SortKey::from_columns(vec!["time", "tag1"]);
 
         // Use a split plan as it has StreamSplitExec, DeduplicateExec and IOxReadFilternode
-        let split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+        let split_plan = ReorgPlanner::new()
             .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000])
             .expect("created compact plan");
 
@@ -238,6 +75,9 @@ mod test {
             .await
             .unwrap();
 
+        assert_eq!(plan.output_partitioning().partition_count(), 2);
+
+        println!("Executing partition 0");
         let mut stream0 = test_execute_partition(Arc::clone(&plan), 0).await;
         let mut num_rows = 0;
         while let Some(batch) = stream0.next().await {
@@ -245,6 +85,7 @@ mod test {
         }
         assert_eq!(num_rows, 3);
 
+        println!("Executing partition 1");
         let mut stream1 = test_execute_partition(Arc::clone(&plan), 1).await;
         let mut num_rows = 0;
         while let Some(batch) = stream1.next().await {
@@ -258,7 +99,7 @@ mod test {
         })
         .unwrap();
 
-        assert_extracted_metrics!(extracted, 5);
+        assert_extracted_metrics!(extracted, 9);
 
         // now the deduplicator
         let extracted = extract_metrics(plan.as_ref(), |plan| {
@@ -336,12 +177,26 @@ mod test {
                 _ => {}
             });
 
-            self.inner = Some(ExtractedMetrics {
+            let new = ExtractedMetrics {
                 elapsed_compute: elapsed_compute.expect("did not find metric"),
                 output_rows: output_rows.expect("did not find metric"),
                 start_timestamp: start_timestamp.expect("did not find metric"),
                 end_timestamp: end_timestamp.expect("did not find metric"),
-            });
+            };
+
+            if let Some(existing) = &self.inner {
+                let ExtractedMetrics {
+                    elapsed_compute,
+                    output_rows,
+                    start_timestamp,
+                    end_timestamp,
+                } = existing;
+                new.elapsed_compute.add(elapsed_compute);
+                new.output_rows.add(output_rows.value());
+                new.start_timestamp.update_to_min(start_timestamp);
+                new.end_timestamp.update_to_max(end_timestamp);
+            }
+            self.inner = Some(new);
 
             // found what we are looking for, no need to continue
             Ok(false)
@@ -359,11 +214,12 @@ mod test {
         extractor.inner
     }
 
-    fn test_chunks(overlapped: bool) -> (Schema, Vec<Arc<dyn QueryChunk>>) {
-        let max_time = if overlapped { 70000 } else { 7000 };
+    fn get_test_chunks() -> (Schema, Vec<Arc<dyn QueryChunk>>) {
+        let max_time = 7000;
         let chunk1 = Arc::new(
             TestChunk::new("t")
-                .with_partition_id(1)
+                .with_order(1)
+                .with_partition(1)
                 .with_time_column_with_stats(Some(50), Some(max_time))
                 .with_tag_column_with_stats("tag1", Some("AL"), Some("MT"))
                 .with_i64_field_column("field_int")
@@ -373,7 +229,8 @@ mod test {
         // Chunk 2 has an extra field, and only 4 rows
         let chunk2 = Arc::new(
             TestChunk::new("t")
-                .with_partition_id(1)
+                .with_order(2)
+                .with_partition(1)
                 .with_time_column_with_stats(Some(28000), Some(220000))
                 .with_tag_column_with_stats("tag1", Some("UT"), Some("WA"))
                 .with_i64_field_column("field_int")
@@ -390,13 +247,5 @@ mod test {
             .build();
 
         (schema, vec![chunk1, chunk2])
-    }
-
-    fn get_test_chunks() -> (Schema, Vec<Arc<dyn QueryChunk>>) {
-        test_chunks(false)
-    }
-
-    fn get_test_overlapped_chunks() -> (Schema, Vec<Arc<dyn QueryChunk>>) {
-        test_chunks(true)
     }
 }

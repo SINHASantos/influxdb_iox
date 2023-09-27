@@ -1,14 +1,10 @@
-use std::{error::Error, fmt::Debug, sync::Arc};
-
+use super::{partitioner::PartitionError, retention_validation::RetentionError, RpcWriteError};
+use crate::schema_validator::SchemaError;
 use async_trait::async_trait;
-use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use data_types::{NamespaceName, NamespaceSchema};
+use std::{error::Error, fmt::Debug, sync::Arc};
 use thiserror::Error;
 use trace::ctx::SpanContext;
-
-use super::{
-    partitioner::PartitionError, retention_validation::RetentionError, RpcWriteError, SchemaError,
-    ShardError,
-};
 
 /// Errors emitted by a [`DmlHandler`] implementation during DML request
 /// processing.
@@ -17,10 +13,6 @@ pub enum DmlError {
     /// The namespace specified by the caller does not exist.
     #[error("namespace {0} does not exist")]
     NamespaceNotFound(String),
-
-    /// An error sharding the writes and pushing them to the write buffer.
-    #[error(transparent)]
-    WriteBuffer(#[from] ShardError),
 
     /// An error pushing the request to a downstream ingester via a direct RPC
     /// call.
@@ -64,27 +56,14 @@ pub trait DmlHandler: Debug + Send + Sync {
     /// All errors must be mappable into the concrete [`DmlError`] type.
     type WriteError: Error + Into<DmlError> + Send;
 
-    /// The error type of the delete handler.
-    type DeleteError: Error + Into<DmlError> + Send;
-
     /// Write `batches` to `namespace`.
     async fn write(
         &self,
         namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError>;
-
-    /// Delete the data specified in `delete`.
-    async fn delete(
-        &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
-        table_name: &str,
-        predicate: &DeletePredicate,
-        span_ctx: Option<SpanContext>,
-    ) -> Result<(), Self::DeleteError>;
 }
 
 #[async_trait]
@@ -95,31 +74,16 @@ where
     type WriteInput = T::WriteInput;
     type WriteOutput = T::WriteOutput;
     type WriteError = T::WriteError;
-    type DeleteError = T::DeleteError;
 
     async fn write(
         &self,
         namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
         (**self)
-            .write(namespace, namespace_id, input, span_ctx)
-            .await
-    }
-
-    /// Delete the data specified in `delete`.
-    async fn delete(
-        &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
-        table_name: &str,
-        predicate: &DeletePredicate,
-        span_ctx: Option<SpanContext>,
-    ) -> Result<(), Self::DeleteError> {
-        (**self)
-            .delete(namespace, namespace_id, table_name, predicate, span_ctx)
+            .write(namespace, namespace_schema, input, span_ctx)
             .await
     }
 }

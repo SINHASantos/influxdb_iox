@@ -14,21 +14,21 @@ format = ["arrow", "arrow_util"]
 arrow = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true, features=["flight-sql-experimental"] }
 arrow_util = { path = "../arrow_util", optional = true }
-bytes = "1.4"
+bytes = "1.5"
 client_util = { path = "../client_util" }
-comfy-table = { version = "6.1", default-features = false}
+comfy-table = { version = "7.0", default-features = false}
 futures-util = { version = "0.3" }
 influxdb-line-protocol = { path = "../influxdb_line_protocol"}
-generated_types = { path = "../generated_types", default-features = false, features = ["data_types_conversions"] }
-prost = "0.11"
+generated_types = { path = "../generated_types" }
+prost = { workspace = true }
 rand = "0.8.3"
-reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 schema = { path = "../schema" }
-serde_json = "1.0.95"
-tokio = { version = "1.26", features = ["macros", "parking_lot", "rt-multi-thread"] }
-tokio-stream = "0.1.12"
-thiserror = "1.0.39"
-tonic = { version = "0.8" }
+serde_json = "1.0.107"
+tokio = { version = "1.32", features = ["macros", "parking_lot", "rt-multi-thread"] }
+tokio-stream = "0.1.13"
+thiserror = "1.0.49"
+tonic = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1" }

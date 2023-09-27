@@ -1,29 +1,20 @@
+//! # WAL
+//!
+//! This crate provides a local-disk WAL for the IOx ingestion pipeline.
+
 #![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
     missing_debug_implementations,
     clippy::explicit_iter_loop,
     clippy::use_self,
-    clippy::clone_on_ref_ptr
+    clippy::clone_on_ref_ptr,
+    unused_crate_dependencies
 )]
 
-//! # WAL
-//!
-//! This crate provides a local-disk WAL for the IOx ingestion pipeline.
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
-use crate::blocking::{
-    ClosedSegmentFileReader as RawClosedSegmentFileReader, OpenSegmentFileWriter,
-};
-use data_types::sequence_number_set::SequenceNumberSet;
-use generated_types::{
-    google::{FieldViolation, OptionalField},
-    influxdata::iox::wal::v1::{
-        sequenced_wal_op::Op as WalOp, SequencedWalOp as ProtoSequencedWalOp,
-    },
-};
-use observability_deps::tracing::info;
-use parking_lot::Mutex;
-use snafu::prelude::*;
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -32,8 +23,26 @@ use std::{
     sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
+
+use data_types::{sequence_number_set::SequenceNumberSet, NamespaceId, TableId};
+use generated_types::{
+    google::{FieldViolation, OptionalField},
+    influxdata::iox::wal::v1::{
+        sequenced_wal_op::Op as WalOp, SequencedWalOp as ProtoSequencedWalOp,
+    },
+};
+use hashbrown::HashMap;
+use mutable_batch::MutableBatch;
+use mutable_batch_pb::decode::decode_database_batch;
+use observability_deps::tracing::info;
+use parking_lot::Mutex;
+use snafu::prelude::*;
 use tokio::{sync::watch, task::JoinHandle};
 use writer_thread::WriterIoThreadHandle;
+
+use crate::blocking::{
+    ClosedSegmentFileReader as RawClosedSegmentFileReader, OpenSegmentFileWriter,
+};
 
 pub mod blocking;
 mod writer_thread;
@@ -100,6 +109,8 @@ pub enum Error {
         source: blocking::ReaderError,
     },
 
+    /// This error indicates that the next entry cannot be read from the
+    /// segment file.
     UnableToReadNextOps {
         source: blocking::ReaderError,
     },
@@ -129,6 +140,19 @@ pub enum Error {
 
     UnableToCreateSegmentFile {
         source: blocking::WriterError,
+    },
+}
+
+/// Errors that occur when decoding internal types from a WAL file.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum DecodeError {
+    UnableToCreateMutableBatch {
+        source: mutable_batch_pb::decode::Error,
+    },
+
+    FailedToReadWal {
+        source: Error,
     },
 }
 
@@ -448,7 +472,10 @@ impl WalBuffer {
 /// A wal operation with a sequence number
 #[derive(Debug, PartialEq, Clone)]
 pub struct SequencedWalOp {
-    pub sequence_number: u64,
+    /// This mapping assigns a sequence number to table ID modified by this
+    /// write.
+    pub table_write_sequence_numbers: std::collections::HashMap<TableId, u64>,
+    /// The underlying WAL operation which this wrapper sequences.
     pub op: WalOp,
 }
 
@@ -457,12 +484,15 @@ impl TryFrom<ProtoSequencedWalOp> for SequencedWalOp {
 
     fn try_from(proto: ProtoSequencedWalOp) -> Result<Self, Self::Error> {
         let ProtoSequencedWalOp {
-            sequence_number,
+            table_write_sequence_numbers,
             op,
         } = proto;
 
         Ok(Self {
-            sequence_number,
+            table_write_sequence_numbers: table_write_sequence_numbers
+                .into_iter()
+                .map(|(table_id, sequence_number)| (TableId::new(table_id), sequence_number))
+                .collect(),
             op: op.unwrap_field("op")?,
         })
     }
@@ -471,12 +501,15 @@ impl TryFrom<ProtoSequencedWalOp> for SequencedWalOp {
 impl From<SequencedWalOp> for ProtoSequencedWalOp {
     fn from(seq_op: SequencedWalOp) -> Self {
         let SequencedWalOp {
-            sequence_number,
+            table_write_sequence_numbers,
             op,
         } = seq_op;
 
         Self {
-            sequence_number,
+            table_write_sequence_numbers: table_write_sequence_numbers
+                .into_iter()
+                .map(|(table_id, sequence_number)| (table_id.get(), sequence_number))
+                .collect(),
             op: Some(op),
         }
     }
@@ -516,12 +549,19 @@ pub struct ClosedSegmentFileReader {
     file: RawClosedSegmentFileReader<BufReader<File>>,
 }
 
-impl ClosedSegmentFileReader {
-    /// Get the next batch of sequenced wal ops from the file
-    pub fn next_batch(&mut self) -> Result<Option<Vec<SequencedWalOp>>> {
-        self.file.next_batch().context(UnableToReadNextOpsSnafu)
-    }
+impl Iterator for ClosedSegmentFileReader {
+    type Item = Result<Vec<SequencedWalOp>>;
 
+    /// Read the next batch of sequenced WAL operations from the file
+    fn next(&mut self) -> Option<Self::Item> {
+        self.file
+            .next_batch()
+            .context(UnableToReadNextOpsSnafu)
+            .transpose()
+    }
+}
+
+impl ClosedSegmentFileReader {
     /// Return the segment file id
     pub fn id(&self) -> SegmentId {
         self.id
@@ -554,6 +594,66 @@ impl std::fmt::Debug for ClosedSegmentFileReader {
     }
 }
 
+/// An in-memory representation of a WAL write operation entry.
+#[derive(Debug)]
+pub struct WriteOpEntry {
+    pub namespace: NamespaceId,
+    pub table_batches: HashMap<TableId, MutableBatch>,
+}
+
+/// A decoder that reads from a closed segment file and parses write
+/// operations from their on-disk format to an internal format.
+#[derive(Debug)]
+pub struct WriteOpEntryDecoder {
+    reader: ClosedSegmentFileReader,
+}
+
+impl From<ClosedSegmentFileReader> for WriteOpEntryDecoder {
+    /// Creates a decoder which will use the closed segment file of `reader` to
+    /// decode write ops from their on-disk format.
+    fn from(reader: ClosedSegmentFileReader) -> Self {
+        Self { reader }
+    }
+}
+
+impl Iterator for WriteOpEntryDecoder {
+    type Item = Result<Vec<WriteOpEntry>, DecodeError>;
+
+    /// Reads a collection of write op entries in the next WAL entry batch from the
+    /// underlying closed segment. A returned Ok(None) indicates that there are no
+    /// more entries to be decoded from the underlying segment. A zero-length vector
+    /// may be returned if there are no writes in a WAL entry batch, but does not
+    /// indicate the decoder is consumed.
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(
+            self.reader
+                .next()?
+                .context(FailedToReadWalSnafu)
+                .map(|batch| {
+                    batch
+                        .into_iter()
+                        .filter_map(|sequenced_op| match sequenced_op.op {
+                            WalOp::Write(w) => Some(w),
+                            WalOp::Delete(..) => None,
+                            WalOp::Persist(..) => None,
+                        })
+                        .map(|w| {
+                            Ok(WriteOpEntry {
+                                namespace: NamespaceId::new(w.database_id),
+                                table_batches: decode_database_batch(&w)
+                                    .context(UnableToCreateMutableBatchSnafu)?
+                                    .into_iter()
+                                    .map(|(id, mb)| (TableId::new(id), mb))
+                                    .collect(),
+                            })
+                        })
+                        .collect::<Self::Item>()
+                })
+                .unwrap_or_else(Err),
+        )
+    }
+}
+
 /// Metadata for a WAL segment that is no longer accepting writes, but can be read for replay
 /// purposes.
 #[derive(Debug, Clone)]
@@ -575,7 +675,11 @@ impl ClosedSegment {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeSet;
+    use std::fs::{read_dir, OpenOptions};
+    use std::io::Write;
+
+    use assert_matches::assert_matches;
     use data_types::{NamespaceId, SequenceNumber, TableId};
     use dml::DmlWrite;
     use generated_types::influxdata::{
@@ -584,28 +688,35 @@ mod tests {
     };
     use mutable_batch_lp::lines_to_batches;
 
+    use super::*;
+
+    const TEST_NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
+
     #[tokio::test]
     async fn wal_write_and_read_ops() {
         let dir = test_helpers::tmp_dir().unwrap();
         let wal = Wal::new(&dir.path()).await.unwrap();
 
         let w1 = test_data("m1,t=foo v=1i 1");
-        let w2 = test_data("m1,t=foo v=2i 2");
+        // Use multiple tables for a write to test per-partition sequencing is preserved
+        let w2 = test_data("m1,t=foo v=2i 2\nm2,u=bar v=1i 1");
 
         let op1 = SequencedWalOp {
-            sequence_number: 0,
+            table_write_sequence_numbers: vec![(TableId::new(0), 0)].into_iter().collect(),
             op: WalOp::Write(w1),
         };
         let op2 = SequencedWalOp {
-            sequence_number: 1,
+            table_write_sequence_numbers: vec![(TableId::new(0), 1), (TableId::new(1), 2)]
+                .into_iter()
+                .collect(),
             op: WalOp::Write(w2),
         };
         let op3 = SequencedWalOp {
-            sequence_number: 2,
+            table_write_sequence_numbers: vec![(TableId::new(0), 3)].into_iter().collect(),
             op: WalOp::Delete(test_delete()),
         };
         let op4 = SequencedWalOp {
-            sequence_number: 2,
+            table_write_sequence_numbers: vec![(TableId::new(0), 3)].into_iter().collect(),
             op: WalOp::Persist(test_persist()),
         };
 
@@ -616,18 +727,17 @@ mod tests {
 
         let (closed, ids) = wal.rotate().unwrap();
 
-        let mut reader = wal.reader_for_segment(closed.id).unwrap();
-
-        let mut ops = vec![];
-        while let Ok(Some(mut batch)) = reader.next_batch() {
-            ops.append(&mut batch);
-        }
+        let ops: Vec<SequencedWalOp> = wal
+            .reader_for_segment(closed.id)
+            .expect("should be able to open reader for closed WAL segment")
+            .flat_map(|batch| batch.expect("failed to read WAL op batch"))
+            .collect();
         assert_eq!(vec![op1, op2, op3, op4], ops);
 
         // Assert the set has recorded the op IDs.
         //
         // Note that one op has a duplicate sequence number above!
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 4);
 
         // Assert the sequence number set contains the specified ops.
         let ids = ids.iter().collect::<Vec<_>>();
@@ -637,8 +747,26 @@ mod tests {
                 SequenceNumber::new(0),
                 SequenceNumber::new(1),
                 SequenceNumber::new(2),
+                SequenceNumber::new(3),
             ]
-        )
+        );
+
+        // Assert the partitioned sequence numbers contain the correct values
+        assert_eq!(
+            ops.into_iter()
+                .map(|op| op.table_write_sequence_numbers)
+                .collect::<Vec<std::collections::HashMap<TableId, u64>>>(),
+            [
+                [(TableId::new(0), 0)].into_iter().collect(),
+                [(TableId::new(0), 1), (TableId::new(1), 2)]
+                    .into_iter()
+                    .collect(),
+                [(TableId::new(0), 3)].into_iter().collect(),
+                [(TableId::new(0), 3)].into_iter().collect(),
+            ]
+            .into_iter()
+            .collect::<Vec<std::collections::HashMap<TableId, u64>>>(),
+        );
     }
 
     // open wal with files that aren't segments (should log and skip)
@@ -670,7 +798,7 @@ mod tests {
 
         // There aren't any entries in the closed segment because nothing was written
         let mut reader = wal.reader_for_segment(closed_segment_details.id()).unwrap();
-        assert!(reader.next_batch().unwrap().is_none());
+        assert!(reader.next().is_none());
 
         // Can delete an empty segment, leaving no closed segments again
         wal.delete(closed_segment_details.id()).await.unwrap();
@@ -679,6 +807,141 @@ mod tests {
             closed.is_empty(),
             "Expected empty closed segments; got {closed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn decode_write_op_entries() {
+        let dir = test_helpers::tmp_dir().unwrap();
+        let wal = Wal::new(dir.path()).await.unwrap();
+
+        let w1 = test_data("m1,t=foo v=1i 1");
+        let w2 = test_data("m1,t=foo v=2i 2\nm2,u=foo w=2i 2");
+        let w3 = test_data("m1,t=foo v=3i 3");
+
+        let op1 = SequencedWalOp {
+            table_write_sequence_numbers: vec![(TableId::new(0), 0)].into_iter().collect(),
+            op: WalOp::Write(w1.to_owned()),
+        };
+        let op2 = SequencedWalOp {
+            table_write_sequence_numbers: vec![(TableId::new(0), 1), (TableId::new(1), 2)]
+                .into_iter()
+                .collect(),
+            op: WalOp::Write(w2.to_owned()),
+        };
+        let op3 = SequencedWalOp {
+            table_write_sequence_numbers: vec![(TableId::new(0), 3)].into_iter().collect(),
+            op: WalOp::Delete(test_delete()),
+        };
+        let op4 = SequencedWalOp {
+            table_write_sequence_numbers: vec![(TableId::new(0), 3)].into_iter().collect(),
+            op: WalOp::Persist(test_persist()),
+        };
+        // A third write entry coming after a delete and persist entry must still be yielded
+        let op5 = SequencedWalOp {
+            table_write_sequence_numbers: vec![(TableId::new(0), 4)].into_iter().collect(),
+            op: WalOp::Write(w3.to_owned()),
+        };
+
+        wal.write_op(op1);
+        wal.write_op(op2);
+        wal.write_op(op3).changed().await.unwrap();
+        wal.write_op(op4);
+        wal.write_op(op5).changed().await.unwrap();
+
+        let (closed, _) = wal.rotate().unwrap();
+
+        let decoder = WriteOpEntryDecoder::from(
+            wal.reader_for_segment(closed.id)
+                .expect("failed to open reader for closed WAL segment"),
+        );
+
+        let wal_entries = decoder
+            .into_iter()
+            .map(|r| r.expect("unexpected bad entry"))
+            .collect::<Vec<_>>();
+        // The decoder should find 2 entries, with a total of 3 write ops
+        assert_eq!(wal_entries.len(), 2);
+        let write_op_entries = wal_entries.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(write_op_entries.len(), 3);
+        assert_matches!(write_op_entries.get(0), Some(got_op1) => {
+            assert_op_shape(got_op1, &w1);
+        });
+        assert_matches!(write_op_entries.get(1), Some(got_op2) => {
+            assert_op_shape(got_op2, &w2);
+        });
+        assert_matches!(write_op_entries.get(2), Some(got_op3) => {
+            assert_op_shape(got_op3, &w3);
+        });
+    }
+
+    #[tokio::test]
+    async fn decode_write_op_entry_from_corrupted_wal() {
+        let dir = test_helpers::tmp_dir().unwrap();
+        let wal = Wal::new(dir.path()).await.unwrap();
+
+        // Log a write operation to test recovery from a tail-corrupted WAL.
+        let good_write = test_data("m3,a=baz b=4i 1");
+        wal.write_op(SequencedWalOp {
+            table_write_sequence_numbers: vec![(TableId::new(0), 0)].into_iter().collect(),
+            op: WalOp::Write(good_write.to_owned()),
+        })
+        .changed()
+        .await
+        .unwrap();
+
+        // Append some garbage to the tail end of the WAL, then rotate it
+        {
+            let mut reader = read_dir(dir.path()).unwrap();
+            let closed_path = reader
+                .next()
+                .expect("no segment file found in WAL dir")
+                .unwrap()
+                .path();
+            assert_matches!(reader.next(), None);
+
+            OpenOptions::new()
+                .append(true)
+                .open(closed_path)
+                .expect("unable to open closed WAL segment for writing")
+                .write_all(b"ceci ne pas une banane")
+                .unwrap();
+        }
+        let (closed, _) = wal.rotate().expect("failed to rotate WAL");
+
+        let mut decoder = WriteOpEntryDecoder::from(
+            wal.reader_for_segment(closed.id())
+                .expect("failed to open reader for closed segment"),
+        );
+        // Recover the single entry in front of the garbage and assert the expected
+        // error is thrown
+        assert_matches!(decoder.next(), Some(Ok(batch)) => {
+            assert_eq!(batch.len(), 1);
+            assert_op_shape(batch.get(0).unwrap(), &good_write);
+        });
+        assert_matches!(
+            decoder.next(),
+            Some(Err(DecodeError::FailedToReadWal { .. }))
+        );
+    }
+
+    fn assert_op_shape(left: &WriteOpEntry, right: &DatabaseBatch) {
+        assert_eq!(left.namespace, NamespaceId::new(right.database_id));
+        assert_eq!(left.table_batches.len(), right.table_batches.len());
+        for right_tb in &right.table_batches {
+            let right_key = TableId::new(right_tb.table_id);
+            let left_mb = left
+                .table_batches
+                .get(&right_key)
+                .unwrap_or_else(|| panic!("left value missing table batch for key {right_key}"));
+            assert_eq!(
+                left_mb.column_names(),
+                right_tb
+                    .columns
+                    .iter()
+                    .map(|c| c.column_name.as_str())
+                    .collect::<BTreeSet<_>>()
+            )
+        }
     }
 
     fn test_data(lp: &str) -> DatabaseBatch {
@@ -690,7 +953,7 @@ mod tests {
             .collect();
 
         let write = DmlWrite::new(
-            NamespaceId::new(42),
+            TEST_NAMESPACE_ID,
             batches,
             "bananas".into(),
             Default::default(),
@@ -701,7 +964,7 @@ mod tests {
 
     fn test_delete() -> DeletePayload {
         DeletePayload {
-            database_id: 42,
+            database_id: TEST_NAMESPACE_ID.get(),
             predicate: None,
             table_name: "bananas".into(),
         }
@@ -709,7 +972,7 @@ mod tests {
 
     fn test_persist() -> PersistOp {
         PersistOp {
-            namespace_id: 42,
+            namespace_id: TEST_NAMESPACE_ID.get(),
             parquet_file_uuid: "b4N4N4Z".into(),
             partition_id: 43,
             table_id: 44,

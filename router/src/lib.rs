@@ -109,28 +109,65 @@
 //! [`NamespaceSchema`]: data_types::NamespaceSchema
 //! [`DmlHandler`]: crate::dml_handlers
 //! [`RetentionValidator`]: crate::dml_handlers::RetentionValidator
-//! [`SchemaValidator`]: crate::dml_handlers::SchemaValidator
+//! [`SchemaValidator`]: crate::schema_validator::SchemaValidator
 //! [`Partitioner`]: crate::dml_handlers::Partitioner
 //! [`RpcWrite`]: crate::dml_handlers::RpcWrite
 
-#![deny(
-    rustdoc::broken_intra_doc_links,
-    rust_2018_idioms,
-    missing_debug_implementations,
-    unreachable_pub
-)]
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
 #![warn(
     missing_docs,
     clippy::todo,
     clippy::dbg_macro,
     clippy::explicit_iter_loop,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    unused_crate_dependencies,
+    missing_debug_implementations,
+    unreachable_pub,
 )]
-#![allow(clippy::missing_docs_in_private_items)]
+#![allow(
+    clippy::missing_docs_in_private_items,
+    clippy::default_constructed_unit_structs
+)]
+
+// Workaround for "unused crate" lint false positives.
+#[cfg(test)]
+use criterion as _;
+use workspace_hack as _;
 
 pub mod dml_handlers;
+pub mod gossip;
 pub mod namespace_cache;
 pub mod namespace_resolver;
+pub mod schema_validator;
 pub mod server;
-pub mod shard;
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use data_types::{
+        partition_template::NamespacePartitionTemplateOverride, MaxColumnsPerTable, MaxTables,
+        NamespaceId, NamespaceSchema,
+    };
+    use std::collections::BTreeMap;
+
+    pub(crate) const DEFAULT_NAMESPACE: NamespaceSchema = new_empty_namespace_schema(4242);
+    pub(crate) const TABLE_NAME: &str = "bananas";
+    pub(crate) const NAMESPACE_NAME: &str = "platanos";
+    pub(crate) const TABLE_ID: i64 = 42;
+
+    pub(crate) const DEFAULT_NAMESPACE_PARTITION_TEMPLATE: NamespacePartitionTemplateOverride =
+        NamespacePartitionTemplateOverride::const_default();
+
+    /// Start a new `NamespaceSchema` with only the given ID; the rest of the fields are arbitrary.
+    pub(crate) const fn new_empty_namespace_schema(id: i64) -> NamespaceSchema {
+        NamespaceSchema {
+            id: NamespaceId::new(id),
+            tables: BTreeMap::new(),
+            max_tables: MaxTables::const_default(),
+            max_columns_per_table: MaxColumnsPerTable::const_default(),
+            retention_period_ns: None,
+            partition_template: DEFAULT_NAMESPACE_PARTITION_TEMPLATE,
+        }
+    }
+}

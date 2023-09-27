@@ -7,42 +7,42 @@
     missing_debug_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 
-pub mod sequence_number_set;
+use thiserror::Error;
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
-use influxdb_line_protocol::FieldValue;
+mod columns;
+pub use columns::*;
+mod namespace_name;
+pub use namespace_name::*;
+pub mod partition_template;
+use partition_template::*;
+pub mod partition;
+pub use partition::*;
+pub mod sequence_number_set;
+pub mod service_limits;
+pub use service_limits::*;
+
 use observability_deps::tracing::warn;
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-use schema::{
-    builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, Schema,
-    TIME_COLUMN_NAME,
-};
-use serde::Deserialize;
-use snafu::{ResultExt, Snafu};
-use sqlx::postgres::PgHasArrayType;
+use schema::TIME_COLUMN_NAME;
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet, HashMap},
     convert::TryFrom,
     fmt::{Display, Write},
     mem::{self, size_of_val},
     num::{FpCategory, NonZeroU64},
-    ops::{Add, Deref, RangeInclusive, Sub},
-    sync::Arc,
+    ops::{Add, Deref, Sub},
 };
 use uuid::Uuid;
-
-/// Magic number to be used shard indices and shard ids in "kafkaless".
-pub const TRANSITION_SHARD_NUMBER: i32 = 1234;
-/// In kafkaless mode all new persisted data uses this shard id.
-pub const TRANSITION_SHARD_ID: ShardId = ShardId::new(TRANSITION_SHARD_NUMBER as i64);
-/// In kafkaless mode all new persisted data uses this shard index.
-pub const TRANSITION_SHARD_INDEX: ShardIndex = ShardIndex::new(TRANSITION_SHARD_NUMBER);
 
 /// Compaction levels
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, sqlx::Type)]
@@ -136,42 +136,6 @@ impl std::fmt::Display for NamespaceId {
     }
 }
 
-/// Unique ID for a Topic, assigned by the catalog and used in [`TopicMetadata`]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct TopicId(i64);
-
-#[allow(missing_docs)]
-impl TopicId {
-    pub const fn new(v: i64) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for TopicId {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Unique ID for a `QueryPool`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct QueryPoolId(i64);
-
-#[allow(missing_docs)]
-impl QueryPoolId {
-    pub fn new(v: i64) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i64 {
-        self.0
-    }
-}
-
 /// Unique ID for a `Table`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
@@ -182,8 +146,13 @@ impl TableId {
     pub const fn new(v: i64) -> Self {
         Self(v)
     }
+
     pub fn get(&self) -> i64 {
         self.0
+    }
+
+    pub const fn to_be_bytes(&self) -> [u8; 8] {
+        self.0.to_be_bytes()
     }
 }
 
@@ -193,187 +162,32 @@ impl std::fmt::Display for TableId {
     }
 }
 
-/// Unique ID for a `Column`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct ColumnId(i64);
-
-#[allow(missing_docs)]
-impl ColumnId {
-    pub fn new(v: i64) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i64 {
-        self.0
-    }
-}
-
-impl PgHasArrayType for ColumnId {
-    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
-        <i64 as PgHasArrayType>::array_type_info()
-    }
-}
-
-/// Unique ID for a `Shard`, assigned by the catalog. Joins to other catalog tables to uniquely
-/// identify shards independently of the underlying write buffer implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct ShardId(i64);
-
-#[allow(missing_docs)]
-impl ShardId {
-    pub const fn new(v: i64) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ShardId {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// The index of the shard in the set of shards. When Kafka is used as the write buffer, this is
-/// the Kafka Partition ID. Used by the router and write buffer to shard requests to a particular
-/// index in a set of shards.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-#[serde(transparent)]
-pub struct ShardIndex(i32);
-
-#[allow(missing_docs)]
-impl ShardIndex {
-    pub const fn new(v: i32) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i32 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ShardIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for ShardIndex {
-    type Err = std::num::ParseIntError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v: i32 = s.parse()?;
-        Ok(Self(v))
-    }
-}
-
-/// Potential configurations of ingester connections for the querier to associate with a shard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IngesterMapping {
-    /// Deliberately not mapping this shard to an ingester. If the querier gets a query for
-    /// this shard, it should return an error.
-    NotMapped,
-    /// Deliberately not contacting ingesters for this shard. If the querier gets a query for
-    /// this shard, it should only return persisted data.
-    Ignore,
-    /// The address of the ingester to contact for this shard.
-    Addr(Arc<str>),
-}
-
-/// Unique ID for a `Partition`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type, sqlx::FromRow)]
-#[sqlx(transparent)]
-pub struct PartitionId(i64);
-
-#[allow(missing_docs)]
-impl PartitionId {
-    pub const fn new(v: i64) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for PartitionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Combination of Shard ID, Table ID, and Partition ID useful for identifying groups of
-/// Parquet files to be compacted together.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
-pub struct TablePartition {
-    /// The shard ID
-    pub shard_id: ShardId,
-    /// The table ID
-    pub table_id: TableId,
-    /// The partition ID
-    pub partition_id: PartitionId,
-}
-
-impl TablePartition {
-    /// Combine the relevant parts
-    pub fn new(shard_id: ShardId, table_id: TableId, partition_id: PartitionId) -> Self {
-        Self {
-            shard_id,
-            table_id,
-            partition_id,
-        }
-    }
-}
-
-/// Unique ID for a `Tombstone`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct TombstoneId(i64);
-
-#[allow(missing_docs)]
-impl TombstoneId {
-    pub fn new(v: i64) -> Self {
-        Self(v)
-    }
-    pub fn get(&self) -> i64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for TombstoneId {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// A sequence number from a `router::Shard` (kafka partition)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct SequenceNumber(i64);
+/// A sequence number from an ingester
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SequenceNumber(u64);
 
 #[allow(missing_docs)]
 impl SequenceNumber {
-    pub fn new(v: i64) -> Self {
+    pub fn new(v: u64) -> Self {
         Self(v)
     }
-    pub fn get(&self) -> i64 {
+    pub fn get(&self) -> u64 {
         self.0
     }
 }
 
-impl Add<i64> for SequenceNumber {
+impl Add<u64> for SequenceNumber {
     type Output = Self;
 
-    fn add(self, other: i64) -> Self {
+    fn add(self, other: u64) -> Self {
         Self(self.0 + other)
     }
 }
 
-impl Sub<i64> for SequenceNumber {
+impl Sub<u64> for SequenceNumber {
     type Output = Self;
 
-    fn sub(self, other: i64) -> Self {
+    fn sub(self, other: u64) -> Self {
         Self(self.0 - other)
     }
 }
@@ -460,89 +274,71 @@ impl std::fmt::Display for ParquetFileId {
     }
 }
 
-/// Data object for a topic. When Kafka is used as the write buffer, this is the Kafka topic name
-/// plus a catalog-assigned ID.
-#[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
-pub struct TopicMetadata {
-    /// The id of the topic
-    pub id: TopicId,
-    /// The unique name of the topic
-    pub name: String,
-}
-
-/// Data object for a query pool
-#[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
-pub struct QueryPool {
-    /// The id of the pool
-    pub id: QueryPoolId,
-    /// The unique name of the pool
-    pub name: String,
-}
-
 /// Data object for a namespace
-#[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Namespace {
     /// The id of the namespace
     pub id: NamespaceId,
     /// The unique name of the namespace
     pub name: String,
-    #[sqlx(default)]
     /// The retention period in ns. None represents infinite duration (i.e. never drop data).
     pub retention_period_ns: Option<i64>,
-    /// The topic that writes to this namespace will land in
-    pub topic_id: TopicId,
-    /// The query pool assigned to answer queries for this namespace
-    pub query_pool_id: QueryPoolId,
     /// The maximum number of tables that can exist in this namespace
-    pub max_tables: i32,
+    pub max_tables: MaxTables,
     /// The maximum number of columns per table in this namespace
-    pub max_columns_per_table: i32,
+    pub max_columns_per_table: MaxColumnsPerTable,
     /// When this file was marked for deletion.
     pub deleted_at: Option<Timestamp>,
+    /// The partition template to use for new tables in this namespace either created implicitly or
+    /// created without specifying a partition template.
+    pub partition_template: NamespacePartitionTemplateOverride,
 }
 
 /// Schema collection for a namespace. This is an in-memory object useful for a schema
 /// cache.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct NamespaceSchema {
     /// the namespace id
     pub id: NamespaceId,
-    /// the topic this namespace gets data written to
-    pub topic_id: TopicId,
-    /// the query pool assigned to answer queries for this namespace
-    pub query_pool_id: QueryPoolId,
     /// the tables in the namespace by name
     pub tables: BTreeMap<String, TableSchema>,
-    /// the number of columns per table this namespace allows
-    pub max_columns_per_table: usize,
     /// The maximum number of tables permitted in this namespace.
-    pub max_tables: usize,
+    pub max_tables: MaxTables,
+    /// the number of columns per table this namespace allows
+    pub max_columns_per_table: MaxColumnsPerTable,
     /// The retention period in ns.
     /// None represents infinite duration (i.e. never drop data).
     pub retention_period_ns: Option<i64>,
+    /// The partition template to use for new tables in this namespace either created implicitly or
+    /// created without specifying a partition template.
+    pub partition_template: NamespacePartitionTemplateOverride,
 }
 
 impl NamespaceSchema {
-    /// Create a new `NamespaceSchema`
-    pub fn new(
-        id: NamespaceId,
-        topic_id: TopicId,
-        query_pool_id: QueryPoolId,
-        max_columns_per_table: i32,
-        max_tables: i32,
-        retention_period_ns: Option<i64>,
-    ) -> Self {
+    /// Start a new `NamespaceSchema` with empty `tables` but the rest of the information populated
+    /// from the given `Namespace`.
+    pub fn new_empty_from(namespace: &Namespace) -> Self {
+        let &Namespace {
+            id,
+            retention_period_ns,
+            max_tables,
+            max_columns_per_table,
+            ref partition_template,
+            ..
+        } = namespace;
+
         Self {
             id,
             tables: BTreeMap::new(),
-            topic_id,
-            query_pool_id,
-            max_columns_per_table: max_columns_per_table as usize,
-            max_tables: max_tables as usize,
+            max_tables,
+            max_columns_per_table,
             retention_period_ns,
+            partition_template: partition_template.clone(),
         }
     }
+}
 
+impl NamespaceSchema {
     /// Estimated Size in bytes including `self`.
     pub fn size(&self) -> usize {
         std::mem::size_of_val(self)
@@ -554,8 +350,42 @@ impl NamespaceSchema {
     }
 }
 
+impl From<&NamespaceSchema> for generated_types::influxdata::iox::schema::v1::NamespaceSchema {
+    fn from(schema: &NamespaceSchema) -> Self {
+        use generated_types::influxdata::iox::schema::v1 as proto;
+        Self {
+            id: schema.id.get(),
+            tables: schema
+                .tables
+                .iter()
+                .map(|(name, t)| {
+                    (
+                        name.clone(),
+                        proto::TableSchema {
+                            id: t.id.get(),
+                            columns: t
+                                .columns
+                                .iter()
+                                .map(|(name, c)| {
+                                    (
+                                        name.clone(),
+                                        proto::ColumnSchema {
+                                            id: c.id.get(),
+                                            column_type: c.column_type as i32,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Data object for a table
-#[derive(Debug, Clone, sqlx::FromRow, Eq, PartialEq)]
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq)]
 pub struct Table {
     /// The id of the table
     pub id: TableId,
@@ -563,23 +393,42 @@ pub struct Table {
     pub namespace_id: NamespaceId,
     /// The name of the table, which is unique within the associated namespace
     pub name: String,
+    /// The partition template to use for writes in this table.
+    pub partition_template: TablePartitionTemplateOverride,
+}
+
+/// Serialise a [`Table`] object into its protobuf representation.
+impl From<Table> for generated_types::influxdata::iox::table::v1::Table {
+    fn from(value: Table) -> Self {
+        generated_types::influxdata::iox::table::v1::Table {
+            id: value.id.get(),
+            name: value.name,
+            namespace_id: value.namespace_id.get(),
+            partition_template: value.partition_template.as_proto().cloned(),
+        }
+    }
 }
 
 /// Column definitions for a table
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableSchema {
     /// the table id
     pub id: TableId,
+
+    /// The partition template to use for writes in this table.
+    pub partition_template: TablePartitionTemplateOverride,
+
     /// the table's columns by their name
-    pub columns: BTreeMap<String, ColumnSchema>,
+    pub columns: ColumnsByName,
 }
 
 impl TableSchema {
-    /// Initialize new `TableSchema`
-    pub fn new(id: TableId) -> Self {
+    /// Initialize new `TableSchema` from the information in the given `Table`.
+    pub fn new_empty_from(table: &Table) -> Self {
         Self {
-            id,
-            columns: BTreeMap::new(),
+            id: table.id,
+            partition_template: table.partition_template.clone(),
+            columns: ColumnsByName::new([]),
         }
     }
 
@@ -588,12 +437,29 @@ impl TableSchema {
     /// # Panics
     ///
     /// This method panics if a column of the same name already exists in
+    /// `self`, or if `col` references a different `table_id`.
+    pub fn add_column(&mut self, col: Column) {
+        let Column {
+            id,
+            name,
+            column_type,
+            table_id,
+        } = col;
+
+        assert_eq!(table_id, self.id);
+
+        let column_schema = ColumnSchema { id, column_type };
+        self.add_column_schema(name, column_schema);
+    }
+
+    /// Add the name and column schema to this table's schema.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if a column of the same name already exists in
     /// `self`.
-    pub fn add_column(&mut self, col: &Column) {
-        let old = self
-            .columns
-            .insert(col.name.clone(), ColumnSchema::from(col));
-        assert!(old.is_none());
+    pub fn add_column_schema(&mut self, column_name: String, column_schema: ColumnSchema) {
+        self.columns.add_column(column_name, column_schema);
     }
 
     /// Estimated Size in bytes including `self`.
@@ -608,411 +474,24 @@ impl TableSchema {
 
     /// Create `ID->name` map for columns.
     pub fn column_id_map(&self) -> HashMap<ColumnId, &str> {
-        self.columns
-            .iter()
-            .map(|(name, c)| (c.id, name.as_str()))
-            .collect()
+        self.columns.id_map()
+    }
+
+    /// Whether a column with this name is in the schema.
+    pub fn contains_column_name(&self, name: &str) -> bool {
+        self.columns.contains_column_name(name)
     }
 
     /// Return the set of column names for this table. Used in combination with a write operation's
     /// column names to determine whether a write would exceed the max allowed columns.
     pub fn column_names(&self) -> BTreeSet<&str> {
-        self.columns.keys().map(|name| name.as_str()).collect()
+        self.columns.names()
     }
 
     /// Return number of columns of the table
     pub fn column_count(&self) -> usize {
-        self.columns.len()
+        self.columns.column_count()
     }
-}
-
-/// Data object for a column
-#[derive(Debug, Clone, sqlx::FromRow, Eq, PartialEq)]
-pub struct Column {
-    /// the column id
-    pub id: ColumnId,
-    /// the table id the column is in
-    pub table_id: TableId,
-    /// the name of the column, which is unique in the table
-    pub name: String,
-    /// the logical type of the column
-    pub column_type: ColumnType,
-}
-
-impl Column {
-    /// returns true if the column type is a tag
-    pub fn is_tag(&self) -> bool {
-        self.column_type == ColumnType::Tag
-    }
-
-    /// returns true if the column type matches the line protocol field value type
-    pub fn matches_field_type(&self, field_value: &FieldValue) -> bool {
-        match field_value {
-            FieldValue::I64(_) => self.column_type == ColumnType::I64,
-            FieldValue::U64(_) => self.column_type == ColumnType::U64,
-            FieldValue::F64(_) => self.column_type == ColumnType::F64,
-            FieldValue::String(_) => self.column_type == ColumnType::String,
-            FieldValue::Boolean(_) => self.column_type == ColumnType::Bool,
-        }
-    }
-}
-
-/// The column id and its type for a column
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct ColumnSchema {
-    /// the column id
-    pub id: ColumnId,
-    /// the column type
-    pub column_type: ColumnType,
-}
-
-impl ColumnSchema {
-    /// returns true if the column is a tag
-    pub fn is_tag(&self) -> bool {
-        self.column_type == ColumnType::Tag
-    }
-
-    /// returns true if the column matches the line protocol field value type
-    pub fn matches_field_type(&self, field_value: &FieldValue) -> bool {
-        matches!(
-            (field_value, self.column_type),
-            (FieldValue::I64(_), ColumnType::I64)
-                | (FieldValue::U64(_), ColumnType::U64)
-                | (FieldValue::F64(_), ColumnType::F64)
-                | (FieldValue::String(_), ColumnType::String)
-                | (FieldValue::Boolean(_), ColumnType::Bool)
-        )
-    }
-
-    /// Returns true if `mb_column` is of the same type as `self`.
-    pub fn matches_type(&self, mb_column_influx_type: InfluxColumnType) -> bool {
-        self.column_type == mb_column_influx_type
-    }
-}
-
-impl From<&Column> for ColumnSchema {
-    fn from(c: &Column) -> Self {
-        let Column {
-            id, column_type, ..
-        } = c;
-
-        Self {
-            id: *id,
-            column_type: *column_type,
-        }
-    }
-}
-
-/// The column data type
-#[allow(missing_docs)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[repr(i16)]
-pub enum ColumnType {
-    I64 = 1,
-    U64 = 2,
-    F64 = 3,
-    Bool = 4,
-    String = 5,
-    Time = 6,
-    Tag = 7,
-}
-
-impl ColumnType {
-    /// the short string description of the type
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::I64 => "i64",
-            Self::U64 => "u64",
-            Self::F64 => "f64",
-            Self::Bool => "bool",
-            Self::String => "string",
-            Self::Time => "time",
-            Self::Tag => "tag",
-        }
-    }
-}
-
-impl std::fmt::Display for ColumnType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.as_str();
-
-        write!(f, "{s}")
-    }
-}
-
-impl TryFrom<i16> for ColumnType {
-    type Error = Box<dyn std::error::Error>;
-
-    fn try_from(value: i16) -> Result<Self, Self::Error> {
-        match value {
-            x if x == Self::I64 as i16 => Ok(Self::I64),
-            x if x == Self::U64 as i16 => Ok(Self::U64),
-            x if x == Self::F64 as i16 => Ok(Self::F64),
-            x if x == Self::Bool as i16 => Ok(Self::Bool),
-            x if x == Self::String as i16 => Ok(Self::String),
-            x if x == Self::Time as i16 => Ok(Self::Time),
-            x if x == Self::Tag as i16 => Ok(Self::Tag),
-            _ => Err("invalid column value".into()),
-        }
-    }
-}
-
-impl From<InfluxColumnType> for ColumnType {
-    fn from(value: InfluxColumnType) -> Self {
-        match value {
-            InfluxColumnType::Tag => Self::Tag,
-            InfluxColumnType::Field(InfluxFieldType::Float) => Self::F64,
-            InfluxColumnType::Field(InfluxFieldType::Integer) => Self::I64,
-            InfluxColumnType::Field(InfluxFieldType::UInteger) => Self::U64,
-            InfluxColumnType::Field(InfluxFieldType::String) => Self::String,
-            InfluxColumnType::Field(InfluxFieldType::Boolean) => Self::Bool,
-            InfluxColumnType::Timestamp => Self::Time,
-        }
-    }
-}
-
-impl From<ColumnType> for InfluxColumnType {
-    fn from(value: ColumnType) -> Self {
-        match value {
-            ColumnType::I64 => Self::Field(InfluxFieldType::Integer),
-            ColumnType::U64 => Self::Field(InfluxFieldType::UInteger),
-            ColumnType::F64 => Self::Field(InfluxFieldType::Float),
-            ColumnType::Bool => Self::Field(InfluxFieldType::Boolean),
-            ColumnType::String => Self::Field(InfluxFieldType::String),
-            ColumnType::Time => Self::Timestamp,
-            ColumnType::Tag => Self::Tag,
-        }
-    }
-}
-
-impl TryFrom<TableSchema> for Schema {
-    type Error = schema::builder::Error;
-
-    fn try_from(value: TableSchema) -> Result<Self, Self::Error> {
-        let mut builder = SchemaBuilder::new();
-
-        for (column_name, column_schema) in &value.columns {
-            let t = InfluxColumnType::from(column_schema.column_type);
-            builder.influx_column(column_name, t);
-        }
-
-        builder.build()
-    }
-}
-
-impl PartialEq<InfluxColumnType> for ColumnType {
-    fn eq(&self, got: &InfluxColumnType) -> bool {
-        match self {
-            Self::I64 => matches!(got, InfluxColumnType::Field(InfluxFieldType::Integer)),
-            Self::U64 => matches!(got, InfluxColumnType::Field(InfluxFieldType::UInteger)),
-            Self::F64 => matches!(got, InfluxColumnType::Field(InfluxFieldType::Float)),
-            Self::Bool => matches!(got, InfluxColumnType::Field(InfluxFieldType::Boolean)),
-            Self::String => matches!(got, InfluxColumnType::Field(InfluxFieldType::String)),
-            Self::Time => matches!(got, InfluxColumnType::Timestamp),
-            Self::Tag => matches!(got, InfluxColumnType::Tag),
-        }
-    }
-}
-
-/// Returns the `ColumnType` for the passed in line protocol `FieldValue` type
-pub fn column_type_from_field(field_value: &FieldValue) -> ColumnType {
-    match field_value {
-        FieldValue::I64(_) => ColumnType::I64,
-        FieldValue::U64(_) => ColumnType::U64,
-        FieldValue::F64(_) => ColumnType::F64,
-        FieldValue::String(_) => ColumnType::String,
-        FieldValue::Boolean(_) => ColumnType::Bool,
-    }
-}
-
-/// Data object for a shard. Only one shard record can exist for a given topic and shard
-/// index (enforced via uniqueness constraint).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct Shard {
-    /// the id of the shard, assigned by the catalog
-    pub id: ShardId,
-    /// the topic the shard is reading from
-    pub topic_id: TopicId,
-    /// the shard index of the shard the sequence numbers are coming from, sharded by the router
-    /// and write buffer
-    pub shard_index: ShardIndex,
-    /// The minimum unpersisted sequence number. Because different tables
-    /// can be persisted at different times, it is possible some data has been persisted
-    /// with a higher sequence number than this. However, all data with a sequence number
-    /// lower than this must have been persisted to Parquet.
-    pub min_unpersisted_sequence_number: SequenceNumber,
-}
-
-/// Defines an partition via an arbitrary string within a table within
-/// a namespace.
-///
-/// Implemented as a reference-counted string, serialisable to
-/// the Postgres VARCHAR data type.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PartitionKey(Arc<str>);
-
-impl PartitionKey {
-    /// Returns true if this instance of [`PartitionKey`] is backed by the same
-    /// string storage as other.
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Display for PartitionKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<String> for PartitionKey {
-    fn from(s: String) -> Self {
-        assert!(!s.is_empty());
-        Self(s.into())
-    }
-}
-
-impl From<&str> for PartitionKey {
-    fn from(s: &str) -> Self {
-        assert!(!s.is_empty());
-        Self(s.into())
-    }
-}
-
-impl sqlx::Type<sqlx::Postgres> for PartitionKey {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        // Store this type as VARCHAR
-        sqlx::postgres::PgTypeInfo::with_name("VARCHAR")
-    }
-}
-
-impl sqlx::Encode<'_, sqlx::Postgres> for PartitionKey {
-    fn encode_by_ref(
-        &self,
-        buf: &mut <sqlx::Postgres as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
-    ) -> sqlx::encode::IsNull {
-        <&str as sqlx::Encode<sqlx::Postgres>>::encode(&self.0, buf)
-    }
-}
-
-impl sqlx::Decode<'_, sqlx::Postgres> for PartitionKey {
-    fn decode(
-        value: <sqlx::Postgres as sqlx::database::HasValueRef<'_>>::ValueRef,
-    ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
-        Ok(Self(
-            <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?.into(),
-        ))
-    }
-}
-
-impl sqlx::Type<sqlx::Sqlite> for PartitionKey {
-    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
-        <String as sqlx::Type<sqlx::Sqlite>>::type_info()
-    }
-}
-
-impl sqlx::Encode<'_, sqlx::Sqlite> for PartitionKey {
-    fn encode_by_ref(
-        &self,
-        buf: &mut <sqlx::Sqlite as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
-    ) -> sqlx::encode::IsNull {
-        <String as sqlx::Encode<sqlx::Sqlite>>::encode(self.0.to_string(), buf)
-    }
-}
-
-impl sqlx::Decode<'_, sqlx::Sqlite> for PartitionKey {
-    fn decode(
-        value: <sqlx::Sqlite as sqlx::database::HasValueRef<'_>>::ValueRef,
-    ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
-        Ok(Self(
-            <String as sqlx::Decode<sqlx::Sqlite>>::decode(value)?.into(),
-        ))
-    }
-}
-
-/// Data object for a partition. The combination of shard, table and key are unique (i.e. only
-/// one record can exist for each combo)
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct Partition {
-    /// the id of the partition
-    pub id: PartitionId,
-    /// the shard the data in the partition arrived from
-    pub shard_id: ShardId,
-    /// the table the partition is under
-    pub table_id: TableId,
-    /// the string key of the partition
-    pub partition_key: PartitionKey,
-    /// vector of column names that describes how *every* parquet file
-    /// in this [`Partition`] is sorted. The sort_key contains all the
-    /// primary key (PK) columns that have been persisted, and nothing
-    /// else. The PK columns are all `tag` columns and the `time`
-    /// column.
-    ///
-    /// Even though it is possible for both the unpersisted data
-    /// and/or multiple parquet files to contain different subsets of
-    /// columns, the partition's sort_key is guaranteed to be
-    /// "compatible" across all files. Compatible means that the
-    /// parquet file is sorted in the same order as the partition
-    /// sort_key after removing any missing columns.
-    ///
-    /// Partitions are initially created before any data is persisted
-    /// with an empty sort_key. The partition sort_key is updated as
-    /// needed when data is persisted to parquet files: both on the
-    /// first persist when the sort key is empty, as on subsequent
-    /// persist operations when new tags occur in newly inserted data.
-    ///
-    /// Updating inserts new column into the existing order. The order
-    /// of the existing columns relative to each other is NOT changed.
-    ///
-    /// For example, updating `A,B,C` to either `A,D,B,C` or `A,B,C,D`
-    /// is legal. However, updating to `A,C,D,B` is not because the
-    /// relative order of B and C have been reversed.
-    pub sort_key: Vec<String>,
-
-    /// The inclusive maximum [`SequenceNumber`] of the most recently persisted
-    /// data for this partition.
-    ///
-    /// All writes with a [`SequenceNumber`] less than and equal to this
-    /// [`SequenceNumber`] have been persisted to the object store. The inverse
-    /// is not guaranteed to be true due to update ordering; some files for this
-    /// partition may exist in the `parquet_files` table that have a greater
-    /// [`SequenceNumber`] than is specified here - the system will converge so
-    /// long as the ingester progresses.
-    ///
-    /// It is a system invariant that this value monotonically increases over
-    /// time - wrote another way, it is an invariant that partitions are
-    /// persisted (or at least made visible) in sequence order.
-    ///
-    /// If [`None`] no data has been persisted for this partition.
-    pub persisted_sequence_number: Option<SequenceNumber>,
-
-    /// The time at which the newest file of the partition is created
-    pub new_file_at: Option<Timestamp>,
-}
-
-impl Partition {
-    /// The sort key for the partition, if present, structured as a `SortKey`
-    pub fn sort_key(&self) -> Option<SortKey> {
-        if self.sort_key.is_empty() {
-            return None;
-        }
-
-        Some(SortKey::from_columns(self.sort_key.iter().map(|s| &**s)))
-    }
-}
-
-/// Data for a partition  chosen from its parquet files
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::FromRow)]
-pub struct PartitionParam {
-    /// the partition
-    pub partition_id: PartitionId,
-    // Remove this shard_id: https://github.com/influxdata/influxdb_iox/issues/6518
-    /// the partition's shard
-    pub shard_id: ShardId,
-    /// the partition's namespace
-    pub namespace_id: NamespaceId,
-    /// the partition's table
-    pub table_id: TableId,
 }
 
 /// Data recorded when compaction skips a partition.
@@ -1036,93 +515,30 @@ pub struct SkippedCompaction {
     pub limit_num_files_first_in_partition: i64,
 }
 
-/// Data object for a tombstone.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, sqlx::FromRow)]
-pub struct Tombstone {
-    /// the id of the tombstone
-    pub id: TombstoneId,
-    /// the table the tombstone is associated with
-    pub table_id: TableId,
-    /// the shard the tombstone was sent through
-    pub shard_id: ShardId,
-    /// the sequence number assigned to the tombstone from the `router::Shard`
-    pub sequence_number: SequenceNumber,
-    /// the min time (inclusive) that the delete applies to
-    pub min_time: Timestamp,
-    /// the max time (exclusive) that the delete applies to
-    pub max_time: Timestamp,
-    /// the full delete predicate
-    pub serialized_predicate: String,
-}
+use generated_types::influxdata::iox::compactor::v1 as compactor_proto;
+impl From<SkippedCompaction> for compactor_proto::SkippedCompaction {
+    fn from(skipped_compaction: SkippedCompaction) -> Self {
+        let SkippedCompaction {
+            partition_id,
+            reason,
+            skipped_at,
+            estimated_bytes,
+            limit_bytes,
+            num_files,
+            limit_num_files,
+            limit_num_files_first_in_partition,
+        } = skipped_compaction;
 
-impl Tombstone {
-    /// Estimate the memory consumption of this object and its contents
-    pub fn size(&self) -> usize {
-        std::mem::size_of_val(self) + self.serialized_predicate.capacity()
-    }
-}
-/// Map of a column type to its count
-#[derive(Debug, Copy, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct ColumnTypeCount {
-    /// column type
-    pub col_type: ColumnType,
-    /// count of the column type
-    pub count: i64,
-}
-
-impl ColumnTypeCount {
-    /// make a new ColumnTypeCount
-    pub fn new(col_type: ColumnType, count: i64) -> Self {
-        Self { col_type, count }
-    }
-}
-
-/// Set of columns.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct ColumnSet(Vec<ColumnId>);
-
-impl ColumnSet {
-    /// Create new column set.
-    ///
-    /// The order of the passed columns will NOT be preserved.
-    ///
-    /// # Panic
-    /// Panics when the set of passed columns contains duplicates.
-    pub fn new<I>(columns: I) -> Self
-    where
-        I: IntoIterator<Item = ColumnId>,
-    {
-        let mut columns: Vec<ColumnId> = columns.into_iter().collect();
-        columns.sort();
-
-        let len_pre_dedup = columns.len();
-        columns.dedup();
-        let len_post_dedup = columns.len();
-        assert_eq!(len_pre_dedup, len_post_dedup, "set contains duplicates");
-
-        columns.shrink_to_fit();
-
-        Self(columns)
-    }
-
-    /// Estimate the memory consumption of this object and its contents
-    pub fn size(&self) -> usize {
-        std::mem::size_of_val(self) + (std::mem::size_of::<ChunkId>() * self.0.capacity())
-    }
-}
-
-impl From<ColumnSet> for Vec<ColumnId> {
-    fn from(set: ColumnSet) -> Self {
-        set.0
-    }
-}
-
-impl Deref for ColumnSet {
-    type Target = [ColumnId];
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
+        Self {
+            partition_id: partition_id.get(),
+            reason,
+            skipped_at: skipped_at.get(),
+            estimated_bytes,
+            limit_bytes,
+            num_files,
+            limit_num_files,
+            limit_num_files_first_in_partition: Some(limit_num_files_first_in_partition),
+        }
     }
 }
 
@@ -1131,18 +547,15 @@ impl Deref for ColumnSet {
 pub struct ParquetFile {
     /// the id of the file in the catalog
     pub id: ParquetFileId,
-    /// the shard that sequenced writes that went into this file
-    pub shard_id: ShardId,
     /// the namespace
     pub namespace_id: NamespaceId,
     /// the table
     pub table_id: TableId,
-    /// the partition
-    pub partition_id: PartitionId,
+    /// the partition identifier
+    #[sqlx(flatten)]
+    pub partition_id: TransitionPartitionId,
     /// the uuid used in the object store path for this file
     pub object_store_id: Uuid,
-    /// the maximum sequence number from a record in this file
-    pub max_sequence_number: SequenceNumber,
     /// the min timestamp of data in this file
     pub min_time: Timestamp,
     /// the max timestamp of data in this file
@@ -1195,12 +608,10 @@ impl ParquetFile {
     pub fn from_params(params: ParquetFileParams, id: ParquetFileId) -> Self {
         Self {
             id,
-            shard_id: params.shard_id,
             namespace_id: params.namespace_id,
             table_id: params.table_id,
             partition_id: params.partition_id,
             object_store_id: params.object_store_id,
-            max_sequence_number: params.max_sequence_number,
             min_time: params.min_time,
             max_time: params.max_time,
             to_delete: None,
@@ -1215,7 +626,7 @@ impl ParquetFile {
 
     /// Estimate the memory consumption of this object and its contents
     pub fn size(&self) -> usize {
-        std::mem::size_of_val(self) + self.column_set.size()
+        std::mem::size_of_val(self) + self.partition_id.size() + self.column_set.size()
             - std::mem::size_of_val(&self.column_set)
     }
 
@@ -1228,23 +639,114 @@ impl ParquetFile {
     pub fn overlaps_time_range(&self, min_time: Timestamp, max_time: Timestamp) -> bool {
         self.min_time <= max_time && self.max_time >= min_time
     }
+
+    /// Return true if the time range of this file overlaps with any of the given split times.
+    pub fn needs_split(&self, split_times: &Vec<i64>) -> bool {
+        for t in split_times {
+            // split time is the last timestamp on the "left" side of the split, if it equals
+            // the min time, one ns goes left, the rest goes right.
+            if self.min_time.get() <= *t && self.max_time.get() > *t {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return true if the time range of this file overlaps with any of the given file ranges
+    pub fn overlaps_ranges(&self, ranges: &Vec<FileRange>) -> bool {
+        for range in ranges {
+            if self.min_time.get() <= range.max && self.max_time.get() >= range.min {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl From<ParquetFile> for generated_types::influxdata::iox::catalog::v1::ParquetFile {
+    fn from(v: ParquetFile) -> Self {
+        Self {
+            id: v.id.get(),
+            namespace_id: v.namespace_id.get(),
+            table_id: v.table_id.get(),
+            partition_identifier: Some(v.partition_id.into()),
+            object_store_id: v.object_store_id.to_string(),
+            min_time: v.min_time.get(),
+            max_time: v.max_time.get(),
+            to_delete: v.to_delete.map(|v| v.get()),
+            file_size_bytes: v.file_size_bytes,
+            row_count: v.row_count,
+            compaction_level: v.compaction_level as i32,
+            created_at: v.created_at.get(),
+            column_set: v.column_set.iter().map(|v| v.get()).collect(),
+            max_l0_created_at: v.max_l0_created_at.get(),
+        }
+    }
+}
+
+/// Errors deserialising a protobuf serialised [`ParquetFile`].
+#[derive(Debug, Error)]
+pub enum ParquetFileProtoError {
+    /// The proto type does not contain a partition ID.
+    #[error("no partition id specified for parquet file")]
+    NoPartitionId,
+
+    /// The specified partition ID is invalid.
+    #[error(transparent)]
+    InvalidPartitionId(#[from] PartitionIdProtoError),
+
+    /// The specified object store UUID is invalid.
+    #[error("invalid object store ID: {0}")]
+    InvalidObjectStoreId(uuid::Error),
+
+    /// The specified compaction level value is invalid.
+    #[error("invalid compaction level: {0}")]
+    InvalidCompactionLevel(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl TryFrom<generated_types::influxdata::iox::catalog::v1::ParquetFile> for ParquetFile {
+    type Error = ParquetFileProtoError;
+
+    fn try_from(
+        v: generated_types::influxdata::iox::catalog::v1::ParquetFile,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: ParquetFileId::new(v.id),
+            namespace_id: NamespaceId::new(v.namespace_id),
+            table_id: TableId::new(v.table_id),
+            partition_id: TransitionPartitionId::try_from(
+                v.partition_identifier
+                    .ok_or(ParquetFileProtoError::NoPartitionId)?,
+            )?,
+            object_store_id: v
+                .object_store_id
+                .parse()
+                .map_err(ParquetFileProtoError::InvalidObjectStoreId)?,
+            min_time: Timestamp::new(v.min_time),
+            max_time: Timestamp::new(v.max_time),
+            to_delete: v.to_delete.map(Timestamp::new),
+            file_size_bytes: v.file_size_bytes,
+            row_count: v.row_count,
+            compaction_level: CompactionLevel::try_from(v.compaction_level)
+                .map_err(ParquetFileProtoError::InvalidCompactionLevel)?,
+            created_at: Timestamp::new(v.created_at),
+            column_set: ColumnSet::new(v.column_set.into_iter().map(ColumnId::new)),
+            max_l0_created_at: Timestamp::new(v.max_l0_created_at),
+        })
+    }
 }
 
 /// Data for a parquet file to be inserted into the catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetFileParams {
-    /// the shard that sequenced writes that went into this file
-    pub shard_id: ShardId,
     /// the namespace
     pub namespace_id: NamespaceId,
     /// the table
     pub table_id: TableId,
-    /// the partition
-    pub partition_id: PartitionId,
+    /// the partition identifier
+    pub partition_id: TransitionPartitionId,
     /// the uuid used in the object store path for this file
     pub object_store_id: Uuid,
-    /// the maximum sequence number from a record in this file
-    pub max_sequence_number: SequenceNumber,
     /// the min timestamp of data in this file
     pub min_time: Timestamp,
     /// the max timestamp of data in this file
@@ -1266,12 +768,10 @@ pub struct ParquetFileParams {
 impl From<ParquetFile> for ParquetFileParams {
     fn from(value: ParquetFile) -> Self {
         Self {
-            shard_id: value.shard_id,
             namespace_id: value.namespace_id,
             table_id: value.table_id,
             partition_id: value.partition_id,
             object_store_id: value.object_store_id,
-            max_sequence_number: value.max_sequence_number,
             min_time: value.min_time,
             max_time: value.max_time,
             file_size_bytes: value.file_size_bytes,
@@ -1282,15 +782,6 @@ impl From<ParquetFile> for ParquetFileParams {
             max_l0_created_at: value.max_l0_created_at,
         }
     }
-}
-
-/// Data for a processed tombstone reference in the catalog.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct ProcessedTombstone {
-    /// the id of the tombstone applied to the parquet file
-    pub tombstone_id: TombstoneId,
-    /// the id of the parquet file the tombstone was applied
-    pub parquet_file_id: ParquetFileId,
 }
 
 /// ID of a chunk.
@@ -1374,64 +865,6 @@ impl ChunkOrder {
     pub fn get(&self) -> i64 {
         self.0
     }
-}
-
-/// `PartitionTemplate` is used to compute the partition key of each row that
-/// gets written. It can consist of the table name, a column name and its value,
-/// a formatted time, or a string column and regex captures of its value. For
-/// columns that do not appear in the input row, a blank value is output.
-///
-/// The key is constructed in order of the template parts; thus ordering changes
-/// what partition key is generated.
-#[derive(Debug, Default, Eq, PartialEq, Clone)]
-#[allow(missing_docs)]
-pub struct PartitionTemplate {
-    pub parts: Vec<TemplatePart>,
-}
-
-/// `TemplatePart` specifies what part of a row should be used to compute this
-/// part of a partition key.
-#[derive(Debug, Eq, PartialEq, Clone)]
-pub enum TemplatePart {
-    /// The name of a table
-    Table,
-    /// The value in a named column
-    Column(String),
-    /// Applies a  `strftime` format to the "time" column.
-    ///
-    /// For example, a time format of "%Y-%m-%d %H:%M:%S" will produce
-    /// partition key parts such as "2021-03-14 12:25:21" and
-    /// "2021-04-14 12:24:21"
-    TimeFormat(String),
-    /// Applies a regex to the value in a string column
-    RegexCapture(RegexCapture),
-    /// Applies a `strftime` pattern to some column other than "time"
-    StrftimeColumn(StrftimeColumn),
-}
-
-/// `RegexCapture` is for pulling parts of a string column into the partition
-/// key.
-#[derive(Debug, Eq, PartialEq, Clone)]
-#[allow(missing_docs)]
-pub struct RegexCapture {
-    pub column: String,
-    pub regex: String,
-}
-
-/// [`StrftimeColumn`] is used to create a time based partition key off some
-/// column other than the builtin `time` column.
-///
-/// The value of the named column is formatted using a `strftime`
-/// style string.
-///
-/// For example, a time format of "%Y-%m-%d %H:%M:%S" will produce
-/// partition key parts such as "2021-03-14 12:25:21" and
-/// "2021-04-14 12:24:21"
-#[derive(Debug, Eq, PartialEq, Clone)]
-#[allow(missing_docs)]
-pub struct StrftimeColumn {
-    pub column: String,
-    pub format: String,
 }
 
 /// Represents a parsed delete predicate for evaluation by the InfluxDB IOx
@@ -1534,7 +967,7 @@ impl std::fmt::Display for DeleteExpr {
         write!(
             f,
             r#""{}"{}{}"#,
-            self.column().replace('\\', r#"\\"#).replace('"', r#"\""#),
+            self.column().replace('\\', r"\\").replace('"', r#"\""#),
             self.op(),
             self.scalar(),
         )
@@ -1595,48 +1028,10 @@ impl std::fmt::Display for Scalar {
                 _ => write!(f, "{:?}", value.as_ref()),
             },
             Scalar::String(value) => {
-                write!(
-                    f,
-                    "'{}'",
-                    value.replace('\\', r#"\\"#).replace('\'', r#"\'"#),
-                )
+                write!(f, "'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
             }
         }
     }
-}
-
-#[derive(Debug, Snafu)]
-#[allow(missing_docs)]
-pub enum OrgBucketMappingError {
-    #[snafu(display("Invalid namespace name: {}", source))]
-    InvalidNamespaceName { source: NamespaceNameError },
-
-    #[snafu(display("missing org/bucket value"))]
-    NotSpecified,
-}
-
-/// Map an InfluxDB 2.X org & bucket into an IOx NamespaceName.
-///
-/// This function ensures the mapping is unambiguous by requiring both `org` and
-/// `bucket` to not contain the `_` character in addition to the
-/// [`NamespaceName`] validation.
-pub fn org_and_bucket_to_namespace<'a, O: AsRef<str>, B: AsRef<str>>(
-    org: O,
-    bucket: B,
-) -> Result<NamespaceName<'a>, OrgBucketMappingError> {
-    const SEPARATOR: char = '_';
-
-    let org: Cow<'_, str> = utf8_percent_encode(org.as_ref(), NON_ALPHANUMERIC).into();
-    let bucket: Cow<'_, str> = utf8_percent_encode(bucket.as_ref(), NON_ALPHANUMERIC).into();
-
-    // An empty org or bucket is not acceptable.
-    if org.is_empty() || bucket.is_empty() {
-        return Err(OrgBucketMappingError::NotSpecified);
-    }
-
-    let db_name = format!("{}{}{}", org.as_ref(), SEPARATOR, bucket.as_ref());
-
-    NamespaceName::new(db_name).context(InvalidNamespaceNameSnafu)
 }
 
 /// A string that cannot be empty
@@ -1664,132 +1059,6 @@ impl Deref for NonEmptyString {
 
     fn deref(&self) -> &Self::Target {
         self.0.as_ref()
-    }
-}
-
-/// Length constraints for a [`NamespaceName`] name.
-///
-/// A `RangeInclusive` is a closed interval, covering [1, 64]
-const LENGTH_CONSTRAINT: RangeInclusive<usize> = 1..=64;
-
-/// [`NamespaceName`] name validation errors.
-#[derive(Debug, Snafu)]
-#[allow(missing_docs)]
-pub enum NamespaceNameError {
-    #[snafu(display(
-        "Namespace name {} length must be between {} and {} characters",
-        name,
-        LENGTH_CONSTRAINT.start(),
-        LENGTH_CONSTRAINT.end()
-    ))]
-    LengthConstraint { name: String },
-
-    #[snafu(display(
-        "Namespace name '{}' contains invalid character. \
-        Character number {} is a control which is not allowed.",
-        name,
-        bad_char_offset
-    ))]
-    BadChars {
-        bad_char_offset: usize,
-        name: String,
-    },
-}
-
-/// A correctly formed Namespace name.
-///
-/// Using this wrapper type allows the consuming code to enforce the invariant
-/// that only valid names are provided.
-///
-/// This type derefs to a `str` and therefore can be used in place of anything
-/// that is expecting a `str`:
-///
-/// ```rust
-/// # use data_types::NamespaceName;
-/// fn print_namespace(s: &str) {
-///     println!("namespace name: {}", s);
-/// }
-///
-/// let ns = NamespaceName::new("data").unwrap();
-/// print_namespace(&ns);
-/// ```
-///
-/// But this is not reciprocal - functions that wish to accept only
-/// pre-validated names can use `NamespaceName` as a parameter.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NamespaceName<'a>(Cow<'a, str>);
-
-impl<'a> NamespaceName<'a> {
-    /// Create a new, valid NamespaceName.
-    pub fn new<T: Into<Cow<'a, str>>>(name: T) -> Result<Self, NamespaceNameError> {
-        let name: Cow<'a, str> = name.into();
-
-        if !LENGTH_CONSTRAINT.contains(&name.len()) {
-            return Err(NamespaceNameError::LengthConstraint {
-                name: name.to_string(),
-            });
-        }
-
-        // Validate the name contains only valid characters.
-        //
-        // NOTE: If changing these characters, please update the error message
-        // above.
-        if let Some(bad_char_offset) = name.chars().position(|c| c.is_control()) {
-            return BadCharsSnafu {
-                bad_char_offset,
-                name,
-            }
-            .fail();
-        };
-
-        Ok(Self(name))
-    }
-
-    /// Borrow a string slice of the name.
-    pub fn as_str(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-impl<'a> std::convert::From<NamespaceName<'a>> for String {
-    fn from(name: NamespaceName<'a>) -> Self {
-        name.0.to_string()
-    }
-}
-
-impl<'a> std::convert::From<&NamespaceName<'a>> for String {
-    fn from(name: &NamespaceName<'a>) -> Self {
-        name.to_string()
-    }
-}
-
-impl<'a> std::convert::TryFrom<&'a str> for NamespaceName<'a> {
-    type Error = NamespaceNameError;
-
-    fn try_from(v: &'a str) -> Result<Self, Self::Error> {
-        Self::new(v)
-    }
-}
-
-impl<'a> std::convert::TryFrom<String> for NamespaceName<'a> {
-    type Error = NamespaceNameError;
-
-    fn try_from(v: String) -> Result<Self, Self::Error> {
-        Self::new(v)
-    }
-}
-
-impl<'a> std::ops::Deref for NamespaceName<'a> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl<'a> std::fmt::Display for NamespaceName<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
     }
 }
 
@@ -2319,25 +1588,6 @@ impl TableSummary {
     }
 }
 
-/// Shard index plus offset
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct Sequence {
-    /// The shard index
-    pub shard_index: ShardIndex,
-    /// The sequence number
-    pub sequence_number: SequenceNumber,
-}
-
-impl Sequence {
-    /// Create a new Sequence
-    pub fn new(shard_index: ShardIndex, sequence_number: SequenceNumber) -> Self {
-        Self {
-            shard_index,
-            sequence_number,
-        }
-    }
-}
-
 /// minimum time that can be represented.
 ///
 /// 1677-09-21 00:12:43.145224194 +0000 UTC
@@ -2356,10 +1606,9 @@ pub const MIN_NANO_TIME: i64 = i64::MIN + 2;
 ///
 /// 2262-04-11 23:47:16.854775806 +0000 UTC
 ///
-/// The highest time represented by a nanosecond needs to be used for an
-/// exclusive range in the shard group, so the maximum time needs to be one
-/// less than the possible maximum number of nanoseconds representable by an
-/// int64 so that we don't lose a point at that one time.
+/// The highest time represented by a nanosecond needs to be used for an exclusive range, so the
+/// maximum time needs to be one less than the possible maximum number of nanoseconds representable
+/// by an int64 so that we don't lose a point at that one time.
 /// Source: [influxdb](https://github.com/influxdata/influxdb/blob/540bb66e1381a48a6d1ede4fc3e49c75a7d9f4af/models/time.go#L12-L34)
 pub const MAX_NANO_TIME: i64 = i64::MAX - 1;
 
@@ -2434,7 +1683,7 @@ impl TimestampRange {
 ///
 /// Note this differs subtlety (but critically) from a
 /// [`TimestampRange`] as the minimum and maximum values are included ([`TimestampRange`] has an exclusive end).
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub struct TimestampMinMax {
     /// The minimum timestamp value
     pub min: i64,
@@ -2459,25 +1708,25 @@ impl TimestampMinMax {
     }
 }
 
-/// Specifies the status of data in the ingestion process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShardWriteStatus {
-    /// Nothing is known about this write (e.g. it refers to a shard for which we have no
-    /// information)
-    ShardUnknown,
-    /// The data has not yet been processed by the ingester, and thus is unreadable
-    Durable,
-    /// The data is readable, but not yet persisted
-    Readable,
-    /// The data is both readable and persisted to parquet
-    Persisted,
+/// FileRange describes a range of files by the min/max time and the sum of their capacities.
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub struct FileRange {
+    /// The minimum time of any file in the range
+    pub min: i64,
+    /// The maximum time of any file in the range
+    pub max: i64,
+    /// The sum of the sizes of all files in the range
+    pub cap: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::borrow::Cow;
+
     use ordered_float::OrderedFloat;
-    use test_helpers::assert_contains;
+    use proptest::{prelude::*, proptest};
 
     #[test]
     fn test_chunk_id_new() {
@@ -2546,7 +1795,7 @@ mod tests {
                     scalar: Scalar::I64(1),
                 },
                 DeleteExpr {
-                    column: String::from(r#"col\2"#),
+                    column: String::from(r"col\2"),
                     op: Op::Eq,
                     scalar: Scalar::I64(2),
                 },
@@ -2682,7 +1931,7 @@ mod tests {
                 DeleteExpr {
                     column: String::from("col3"),
                     op: Op::Eq,
-                    scalar: Scalar::String(String::from(r#"fo\o"#)),
+                    scalar: Scalar::String(String::from(r"fo\o")),
                 },
                 DeleteExpr {
                     column: String::from("col4"),
@@ -2695,111 +1944,6 @@ mod tests {
             &pred.expr_sql_string(),
             r#""col1"='' AND "col2"='foo' AND "col3"='fo\\o' AND "col4"='fo\'o'"#
         );
-    }
-
-    #[test]
-    fn test_org_bucket_map_db_ok() {
-        let got = org_and_bucket_to_namespace("org", "bucket").expect("failed on valid DB mapping");
-
-        assert_eq!(got.as_str(), "org_bucket");
-    }
-
-    #[test]
-    fn test_org_bucket_map_db_contains_underscore() {
-        let got = org_and_bucket_to_namespace("my_org", "bucket").unwrap();
-        assert_eq!(got.as_str(), "my%5Forg_bucket");
-
-        let got = org_and_bucket_to_namespace("org", "my_bucket").unwrap();
-        assert_eq!(got.as_str(), "org_my%5Fbucket");
-
-        let got = org_and_bucket_to_namespace("org", "my__bucket").unwrap();
-        assert_eq!(got.as_str(), "org_my%5F%5Fbucket");
-
-        let got = org_and_bucket_to_namespace("my_org", "my_bucket").unwrap();
-        assert_eq!(got.as_str(), "my%5Forg_my%5Fbucket");
-    }
-
-    #[test]
-    fn test_org_bucket_map_db_contains_underscore_and_percent() {
-        let got = org_and_bucket_to_namespace("my%5Forg", "bucket").unwrap();
-        assert_eq!(got.as_str(), "my%255Forg_bucket");
-
-        let got = org_and_bucket_to_namespace("my%5Forg_", "bucket").unwrap();
-        assert_eq!(got.as_str(), "my%255Forg%5F_bucket");
-    }
-
-    #[test]
-    fn test_bad_namespace_name_is_encoded() {
-        let got = org_and_bucket_to_namespace("org", "bucket?").unwrap();
-        assert_eq!(got.as_str(), "org_bucket%3F");
-
-        let got = org_and_bucket_to_namespace("org!", "bucket").unwrap();
-        assert_eq!(got.as_str(), "org%21_bucket");
-    }
-
-    #[test]
-    fn test_empty_org_bucket() {
-        let err = org_and_bucket_to_namespace("", "")
-            .expect_err("should fail with empty org/bucket valuese");
-        assert!(matches!(err, OrgBucketMappingError::NotSpecified));
-    }
-
-    #[test]
-    fn test_deref() {
-        let db = NamespaceName::new("my_example_name").unwrap();
-        assert_eq!(&*db, "my_example_name");
-    }
-
-    #[test]
-    fn test_too_short() {
-        let name = "".to_string();
-        let got = NamespaceName::try_from(name).unwrap_err();
-
-        assert!(matches!(
-            got,
-            NamespaceNameError::LengthConstraint { name: _n }
-        ));
-    }
-
-    #[test]
-    fn test_too_long() {
-        let name = "my_example_name_that_is_quite_a_bit_longer_than_allowed_even_though_database_names_can_be_quite_long_bananas".to_string();
-        let got = NamespaceName::try_from(name).unwrap_err();
-
-        assert!(matches!(
-            got,
-            NamespaceNameError::LengthConstraint { name: _n }
-        ));
-    }
-
-    #[test]
-    fn test_bad_chars_null() {
-        let got = NamespaceName::new("example\x00").unwrap_err();
-        assert_contains!(got.to_string() , "Namespace name 'example\x00' contains invalid character. Character number 7 is a control which is not allowed.");
-    }
-
-    #[test]
-    fn test_bad_chars_high_control() {
-        let got = NamespaceName::new("\u{007f}example").unwrap_err();
-        assert_contains!(got.to_string() , "Namespace name '\u{007f}example' contains invalid character. Character number 0 is a control which is not allowed.");
-    }
-
-    #[test]
-    fn test_bad_chars_tab() {
-        let got = NamespaceName::new("example\tdb").unwrap_err();
-        assert_contains!(got.to_string() , "Namespace name 'example\tdb' contains invalid character. Character number 7 is a control which is not allowed.");
-    }
-
-    #[test]
-    fn test_bad_chars_newline() {
-        let got = NamespaceName::new("my_example\ndb").unwrap_err();
-        assert_contains!(got.to_string() , "Namespace name 'my_example\ndb' contains invalid character. Character number 10 is a control which is not allowed.");
-    }
-
-    #[test]
-    fn test_ok_chars() {
-        let db = NamespaceName::new("my-example-db_with_underscores and spaces").unwrap();
-        assert_eq!(&*db, "my-example-db_with_underscores and spaces");
     }
 
     #[test]
@@ -3516,17 +2660,18 @@ mod tests {
     fn test_table_schema_size() {
         let schema1 = TableSchema {
             id: TableId::new(1),
-            columns: BTreeMap::from([]),
+            partition_template: Default::default(),
+            columns: ColumnsByName::new([]),
         };
         let schema2 = TableSchema {
             id: TableId::new(2),
-            columns: BTreeMap::from([(
-                String::from("foo"),
-                ColumnSchema {
-                    id: ColumnId::new(1),
-                    column_type: ColumnType::Bool,
-                },
-            )]),
+            partition_template: Default::default(),
+            columns: ColumnsByName::new([Column {
+                id: ColumnId::new(1),
+                table_id: TableId::new(2),
+                name: String::from("foo"),
+                column_type: ColumnType::Bool,
+            }]),
         };
         assert!(schema1.size() < schema2.size());
     }
@@ -3535,21 +2680,26 @@ mod tests {
     fn test_namespace_schema_size() {
         let schema1 = NamespaceSchema {
             id: NamespaceId::new(1),
-            topic_id: TopicId::new(2),
-            query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([]),
-            max_columns_per_table: 4,
-            max_tables: 42,
+            max_tables: MaxTables::try_from(42).unwrap(),
+            max_columns_per_table: MaxColumnsPerTable::try_from(4).unwrap(),
             retention_period_ns: None,
+            partition_template: Default::default(),
         };
         let schema2 = NamespaceSchema {
             id: NamespaceId::new(1),
-            topic_id: TopicId::new(2),
-            query_pool_id: QueryPoolId::new(3),
-            tables: BTreeMap::from([(String::from("foo"), TableSchema::new(TableId::new(1)))]),
-            max_columns_per_table: 4,
-            max_tables: 42,
+            tables: BTreeMap::from([(
+                String::from("foo"),
+                TableSchema {
+                    id: TableId::new(1),
+                    columns: ColumnsByName::new([]),
+                    partition_template: Default::default(),
+                },
+            )]),
+            max_tables: MaxTables::try_from(42).unwrap(),
+            max_columns_per_table: MaxColumnsPerTable::try_from(4).unwrap(),
             retention_period_ns: None,
+            partition_template: Default::default(),
         };
         assert!(schema1.size() < schema2.size());
     }
@@ -3579,15 +2729,82 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "set contains duplicates"]
-    fn test_column_set_duplicates() {
-        ColumnSet::new([ColumnId::new(1), ColumnId::new(2), ColumnId::new(1)]);
-    }
-
-    #[test]
     fn test_timestamprange_start_after_end() {
         let tr = TimestampRange::new(2, 1);
         assert_eq!(tr.start(), 1);
         assert_eq!(tr.end(), 1);
+    }
+
+    use crate::partition::tests::arbitrary_partition_id;
+
+    prop_compose! {
+        /// Return an arbitrary [`Timestamp`].
+        pub fn arbitrary_timestamp()(value in any::<i64>()) -> Timestamp {
+            Timestamp::new(value)
+        }
+    }
+
+    fn arbitrary_compaction_level() -> impl prop::strategy::Strategy<Value = CompactionLevel> {
+        prop_oneof![
+            Just(CompactionLevel::Initial),
+            Just(CompactionLevel::FileNonOverlapped),
+            Just(CompactionLevel::Final),
+        ]
+    }
+
+    prop_compose! {
+        /// Return an arbitrary [`ParquetFile`] with a randomised values.
+        fn arbitrary_parquet_file()(
+            partition_id in arbitrary_partition_id(),
+            parquet_file_id in any::<i64>(),
+            namespace_id in any::<i64>(),
+            table_id in any::<i64>(),
+            min_time in arbitrary_timestamp(),
+            max_time in arbitrary_timestamp(),
+            to_delete in prop::option::of(arbitrary_timestamp()),
+            file_size_bytes in any::<i64>(),
+            row_count in any::<i64>(),
+            compaction_level in arbitrary_compaction_level(),
+            created_at in arbitrary_timestamp(),
+            column_set in prop::collection::vec(any::<i64>(), 0..10),
+            max_l0_created_at in arbitrary_timestamp(),
+        ) -> ParquetFile {
+            let column_set = ColumnSet::new(column_set.into_iter().map(ColumnId::new));
+
+            ParquetFile {
+                id: ParquetFileId::new(parquet_file_id),
+                namespace_id: NamespaceId::new(namespace_id),
+                table_id: TableId::new(table_id),
+                partition_id,
+                object_store_id: Uuid::new_v4(),
+                min_time,
+                max_time,
+                to_delete,
+                file_size_bytes,
+                row_count,
+                compaction_level,
+                created_at,
+                column_set,
+                max_l0_created_at,
+            }
+        }
+    }
+
+    proptest! {
+        /// Assert a [`ParquetFile`] is round-trippable through proto
+        /// serialisation.
+        #[test]
+        fn prop_parquet_file_proto_round_trip(file in arbitrary_parquet_file()) {
+            use generated_types::influxdata::iox::catalog::v1 as proto;
+
+            // Encoding is infallible
+            let encoded = proto::ParquetFile::from(file.clone());
+
+            // Decoding a valid proto ParquetFile is infallible.
+            let decoded = ParquetFile::try_from(encoded).unwrap();
+
+            // The deserialised value must match the input (round trippable)
+            assert_eq!(decoded, file);
+        }
     }
 }

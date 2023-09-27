@@ -7,12 +7,17 @@
     missing_debug_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use futures::{stream::BoxStream, StreamExt};
 use generated_types::influxdata::iox::object_store::v1::*;
@@ -70,8 +75,7 @@ impl object_store_service_server::ObjectStoreService for ObjectStoreService {
         let path = ParquetFilePath::new(
             parquet_file.namespace_id,
             parquet_file.table_id,
-            parquet_file.shard_id,
-            parquet_file.partition_id,
+            &parquet_file.partition_id.clone(),
             parquet_file.object_store_id,
         );
         let path = path.object_store_path();
@@ -97,12 +101,12 @@ impl object_store_service_server::ObjectStoreService for ObjectStoreService {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, SequenceNumber, ShardIndex,
-        Timestamp,
-    };
+    use data_types::{ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, Timestamp};
     use generated_types::influxdata::iox::object_store::v1::object_store_service_server::ObjectStoreService;
-    use iox_catalog::mem::MemCatalog;
+    use iox_catalog::{
+        mem::MemCatalog,
+        test_helpers::{arbitrary_namespace, arbitrary_table},
+    };
     use object_store::{memory::InMemory, ObjectStore};
     use uuid::Uuid;
 
@@ -114,39 +118,18 @@ mod tests {
             let metrics = Arc::new(metric::Registry::default());
             let catalog = Arc::new(MemCatalog::new(metrics));
             let mut repos = catalog.repositories().await;
-            let topic = repos.topics().create_or_get("iox-shared").await.unwrap();
-            let pool = repos
-                .query_pools()
-                .create_or_get("iox-shared")
-                .await
-                .unwrap();
-            let shard = repos
-                .shards()
-                .create_or_get(&topic, ShardIndex::new(1))
-                .await
-                .unwrap();
-            let namespace = repos
-                .namespaces()
-                .create("catalog_partition_test", None, topic.id, pool.id)
-                .await
-                .unwrap();
-            let table = repos
-                .tables()
-                .create_or_get("schema_test_table", namespace.id)
-                .await
-                .unwrap();
+            let namespace = arbitrary_namespace(&mut *repos, "catalog_partition_test").await;
+            let table = arbitrary_table(&mut *repos, "schema_test_table", &namespace).await;
             let partition = repos
                 .partitions()
-                .create_or_get("foo".into(), shard.id, table.id)
+                .create_or_get("foo".into(), table.id)
                 .await
                 .unwrap();
             let p1params = ParquetFileParams {
-                shard_id: shard.id,
                 namespace_id: namespace.id,
                 table_id: table.id,
-                partition_id: partition.id,
+                partition_id: partition.transition_partition_id(),
                 object_store_id: Uuid::new_v4(),
-                max_sequence_number: SequenceNumber::new(40),
                 min_time: Timestamp::new(1),
                 max_time: Timestamp::new(5),
                 file_size_bytes: 2343,
@@ -166,8 +149,7 @@ mod tests {
         let path = ParquetFilePath::new(
             p1.namespace_id,
             p1.table_id,
-            p1.shard_id,
-            p1.partition_id,
+            &p1.partition_id.clone(),
             p1.object_store_id,
         );
         let path = path.object_store_path();

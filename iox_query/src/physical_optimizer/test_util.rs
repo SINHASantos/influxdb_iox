@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use datafusion::{
-    config::ConfigOptions, physical_optimizer::PhysicalOptimizerRule, physical_plan::ExecutionPlan,
+    config::ConfigOptions,
+    error::DataFusionError,
+    physical_optimizer::PhysicalOptimizerRule,
+    physical_plan::{ExecutionPlan, Partitioning},
 };
 use serde::Serialize;
 
@@ -34,9 +37,25 @@ impl OptimizationTest {
     {
         let input = format_execution_plan(&input_plan);
 
+        let input_schema = input_plan.schema();
+
         let output_result = opt.optimize(input_plan, config);
         let output_plan = output_result.as_ref().ok().cloned();
         let output = output_result
+            .and_then(|plan| {
+                if opt.schema_check() && (plan.schema() != input_schema) {
+                    Err(DataFusionError::External(
+                        format!(
+                            "Schema mismatch:\n\nBefore:\n{:?}\n\nAfter:\n{:?}",
+                            input_schema,
+                            plan.schema()
+                        )
+                        .into(),
+                    ))
+                } else {
+                    Ok(plan)
+                }
+            })
             .map(|plan| format_execution_plan(&plan))
             .map_err(|e| e.to_string());
 
@@ -49,5 +68,20 @@ impl OptimizationTest {
 
     pub fn output_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         self.output_plan.as_ref()
+    }
+}
+
+/// Check if given partitioning is [`Partitioning::UnknownPartitioning`] with the given count.
+///
+/// This is needed because [`PartialEq`] for [`Partitioning`] is specified as "unknown != unknown".
+#[track_caller]
+pub fn assert_unknown_partitioning(partitioning: Partitioning, n: usize) {
+    match partitioning {
+        Partitioning::UnknownPartitioning(n2) if n == n2 => {}
+        _ => panic!(
+            "Unexpected partitioning, wanted: {:?}, got: {:?}",
+            Partitioning::UnknownPartitioning(n),
+            partitioning
+        ),
     }
 }

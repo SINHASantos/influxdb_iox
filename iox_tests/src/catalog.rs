@@ -5,18 +5,21 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use data_types::{
-    Column, ColumnSet, ColumnType, CompactionLevel, Namespace, NamespaceSchema, ParquetFile,
-    ParquetFileParams, Partition, PartitionId, QueryPool, SequenceNumber, Shard, ShardId,
-    ShardIndex, Table, TableId, TablePartition, TableSchema, Timestamp, Tombstone, TombstoneId,
-    TopicMetadata,
+    partition_template::TablePartitionTemplateOverride, Column, ColumnSet, ColumnType,
+    ColumnsByName, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceName,
+    NamespaceSchema, ParquetFile, ParquetFileParams, Partition, PartitionId, SortedColumnSet,
+    Table, TableId, TableSchema, Timestamp, TransitionPartitionId,
 };
 use datafusion::physical_plan::metrics::Count;
-use datafusion_util::MemoryStream;
+use datafusion_util::{unbounded_memory_pool, MemoryStream};
+use generated_types::influxdata::iox::partition_template::v1::PartitionTemplate;
 use iox_catalog::{
     interface::{
-        get_schema_by_id, get_table_schema_by_id, Catalog, PartitionRepo, SoftDeletedRows,
+        get_schema_by_id, get_table_columns_by_id, Catalog, RepoCollection, SoftDeletedRows,
     },
     mem::MemCatalog,
+    partition_lookup,
+    test_helpers::arbitrary_table,
 };
 use iox_query::{
     exec::{DedicatedExecutors, Executor, ExecutorConfig},
@@ -89,6 +92,7 @@ impl TestCatalog {
                     parquet_store.id(),
                     Arc::clone(parquet_store.object_store()),
                 )]),
+                metric_registry: Arc::clone(&metric_registry),
                 mem_pool_size: 1024 * 1024 * 1024,
             },
             exec,
@@ -138,21 +142,6 @@ impl TestCatalog {
         Arc::clone(&self.exec)
     }
 
-    /// Create a shard in the catalog
-    pub async fn create_shard(self: &Arc<Self>, shard_index: i32) -> Arc<Shard> {
-        let mut repos = self.catalog.repositories().await;
-
-        let topic = repos.topics().create_or_get("topic").await.unwrap();
-        let shard_index = ShardIndex::new(shard_index);
-        Arc::new(
-            repos
-                .shards()
-                .create_or_get(&topic, shard_index)
-                .await
-                .unwrap(),
-        )
-    }
-
     /// Create namespace with specified retention
     pub async fn create_namespace_with_retention(
         self: &Arc<Self>,
@@ -160,19 +149,15 @@ impl TestCatalog {
         retention_period_ns: Option<i64>,
     ) -> Arc<TestNamespace> {
         let mut repos = self.catalog.repositories().await;
-
-        let topic = repos.topics().create_or_get("topic").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("pool").await.unwrap();
+        let namespace_name = NamespaceName::new(name).unwrap();
         let namespace = repos
             .namespaces()
-            .create(name, retention_period_ns, topic.id, query_pool.id)
+            .create(&namespace_name, None, retention_period_ns, None)
             .await
             .unwrap();
 
         Arc::new(TestNamespace {
             catalog: Arc::clone(self),
-            topic,
-            query_pool,
             namespace,
         })
     }
@@ -186,83 +171,6 @@ impl TestCatalog {
             .await
     }
 
-    /// return tombstones of a given table
-    pub async fn list_tombstones_by_table(self: &Arc<Self>, table_id: TableId) -> Vec<Tombstone> {
-        self.catalog
-            .repositories()
-            .await
-            .tombstones()
-            .list_by_table(table_id)
-            .await
-            .unwrap()
-    }
-
-    /// return number of tombstones of a given table
-    pub async fn count_tombstones_for_table(self: &Arc<Self>, table_id: TableId) -> usize {
-        let ts = self
-            .catalog
-            .repositories()
-            .await
-            .tombstones()
-            .list_by_table(table_id)
-            .await
-            .unwrap();
-        ts.len()
-    }
-
-    /// return number of processed tombstones of a tombstones
-    pub async fn count_processed_tombstones(self: &Arc<Self>, tombstone_id: TombstoneId) -> i64 {
-        self.catalog
-            .repositories()
-            .await
-            .processed_tombstones()
-            .count_by_tombstone_id(tombstone_id)
-            .await
-            .unwrap()
-    }
-
-    /// List level 0 files
-    pub async fn list_level_0_files(self: &Arc<Self>, shard_id: ShardId) -> Vec<ParquetFile> {
-        self.catalog
-            .repositories()
-            .await
-            .parquet_files()
-            .level_0(shard_id)
-            .await
-            .unwrap()
-    }
-
-    /// Count level 0 files
-    pub async fn count_level_0_files(self: &Arc<Self>, shard_id: ShardId) -> usize {
-        let level_0 = self
-            .catalog
-            .repositories()
-            .await
-            .parquet_files()
-            .level_0(shard_id)
-            .await
-            .unwrap();
-        level_0.len()
-    }
-
-    /// Count level 1 files
-    pub async fn count_level_1_files(
-        self: &Arc<Self>,
-        table_partition: TablePartition,
-        min_time: Timestamp,
-        max_time: Timestamp,
-    ) -> usize {
-        let level_1 = self
-            .catalog
-            .repositories()
-            .await
-            .parquet_files()
-            .level_1(table_partition, min_time, max_time)
-            .await
-            .unwrap();
-        level_1.len()
-    }
-
     /// List all non-deleted files
     pub async fn list_by_table_not_to_delete(
         self: &Arc<Self>,
@@ -273,17 +181,6 @@ impl TestCatalog {
             .await
             .parquet_files()
             .list_by_table_not_to_delete(table_id)
-            .await
-            .unwrap()
-    }
-
-    /// List all files including the soft deleted ones
-    pub async fn list_by_table(self: &Arc<Self>, table_id: TableId) -> Vec<ParquetFile> {
-        self.catalog
-            .repositories()
-            .await
-            .parquet_files()
-            .list_by_table(table_id)
             .await
             .unwrap()
     }
@@ -309,8 +206,6 @@ impl TestCatalog {
 #[allow(missing_docs)]
 pub struct TestNamespace {
     pub catalog: Arc<TestCatalog>,
-    pub topic: TopicMetadata,
-    pub query_pool: QueryPool,
     pub namespace: Namespace,
 }
 
@@ -319,11 +214,7 @@ impl TestNamespace {
     pub async fn create_table(self: &Arc<Self>, name: &str) -> Arc<TestTable> {
         let mut repos = self.catalog.catalog.repositories().await;
 
-        let table = repos
-            .tables()
-            .create_or_get(name, self.namespace.id)
-            .await
-            .unwrap();
+        let table = arbitrary_table(&mut *repos, name, &self.namespace).await;
 
         Arc::new(TestTable {
             catalog: Arc::clone(&self.catalog),
@@ -332,20 +223,32 @@ impl TestNamespace {
         })
     }
 
-    /// Create a shard for this namespace
-    pub async fn create_shard(self: &Arc<Self>, shard_index: i32) -> Arc<TestShard> {
+    /// Create a table in this namespace w/ given partition template
+    pub async fn create_table_with_partition_template(
+        self: &Arc<Self>,
+        name: &str,
+        template: Option<PartitionTemplate>,
+    ) -> Arc<TestTable> {
         let mut repos = self.catalog.catalog.repositories().await;
 
-        let shard = repos
-            .shards()
-            .create_or_get(&self.topic, ShardIndex::new(shard_index))
+        let table = repos
+            .tables()
+            .create(
+                name,
+                TablePartitionTemplateOverride::try_new(
+                    template,
+                    &self.namespace.partition_template,
+                )
+                .unwrap(),
+                self.namespace.id,
+            )
             .await
             .unwrap();
 
-        Arc::new(TestShard {
+        Arc::new(TestTable {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(self),
-            shard,
+            table,
         })
     }
 
@@ -361,34 +264,28 @@ impl TestNamespace {
         .unwrap()
     }
 
-    /// Set the number of columns per table allowed in this namespace.
-    pub async fn update_column_limit(&self, new_max: i32) {
-        let mut repos = self.catalog.catalog.repositories().await;
-        repos
-            .namespaces()
-            .update_column_limit(&self.namespace.name, new_max)
-            .await
-            .unwrap();
-    }
-
     /// Set the number of tables allowed in this namespace.
-    pub async fn update_table_limit(&self, new_max: i32) {
+    pub async fn update_table_limit(&self, new_max: usize) {
         let mut repos = self.catalog.catalog.repositories().await;
         repos
             .namespaces()
-            .update_table_limit(&self.namespace.name, new_max)
+            .update_table_limit(&self.namespace.name, MaxTables::try_from(new_max).unwrap())
             .await
             .unwrap();
     }
-}
 
-/// A test shard with its namespace in the catalog
-#[derive(Debug)]
-#[allow(missing_docs)]
-pub struct TestShard {
-    pub catalog: Arc<TestCatalog>,
-    pub namespace: Arc<TestNamespace>,
-    pub shard: Shard,
+    /// Set the number of columns per table allowed in this namespace.
+    pub async fn update_column_limit(&self, new_max: usize) {
+        let mut repos = self.catalog.catalog.repositories().await;
+        repos
+            .namespaces()
+            .update_column_limit(
+                &self.namespace.name,
+                MaxColumnsPerTable::try_from(new_max).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 /// A test table of a namespace in the catalog
@@ -401,16 +298,56 @@ pub struct TestTable {
 }
 
 impl TestTable {
-    /// Attach a shard to the table
-    pub fn with_shard(self: &Arc<Self>, shard: &Arc<TestShard>) -> Arc<TestTableBoundShard> {
-        assert!(Arc::ptr_eq(&self.catalog, &shard.catalog));
-        assert!(Arc::ptr_eq(&self.namespace, &shard.namespace));
+    /// Creat a partition for the table
+    pub async fn create_partition(self: &Arc<Self>, key: &str) -> Arc<TestPartition> {
+        let mut repos = self.catalog.catalog.repositories().await;
 
-        Arc::new(TestTableBoundShard {
+        let partition = repos
+            .partitions()
+            .create_or_get(key.into(), self.table.id)
+            .await
+            .unwrap();
+
+        Arc::new(TestPartition {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(self),
-            shard: Arc::clone(shard),
+            partition,
+        })
+    }
+
+    /// Create a partition with a specified sort key for the table
+    pub async fn create_partition_with_sort_key(
+        self: &Arc<Self>,
+        key: &str,
+        sort_key: &[&str],
+        sort_key_ids: &[i64],
+    ) -> Arc<TestPartition> {
+        let mut repos = self.catalog.catalog.repositories().await;
+
+        let partition = repos
+            .partitions()
+            .create_or_get(key.into(), self.table.id)
+            .await
+            .unwrap();
+
+        let partition = repos
+            .partitions()
+            .cas_sort_key(
+                &TransitionPartitionId::Deprecated(partition.id),
+                None,
+                None,
+                sort_key,
+                &SortedColumnSet::from(sort_key_ids.iter().cloned()),
+            )
+            .await
+            .unwrap();
+
+        Arc::new(TestPartition {
+            catalog: Arc::clone(&self.catalog),
+            namespace: Arc::clone(&self.namespace),
+            table: Arc::clone(self),
+            partition,
         })
     }
 
@@ -436,25 +373,34 @@ impl TestTable {
         })
     }
 
-    /// Get catalog schema.
+    /// Get the TableSchema from the catalog.
     pub async fn catalog_schema(&self) -> TableSchema {
+        TableSchema {
+            id: self.table.id,
+            partition_template: Default::default(),
+            columns: self.catalog_columns().await,
+        }
+    }
+
+    /// Get columns from the catalog.
+    pub async fn catalog_columns(&self) -> ColumnsByName {
         let mut repos = self.catalog.catalog.repositories().await;
 
-        get_table_schema_by_id(self.table.id, repos.as_mut())
+        get_table_columns_by_id(self.table.id, repos.as_mut())
             .await
             .unwrap()
     }
 
     /// Get schema for this table.
     pub async fn schema(&self) -> Schema {
-        self.catalog_schema().await.try_into().unwrap()
+        self.catalog_columns().await.try_into().unwrap()
     }
 
     /// Read the record batches from the specified Parquet File associated with this table.
     pub async fn read_parquet_file(&self, file: ParquetFile) -> Vec<RecordBatch> {
         // get schema
-        let table_catalog_schema = self.catalog_schema().await;
-        let column_id_lookup = table_catalog_schema.column_id_map();
+        let table_catalog_columns = self.catalog_columns().await;
+        let column_id_lookup = table_catalog_columns.id_map();
         let table_schema = self.schema().await;
         let selection: Vec<_> = file
             .column_set
@@ -485,120 +431,39 @@ pub struct TestColumn {
     pub column: Column,
 }
 
-/// A test catalog with specified namespace, shard, and table
-#[allow(missing_docs)]
-pub struct TestTableBoundShard {
-    pub catalog: Arc<TestCatalog>,
-    pub namespace: Arc<TestNamespace>,
-    pub table: Arc<TestTable>,
-    pub shard: Arc<TestShard>,
-}
-
-impl TestTableBoundShard {
-    /// Creat a partition for the table
-    pub async fn create_partition(self: &Arc<Self>, key: &str) -> Arc<TestPartition> {
-        let mut repos = self.catalog.catalog.repositories().await;
-
-        let partition = repos
-            .partitions()
-            .create_or_get(key.into(), self.shard.shard.id, self.table.table.id)
-            .await
-            .unwrap();
-
-        Arc::new(TestPartition {
-            catalog: Arc::clone(&self.catalog),
-            namespace: Arc::clone(&self.namespace),
-            table: Arc::clone(&self.table),
-            shard: Arc::clone(&self.shard),
-            partition,
-        })
-    }
-
-    /// Creat a partition with a specified sort key for the table
-    pub async fn create_partition_with_sort_key(
-        self: &Arc<Self>,
-        key: &str,
-        sort_key: &[&str],
-    ) -> Arc<TestPartition> {
-        let mut repos = self.catalog.catalog.repositories().await;
-
-        let partition = repos
-            .partitions()
-            .create_or_get(key.into(), self.shard.shard.id, self.table.table.id)
-            .await
-            .unwrap();
-
-        let partition = repos
-            .partitions()
-            .cas_sort_key(partition.id, None, sort_key)
-            .await
-            .unwrap();
-
-        Arc::new(TestPartition {
-            catalog: Arc::clone(&self.catalog),
-            namespace: Arc::clone(&self.namespace),
-            table: Arc::clone(&self.table),
-            shard: Arc::clone(&self.shard),
-            partition,
-        })
-    }
-
-    /// Create a tombstone
-    pub async fn create_tombstone(
-        self: &Arc<Self>,
-        sequence_number: i64,
-        min_time: i64,
-        max_time: i64,
-        predicate: &str,
-    ) -> Arc<TestTombstone> {
-        let mut repos = self.catalog.catalog.repositories().await;
-
-        let tombstone = repos
-            .tombstones()
-            .create_or_get(
-                self.table.table.id,
-                self.shard.shard.id,
-                SequenceNumber::new(sequence_number),
-                Timestamp::new(min_time),
-                Timestamp::new(max_time),
-                predicate,
-            )
-            .await
-            .unwrap();
-
-        Arc::new(TestTombstone {
-            catalog: Arc::clone(&self.catalog),
-            namespace: Arc::clone(&self.namespace),
-            tombstone,
-        })
+impl TestColumn {
+    pub fn id(&self) -> i64 {
+        self.column.id.get()
     }
 }
 
-/// A test catalog with specified namespace, shard, table, partition
+/// A test catalog with specified namespace, table, partition
 #[allow(missing_docs)]
 #[derive(Debug)]
 pub struct TestPartition {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Arc<TestNamespace>,
     pub table: Arc<TestTable>,
-    pub shard: Arc<TestShard>,
     pub partition: Partition,
 }
 
 impl TestPartition {
     /// Update sort key.
-    pub async fn update_sort_key(self: &Arc<Self>, sort_key: SortKey) -> Arc<Self> {
-        let old_sort_key = self
-            .catalog
-            .catalog
-            .repositories()
-            .await
-            .partitions()
-            .get_by_id(self.partition.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .sort_key;
+    pub async fn update_sort_key(
+        self: &Arc<Self>,
+        sort_key: SortKey,
+        sort_key_ids: &SortedColumnSet,
+    ) -> Arc<Self> {
+        let partition = partition_lookup(
+            self.catalog.catalog.repositories().await.as_mut(),
+            &self.partition.transition_partition_id(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let old_sort_key = partition.sort_key;
+        let old_sort_key_ids = partition.sort_key_ids;
 
         let partition = self
             .catalog
@@ -607,9 +472,11 @@ impl TestPartition {
             .await
             .partitions()
             .cas_sort_key(
-                self.partition.id,
-                Some(old_sort_key),
+                &self.partition.transition_partition_id(),
+                old_sort_key,
+                Some(old_sort_key_ids),
                 &sort_key.to_columns().collect::<Vec<_>>(),
+                sort_key_ids,
             )
             .await
             .unwrap();
@@ -618,7 +485,6 @@ impl TestPartition {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
-            shard: Arc::clone(&self.shard),
             partition,
         })
     }
@@ -633,7 +499,6 @@ impl TestPartition {
             record_batch,
             table,
             schema,
-            max_sequence_number,
             min_time,
             max_time,
             file_size_bytes,
@@ -670,12 +535,9 @@ impl TestPartition {
             creation_timestamp: now(),
             namespace_id: self.namespace.namespace.id,
             namespace_name: self.namespace.namespace.name.clone().into(),
-            shard_id: self.shard.shard.id,
             table_id: self.table.table.id,
             table_name: self.table.table.name.clone().into(),
-            partition_id: self.partition.id,
             partition_key: self.partition.partition_key.clone(),
-            max_sequence_number,
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key.clone()),
             max_l0_created_at: Time::from_timestamp_nanos(max_l0_created_at),
@@ -685,6 +547,7 @@ impl TestPartition {
                 Arc::clone(&self.catalog.object_store),
                 StorageId::from("iox"),
             ),
+            &self.partition.transition_partition_id(),
             &metadata,
             record_batch.clone(),
         )
@@ -694,7 +557,6 @@ impl TestPartition {
             record_batch: Some(record_batch),
             table: Some(table),
             schema: Some(schema),
-            max_sequence_number,
             min_time,
             max_time,
             file_size_bytes: Some(file_size_bytes.unwrap_or(real_file_size_bytes as u64)),
@@ -709,7 +571,12 @@ impl TestPartition {
 
         let result = self.create_parquet_file_catalog_record(builder).await;
         let mut repos = self.catalog.catalog.repositories().await;
-        update_catalog_sort_key_if_needed(repos.partitions(), self.partition.id, sort_key).await;
+        update_catalog_sort_key_if_needed(
+            repos.as_mut(),
+            &self.partition.transition_partition_id(),
+            sort_key,
+        )
+        .await;
         result
     }
 
@@ -721,7 +588,6 @@ impl TestPartition {
     ) -> TestParquetFile {
         let TestParquetFileBuilder {
             record_batch,
-            max_sequence_number,
             min_time,
             max_time,
             file_size_bytes,
@@ -735,12 +601,11 @@ impl TestPartition {
             ..
         } = builder;
 
-        let table_catalog_schema = self.table.catalog_schema().await;
+        let table_catalog_columns = self.table.catalog_columns().await;
 
         let (row_count, column_set) = if let Some(record_batch) = record_batch {
             let column_set = ColumnSet::new(record_batch.schema().fields().iter().map(|f| {
-                table_catalog_schema
-                    .columns
+                table_catalog_columns
                     .get(f.name())
                     .unwrap_or_else(|| panic!("Column {} is not registered", f.name()))
                     .id
@@ -753,18 +618,15 @@ impl TestPartition {
 
             (record_batch.num_rows(), column_set)
         } else {
-            let column_set =
-                ColumnSet::new(table_catalog_schema.columns.values().map(|col| col.id));
+            let column_set = ColumnSet::new(table_catalog_columns.ids());
             (row_count.unwrap_or(0), column_set)
         };
 
         let parquet_file_params = ParquetFileParams {
-            shard_id: self.shard.shard.id,
             namespace_id: self.namespace.namespace.id,
             table_id: self.table.table.id,
-            partition_id: self.partition.id,
+            partition_id: self.partition.transition_partition_id(),
             object_store_id: object_store_id.unwrap_or_else(Uuid::new_v4),
-            max_sequence_number,
             min_time: Timestamp::new(min_time),
             max_time: Timestamp::new(max_time),
             file_size_bytes: file_size_bytes.unwrap_or(0) as i64,
@@ -785,7 +647,7 @@ impl TestPartition {
         if to_delete {
             repos
                 .parquet_files()
-                .flag_for_delete(parquet_file.id)
+                .create_upgrade_delete(&[parquet_file.id], &[], &[], CompactionLevel::Initial)
                 .await
                 .unwrap();
         }
@@ -794,7 +656,6 @@ impl TestPartition {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
-            shard: Arc::clone(&self.shard),
             partition: Arc::clone(self),
             parquet_file,
             size_override,
@@ -808,7 +669,6 @@ pub struct TestParquetFileBuilder {
     record_batch: Option<RecordBatch>,
     table: Option<String>,
     schema: Option<Schema>,
-    max_sequence_number: SequenceNumber,
     min_time: i64,
     max_time: i64,
     file_size_bytes: Option<u64>,
@@ -827,7 +687,6 @@ impl Default for TestParquetFileBuilder {
             record_batch: None,
             table: None,
             schema: None,
-            max_sequence_number: SequenceNumber::new(100),
             min_time: now().timestamp_nanos(),
             max_time: now().timestamp_nanos(),
             file_size_bytes: None,
@@ -867,12 +726,6 @@ impl TestParquetFileBuilder {
 
     fn with_schema(mut self, schema: Schema) -> Self {
         self.schema = Some(schema);
-        self
-    }
-
-    /// Specify the maximum sequence number for the parquet file metadata.
-    pub fn with_max_seq(mut self, max_seq: i64) -> Self {
-        self.max_sequence_number = SequenceNumber::new(max_seq);
         self
     }
 
@@ -932,66 +785,86 @@ impl TestParquetFileBuilder {
     }
 }
 
-async fn update_catalog_sort_key_if_needed(
-    partitions_catalog: &mut dyn PartitionRepo,
-    partition_id: PartitionId,
+async fn update_catalog_sort_key_if_needed<R>(
+    repos: &mut R,
+    id: &TransitionPartitionId,
     sort_key: SortKey,
-) {
+) where
+    R: RepoCollection + ?Sized,
+{
     // Fetch the latest partition info from the catalog
-    let partition = partitions_catalog
-        .get_by_id(partition_id)
+    let partition = partition_lookup(repos, id).await.unwrap().unwrap();
+
+    // fecth column ids from catalog
+    let columns = get_table_columns_by_id(partition.table_id, repos)
         .await
-        .unwrap()
         .unwrap();
 
     // Similarly to what the ingester does, if there's an existing sort key in the catalog, add new
     // columns onto the end
-    match partition.sort_key() {
-        Some(catalog_sort_key) => {
+
+    match (partition.sort_key(), partition.sort_key_ids_none_if_empty()) {
+        (Some(catalog_sort_key), Some(catalog_sort_key_ids)) => {
             let new_sort_key = sort_key.to_columns().collect::<Vec<_>>();
             let (_metadata, update) = adjust_sort_key_columns(&catalog_sort_key, &new_sort_key);
             if let Some(new_sort_key) = update {
-                let new_columns = new_sort_key.to_columns().collect::<Vec<_>>();
+                let new_sort_key = new_sort_key.to_columns().collect::<Vec<_>>();
+                let new_sort_key_ids = columns.ids_for_names(&new_sort_key);
+
                 debug!(
-                    "Updating sort key from {:?} to {:?}",
+                    "Updating (sort_key, sort_key_ids) from ({:?}, {:?}) to ({:?}, {:?})",
                     catalog_sort_key.to_columns().collect::<Vec<_>>(),
-                    &new_columns,
+                    catalog_sort_key_ids,
+                    &new_sort_key,
+                    &new_sort_key_ids,
                 );
-                partitions_catalog
+
+                repos
+                    .partitions()
                     .cas_sort_key(
-                        partition_id,
+                        id,
                         Some(
                             catalog_sort_key
                                 .to_columns()
                                 .map(ToString::to_string)
                                 .collect::<Vec<_>>(),
                         ),
-                        &new_columns,
+                        Some(partition.sort_key_ids),
+                        &new_sort_key,
+                        &new_sort_key_ids,
                     )
                     .await
                     .unwrap();
             }
         }
-        None => {
+        (None, None) => {
             let new_columns = sort_key.to_columns().collect::<Vec<_>>();
             debug!("Updating sort key from None to {:?}", &new_columns);
-            partitions_catalog
-                .cas_sort_key(partition_id, None, &new_columns)
+            let column_ids = columns.ids_for_names(&new_columns);
+            repos
+                .partitions()
+                .cas_sort_key(id, None, None, &new_columns, &column_ids)
                 .await
                 .unwrap();
         }
+        _ => panic!(
+            "sort_key {:?} and sort_key_ids {:?} should be both None or both Some",
+            partition.sort_key(),
+            partition.sort_key_ids_none_if_empty()
+        ),
     }
 }
 
 /// Create parquet file and return file size.
 async fn create_parquet_file(
     store: ParquetStorage,
+    partition_id: &TransitionPartitionId,
     metadata: &IoxMetadata,
     record_batch: RecordBatch,
 ) -> usize {
     let stream = Box::pin(MemoryStream::new(vec![record_batch]));
     let (_meta, file_size) = store
-        .upload(stream, metadata)
+        .upload(stream, partition_id, metadata, unbounded_memory_pool())
         .await
         .expect("persisting parquet file should succeed");
     file_size
@@ -1003,7 +876,6 @@ pub struct TestParquetFile {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Arc<TestNamespace>,
     pub table: Arc<TestTable>,
-    pub shard: Arc<TestShard>,
     pub partition: Arc<TestPartition>,
     pub parquet_file: ParquetFile,
     pub size_override: Option<i64>,
@@ -1024,47 +896,23 @@ impl TestParquetFile {
 
         repos
             .parquet_files()
-            .flag_for_delete(self.parquet_file.id)
+            .create_upgrade_delete(&[self.parquet_file.id], &[], &[], CompactionLevel::Initial)
             .await
-            .unwrap()
+            .unwrap();
     }
 
     /// Get Parquet file schema.
     pub async fn schema(&self) -> Schema {
-        let table_schema = self.table.catalog_schema().await;
-        let column_id_lookup = table_schema.column_id_map();
+        let table_columns = self.table.catalog_columns().await;
+        let column_id_lookup = table_columns.id_map();
         let selection: Vec<_> = self
             .parquet_file
             .column_set
             .iter()
             .map(|id| *column_id_lookup.get(id).unwrap())
             .collect();
-        let table_schema: Schema = table_schema.clone().try_into().unwrap();
+        let table_schema: Schema = table_columns.clone().try_into().unwrap();
         table_schema.select_by_names(&selection).unwrap()
-    }
-}
-
-/// A catalog test tombstone
-#[allow(missing_docs)]
-pub struct TestTombstone {
-    pub catalog: Arc<TestCatalog>,
-    pub namespace: Arc<TestNamespace>,
-    pub tombstone: Tombstone,
-}
-
-impl TestTombstone {
-    /// mark the tombstone proccesed
-    pub async fn mark_processed(self: &Arc<Self>, parquet_file: &TestParquetFile) {
-        assert!(Arc::ptr_eq(&self.catalog, &parquet_file.catalog));
-        assert!(Arc::ptr_eq(&self.namespace, &parquet_file.namespace));
-
-        let mut repos = self.catalog.catalog.repositories().await;
-
-        repos
-            .processed_tombstones()
-            .create(parquet_file.parquet_file.id, self.tombstone.id)
-            .await
-            .unwrap();
     }
 }
 

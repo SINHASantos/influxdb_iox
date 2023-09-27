@@ -1,5 +1,5 @@
-use influxdb_influxql_parser::expression::Expr;
-use influxdb_influxql_parser::select::{Field, SelectStatement};
+use crate::plan::ir::Field;
+use influxdb_influxql_parser::expression::{Call, Expr, VarRef};
 use influxdb_influxql_parser::visit::{Recursion, Visitable, Visitor};
 use std::ops::Deref;
 
@@ -10,19 +10,19 @@ use std::ops::Deref;
 /// are available, falls back to an empty string.
 ///
 /// Derived from [Go implementation](https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L3326-L3328)
-pub(crate) fn field_name(f: &Field) -> String {
+pub(crate) fn field_name(f: &influxdb_influxql_parser::select::Field) -> String {
     if let Some(alias) = &f.alias {
-        return alias.to_string();
+        return alias.deref().to_string();
     }
 
     let mut expr = &f.expr;
     loop {
         expr = match expr {
-            Expr::Call { name, .. } => return name.clone(),
+            Expr::Call(Call { name, .. }) => return name.clone(),
             Expr::Nested(nested) => nested,
             Expr::Binary { .. } => return binary_expr_name(&f.expr),
             Expr::Distinct(_) => return "distinct".to_string(),
-            Expr::VarRef { name, .. } => return name.deref().into(),
+            Expr::VarRef(VarRef { name, .. }) => return name.deref().into(),
             Expr::Wildcard(_) | Expr::BindParameter(_) | Expr::Literal(_) => return "".to_string(),
         };
     }
@@ -40,19 +40,14 @@ pub(crate) fn field_name(f: &Field) -> String {
 /// This implementation duplicates the behavior of the original implementation, including skipping the
 /// first argument. It is likely the original intended to skip the _last_ argument, which is the number
 /// of rows.
-pub(crate) fn field_by_name(select: &SelectStatement, name: &str) -> Option<Field> {
-    select.fields
-        .iter()
-        .find(|f| {
-            field_name(f) == name || match &f.expr {
-                Expr::Call { name: func_name, args } if (func_name.eq_ignore_ascii_case("top")
-                    || func_name.eq_ignore_ascii_case("bottom"))
-                    && args.len() > 2 =>
-                    args[1..].iter().any(|f| matches!(f, Expr::VarRef { name: field_name, .. } if field_name.as_str() == name)),
-                _ => false,
-            }
-        })
-        .cloned()
+pub(super) fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
+    fields.iter().find(|f| f.name == name || match &f.expr {
+        Expr::Call(Call{ name: func_name, args }) if (func_name == "top"
+            || func_name == "bottom")
+            && args.len() > 2 =>
+            args[1..].iter().any(|f| matches!(f, Expr::VarRef(VarRef{ name: field_name, .. }) if field_name.as_str() == name)),
+        _ => false,
+    })
 }
 
 struct BinaryExprNameVisitor<'a>(&'a mut Vec<String>);
@@ -60,14 +55,14 @@ struct BinaryExprNameVisitor<'a>(&'a mut Vec<String>);
 impl<'a> Visitor for BinaryExprNameVisitor<'a> {
     type Error = ();
 
-    fn pre_visit_expr(self, n: &Expr) -> Result<Recursion<Self>, Self::Error> {
-        match n {
-            Expr::Call { name, .. } => self.0.push(name.clone()),
-            Expr::VarRef { name, .. } => self.0.push(name.to_string()),
-            _ => {}
-        };
-
+    fn pre_visit_var_ref(self, n: &VarRef) -> Result<Recursion<Self>, Self::Error> {
+        self.0.push(n.name.to_string());
         Ok(Recursion::Continue(self))
+    }
+
+    fn pre_visit_call(self, n: &Call) -> Result<Recursion<Self>, Self::Error> {
+        self.0.push(n.name.clone());
+        Ok(Recursion::Stop(self))
     }
 }
 
@@ -85,73 +80,91 @@ fn binary_expr_name(expr: &Expr) -> String {
 #[cfg(test)]
 mod test {
     use crate::plan::field::{field_by_name, field_name};
-    use crate::plan::test_utils::{get_first_field, parse_select};
+    use crate::plan::ir;
     use assert_matches::assert_matches;
+    use influxdb_influxql_parser::select::Field;
 
     #[test]
     fn test_field_name() {
-        let f = get_first_field("SELECT usage FROM cpu");
+        let f: Field = "usage".parse().unwrap();
         assert_eq!(field_name(&f), "usage");
 
-        let f = get_first_field("SELECT usage as u2 FROM cpu");
+        let f: Field = "usage as u2".parse().unwrap();
         assert_eq!(field_name(&f), "u2");
 
-        let f = get_first_field("SELECT (usage) FROM cpu");
+        let f: Field = "(usage)".parse().unwrap();
         assert_eq!(field_name(&f), "usage");
 
-        let f = get_first_field("SELECT COUNT(usage) FROM cpu");
+        let f: Field = "COUNT(usage)".parse().unwrap();
         assert_eq!(field_name(&f), "count");
 
-        let f = get_first_field("SELECT COUNT(usage) + SUM(usage_idle) FROM cpu");
-        assert_eq!(field_name(&f), "count_usage_sum_usage_idle");
+        let f: Field = "COUNT(usage) + SUM(usage_idle)".parse().unwrap();
+        assert_eq!(field_name(&f), "count_sum");
 
-        let f = get_first_field("SELECT 1+2 FROM cpu");
+        let f: Field = "1+2".parse().unwrap();
         assert_eq!(field_name(&f), "");
 
-        let f = get_first_field("SELECT 1 + usage FROM cpu");
+        let f: Field = "1 + usage".parse().unwrap();
         assert_eq!(field_name(&f), "usage");
 
-        let f = get_first_field("SELECT /reg/ FROM cpu");
+        let f: Field = "/reg/".parse().unwrap();
         assert_eq!(field_name(&f), "");
 
-        let f = get_first_field("SELECT DISTINCT usage FROM cpu");
+        let f: Field = "DISTINCT usage".parse().unwrap();
         assert_eq!(field_name(&f), "distinct");
 
-        let f = get_first_field("SELECT -usage FROM cpu");
+        let f: Field = "-usage".parse().unwrap();
         assert_eq!(field_name(&f), "usage");
 
         // Doesn't quote keyword
-        let f = get_first_field("SELECT \"user\" FROM cpu");
+        let f: Field = "\"user\"".parse().unwrap();
         assert_eq!(field_name(&f), "user");
     }
 
     #[test]
     fn test_field_by_name() {
-        let stmt = parse_select("SELECT usage, idle FROM cpu");
+        fn parse_fields(exprs: Vec<&str>) -> Vec<ir::Field> {
+            exprs
+                .iter()
+                .map(|s| {
+                    let f: Field = s.parse().unwrap();
+                    let name = field_name(&f);
+                    let data_type = None;
+                    ir::Field {
+                        expr: f.expr,
+                        name,
+                        data_type,
+                    }
+                })
+                .collect()
+        }
+        let stmt = parse_fields(vec!["usage", "idle"]);
         assert_eq!(
             format!("{}", field_by_name(&stmt, "usage").unwrap()),
-            "usage"
+            "usage AS usage"
         );
 
-        let stmt = parse_select("SELECT usage as foo, usage FROM cpu");
+        let stmt = parse_fields(vec!["usage as foo", "usage"]);
         assert_eq!(
             format!("{}", field_by_name(&stmt, "foo").unwrap()),
             "usage AS foo"
         );
 
-        let stmt = parse_select("SELECT top(idle, usage, 5), usage FROM cpu");
+        let stmt = parse_fields(vec!["top(idle, usage, 5)", "usage"]);
         assert_eq!(
             format!("{}", field_by_name(&stmt, "usage").unwrap()),
-            "top(idle, usage, 5)"
+            "top(idle, usage, 5) AS top"
         );
 
-        let stmt = parse_select("SELECT bottom(idle, usage, 5), usage FROM cpu");
+        let stmt = parse_fields(vec!["bottom(idle, usage, 5)", "usage"]);
         assert_eq!(
             format!("{}", field_by_name(&stmt, "usage").unwrap()),
-            "bottom(idle, usage, 5)"
+            "bottom(idle, usage, 5) AS bottom"
         );
 
-        let stmt = parse_select("SELECT top(idle, usage, 5) as foo, usage FROM cpu");
+        // TOP is in uppercase, to ensure we can expect the function name to be
+        // uniformly lowercase.
+        let stmt = parse_fields(vec!["TOP(idle, usage, 5) as foo", "usage"]);
         assert_eq!(
             format!("{}", field_by_name(&stmt, "usage").unwrap()),
             "top(idle, usage, 5) AS foo"
@@ -163,13 +176,16 @@ mod test {
 
         // Not exists
 
-        let stmt = parse_select("SELECT usage, idle FROM cpu");
+        let stmt = parse_fields(vec!["usage", "idle"]);
         assert_matches!(field_by_name(&stmt, "bar"), None);
 
         // Does not match name by first argument to top or bottom, per
         // bug in original implementation.
-        let stmt = parse_select("SELECT top(foo, usage, 5), idle FROM cpu");
+        let stmt = parse_fields(vec!["top(foo, usage, 5)", "idle"]);
         assert_matches!(field_by_name(&stmt, "foo"), None);
-        assert_eq!(format!("{}", field_by_name(&stmt, "idle").unwrap()), "idle");
+        assert_eq!(
+            format!("{}", field_by_name(&stmt, "idle").unwrap()),
+            "idle AS idle"
+        );
     }
 }

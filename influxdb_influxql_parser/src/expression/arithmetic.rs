@@ -2,7 +2,8 @@ use crate::common::ws0;
 use crate::identifier::unquoted_identifier;
 use crate::internal::{expect, Error, ParseError, ParseResult};
 use crate::keywords::keyword;
-use crate::literal::literal_regex;
+use crate::literal::{literal_regex, Duration};
+use crate::timestamp::Timestamp;
 use crate::{
     identifier::{identifier, Identifier},
     literal::Literal,
@@ -18,43 +19,101 @@ use num_traits::cast;
 use std::fmt::{Display, Formatter, Write};
 use std::ops::Neg;
 
+/// Reference to a tag or field key.
+#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct VarRef {
+    /// The name of the tag or field.
+    pub name: Identifier,
+
+    /// An optional data type selection specified using the `::` operator.
+    ///
+    /// When the `::` operator follows an identifier, it instructs InfluxQL to fetch
+    /// only data of the matching data type.
+    ///
+    /// The `::` operator appears after an [`Identifier`] and may be described using
+    /// the following EBNF:
+    ///
+    /// ```text
+    /// variable_ref ::= identifier ( "::" data_type )?
+    /// data_type    ::= "float" | "integer" | "boolean" | "string" | "tag" | "field"
+    /// ```
+    ///
+    /// For example:
+    ///
+    /// ```text
+    /// SELECT foo::field, host::tag, usage_idle::integer, idle::boolean FROM cpu
+    /// ```
+    ///
+    /// Specifies the following:
+    ///
+    /// * `foo::field` will return a field of any data type named `foo`
+    /// * `host::tag` will return a tag named `host`
+    /// * `usage_idle::integer` will return either a float or integer field named `usage_idle`,
+    ///   and casting it to an `integer`
+    /// * `idle::boolean` will return a field named `idle` that has a matching data type of
+    ///    `boolean`
+    pub data_type: Option<VarRefDataType>,
+}
+
+impl Display for VarRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self { name, data_type } = self;
+        write!(f, "{name}")?;
+        if let Some(d) = data_type {
+            write!(f, "::{d}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Function call
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    /// Represents the name of the function call.
+    pub name: String,
+
+    /// Represents the list of arguments to the function call.
+    pub args: Vec<Expr>,
+}
+
+impl Display for Call {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self { name, args } = self;
+        write!(f, "{name}(")?;
+        if !args.is_empty() {
+            let args = args.as_slice();
+            write!(f, "{}", args[0])?;
+            for arg in &args[1..] {
+                write!(f, ", {arg}")?;
+            }
+        }
+        write!(f, ")")
+    }
+}
+
+/// Binary operations, such as `1 + 2`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binary {
+    /// Represents the left-hand side of the binary expression.
+    pub lhs: Box<Expr>,
+    /// Represents the operator to apply to the binary expression.
+    pub op: BinaryOperator,
+    /// Represents the right-hand side of the binary expression.
+    pub rhs: Box<Expr>,
+}
+
+impl Display for Binary {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self { lhs, op, rhs } = self;
+        write!(f, "{lhs} {op} {rhs}")
+    }
+}
+
 /// An InfluxQL arithmetic expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     /// Reference to a tag or field key.
-    VarRef {
-        /// The name of the tag or field.
-        name: Identifier,
-
-        /// An optional data type selection specified using the `::` operator.
-        ///
-        /// When the `::` operator follows an identifier, it instructs InfluxQL to fetch
-        /// only data of the matching data type.
-        ///
-        /// The `::` operator appears after an [`Identifier`] and may be described using
-        /// the following EBNF:
-        ///
-        /// ```text
-        /// variable_ref ::= identifier ( "::" data_type )?
-        /// data_type    ::= "float" | "integer" | "boolean" | "string" | "tag" | "field"
-        /// ```
-        ///
-        /// For example:
-        ///
-        /// ```text
-        /// SELECT foo::field, host::tag, usage_idle::integer, idle::boolean FROM cpu
-        /// ```
-        ///
-        /// Specifies the following:
-        ///
-        /// * `foo::field` will return a field of any data type named `foo`
-        /// * `host::tag` will return a tag named `host`
-        /// * `usage_idle::integer` will return either a float or integer field named `usage_idle`,
-        ///   and casting it to an `integer`
-        /// * `idle::boolean` will return a field named `idle` that has a matching data type of
-        ///    `boolean`
-        data_type: Option<VarRefDataType>,
-    },
+    VarRef(VarRef),
 
     /// BindParameter identifier
     BindParameter(BindParameter),
@@ -69,23 +128,10 @@ pub enum Expr {
     Distinct(Identifier),
 
     /// Function call
-    Call {
-        /// Represents the name of the function call.
-        name: String,
-
-        /// Represents the list of arguments to the function call.
-        args: Vec<Expr>,
-    },
+    Call(Call),
 
     /// Binary operations, such as `1 + 2`.
-    Binary {
-        /// Represents the left-hand side of the binary expression.
-        lhs: Box<Expr>,
-        /// Represents the operator to apply to the binary expression.
-        op: BinaryOperator,
-        /// Represents the right-hand side of the binary expression.
-        rhs: Box<Expr>,
-    },
+    Binary(Binary),
 
     /// Nested expression, such as (foo = 'bar') or (1)
     Nested(Box<Expr>),
@@ -136,33 +182,32 @@ impl From<i32> for Box<Expr> {
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VarRef { name, data_type } => {
-                write!(f, "{name}")?;
-                if let Some(d) = data_type {
-                    write!(f, "::{d}")?;
-                }
-            }
-            Self::BindParameter(v) => write!(f, "{v}")?,
-            Self::Literal(v) => write!(f, "{v}")?,
-            Self::Binary { lhs, op, rhs } => write!(f, "{lhs} {op} {rhs}")?,
-            Self::Nested(e) => write!(f, "({e})")?,
-            Self::Call { name, args } => {
-                write!(f, "{name}(")?;
-                if !args.is_empty() {
-                    let args = args.as_slice();
-                    write!(f, "{}", args[0])?;
-                    for arg in &args[1..] {
-                        write!(f, ", {arg}")?;
-                    }
-                }
-                write!(f, ")")?;
-            }
-            Self::Wildcard(Some(dt)) => write!(f, "*::{dt}")?,
-            Self::Wildcard(None) => f.write_char('*')?,
-            Self::Distinct(ident) => write!(f, "DISTINCT {ident}")?,
+            Self::VarRef(v) => write!(f, "{v}"),
+            Self::BindParameter(v) => write!(f, "{v}"),
+            Self::Literal(v) => write!(f, "{v}"),
+            Self::Binary(v) => write!(f, "{v}"),
+            Self::Nested(v) => write!(f, "({v})"),
+            Self::Call(v) => write!(f, "{v}"),
+            Self::Wildcard(Some(v)) => write!(f, "*::{v}"),
+            Self::Wildcard(None) => f.write_char('*'),
+            Self::Distinct(v) => write!(f, "DISTINCT {v}"),
         }
+    }
+}
 
-        Ok(())
+/// Traits to help creating InfluxQL [`Expr`]s containing
+/// a [`VarRef`].
+pub trait AsVarRefExpr {
+    /// Creates an InfluxQL [`VarRef`] expression.
+    fn to_var_ref_expr(&self) -> Expr;
+}
+
+impl AsVarRefExpr for str {
+    fn to_var_ref_expr(&self) -> Expr {
+        Expr::VarRef(VarRef {
+            name: self.into(),
+            data_type: None,
+        })
     }
 }
 
@@ -386,11 +431,11 @@ where
                 }
             },
             v @ Expr::VarRef { .. } | v @ Expr::Call { .. } | v @ Expr::Nested(..) | v @ Expr::BindParameter(..) => {
-                Expr::Binary {
+                Expr::Binary(Binary {
                     lhs: Box::new(Expr::Literal(Literal::Integer(-1))),
                     op: BinaryOperator::Mul,
                     rhs: Box::new(v),
-                }
+                })
             }
             _ => {
                 return Err(nom::Err::Failure(Error::from_message(
@@ -444,7 +489,7 @@ where
                 cut(preceded(ws0, char(')'))),
             ),
         ),
-        |(name, args)| Expr::Call { name, args },
+        |(name, args)| Expr::Call(Call { name, args }),
     )(i)
 }
 
@@ -512,7 +557,7 @@ pub(crate) fn var_ref(i: &str) -> ParseResult<&str, Expr> {
                 )
             )),
         ),
-        |(name, data_type)| Expr::VarRef { name, data_type },
+        |(name, data_type)| Expr::VarRef(VarRef { name, data_type }),
     )(i)
 }
 
@@ -580,11 +625,66 @@ pub(crate) trait ArithmeticParsers {
 
 /// Folds `expr` and `remainder` into a [Expr::Binary] tree.
 fn reduce_expr(expr: Expr, remainder: Vec<(BinaryOperator, Expr)>) -> Expr {
-    remainder.into_iter().fold(expr, |lhs, val| Expr::Binary {
-        lhs: lhs.into(),
-        op: val.0,
-        rhs: val.1.into(),
+    remainder.into_iter().fold(expr, |lhs, val| {
+        Expr::Binary(Binary {
+            lhs: lhs.into(),
+            op: val.0,
+            rhs: val.1.into(),
+        })
     })
+}
+
+/// Trait for converting a type to a [`Expr::Literal`] expression.
+pub trait LiteralExpr {
+    /// Convert the receiver to a literal expression.
+    fn lit(self) -> Expr;
+}
+
+/// Convert `v` to a literal expression.
+pub fn lit<T: LiteralExpr>(v: T) -> Expr {
+    v.lit()
+}
+
+impl LiteralExpr for Literal {
+    fn lit(self) -> Expr {
+        Expr::Literal(self)
+    }
+}
+
+impl LiteralExpr for Duration {
+    fn lit(self) -> Expr {
+        Expr::Literal(Literal::Duration(self))
+    }
+}
+
+impl LiteralExpr for bool {
+    fn lit(self) -> Expr {
+        Expr::Literal(Literal::Boolean(self))
+    }
+}
+
+impl LiteralExpr for i64 {
+    fn lit(self) -> Expr {
+        Expr::Literal(Literal::Integer(self))
+    }
+}
+
+impl LiteralExpr for f64 {
+    fn lit(self) -> Expr {
+        Expr::Literal(Literal::Float(self))
+    }
+}
+
+impl LiteralExpr for String {
+    fn lit(self) -> Expr {
+        Expr::Literal(Literal::String(self))
+    }
+}
+
+impl LiteralExpr for Timestamp {
+    fn lit(self) -> Expr {
+        Expr::Literal(Literal::Timestamp(self))
+    }
 }
 
 #[cfg(test)]
@@ -905,18 +1005,18 @@ mod test {
     #[test]
     fn test_var_ref_display() {
         assert_eq!(
-            Expr::VarRef {
+            Expr::VarRef(VarRef {
                 name: "foo".into(),
                 data_type: None
-            }
+            })
             .to_string(),
             "foo"
         );
         assert_eq!(
-            Expr::VarRef {
+            Expr::VarRef(VarRef {
                 name: "foo".into(),
                 data_type: Some(VarRefDataType::Field)
-            }
+            })
             .to_string(),
             "foo::field"
         );

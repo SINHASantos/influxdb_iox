@@ -3,6 +3,13 @@
 // control over.
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #![allow(clippy::derive_partial_eq_without_eq, clippy::needless_borrow)]
+#![warn(unused_crate_dependencies)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
+// Re-export prost for users of proto types.
+pub use prost;
 
 /// This module imports the generated protobuf code into a Rust module
 /// hierarchy that matches the namespace hierarchy of the protobuf
@@ -85,6 +92,55 @@ pub mod influxdata {
             }
         }
 
+        pub mod gossip {
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/influxdata.iox.gossip.v1.rs"));
+            }
+
+            /// The set of topics used for IOx gossiping.
+            ///
+            /// NOTE: Don't renumber topics. Don't re-use numbers. Use the range
+            /// 0 to 63 for numbers.
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub enum Topic {
+                /// New namespace, table, and column additions observed and
+                /// broadcast by the routers.
+                SchemaChanges = 1,
+
+                /// Parquet file creation notifications.
+                NewParquetFiles = 2,
+
+                /// Compaction round completion notifications.
+                CompactionEvents = 3,
+
+                /// Schema cache consistency check / sync / convergence
+                /// messages.
+                SchemaCacheConsistency = 4,
+            }
+
+            impl TryFrom<u64> for Topic {
+                type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+                fn try_from(v: u64) -> Result<Self, Self::Error> {
+                    Ok(match v {
+                        v if v == Self::SchemaChanges as u64 => Self::SchemaChanges,
+                        v if v == Self::NewParquetFiles as u64 => Self::NewParquetFiles,
+                        v if v == Self::CompactionEvents as u64 => Self::CompactionEvents,
+                        v if v == Self::SchemaCacheConsistency as u64 => {
+                            Self::SchemaCacheConsistency
+                        }
+                        _ => return Err(format!("unknown topic id {}", v).into()),
+                    })
+                }
+            }
+
+            impl From<Topic> for u64 {
+                fn from(v: Topic) -> u64 {
+                    v as u64
+                }
+            }
+        }
+
         pub mod ingester {
             pub mod v1 {
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.ingester.v1.rs"));
@@ -118,6 +174,19 @@ pub mod influxdata {
             }
         }
 
+        pub mod partition_template {
+            pub mod v1 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/influxdata.iox.partition_template.v1.rs"
+                ));
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/influxdata.iox.partition_template.v1.serde.rs"
+                ));
+            }
+        }
+
         pub mod predicate {
             pub mod v1 {
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.predicate.v1.rs"));
@@ -145,34 +214,15 @@ pub mod influxdata {
                     env!("OUT_DIR"),
                     "/influxdata.iox.schema.v1.serde.rs"
                 ));
-
-                impl TryFrom<column_schema::ColumnType> for data_types::ColumnType {
-                    type Error = Box<dyn std::error::Error>;
-
-                    fn try_from(value: column_schema::ColumnType) -> Result<Self, Self::Error> {
-                        Ok(match value {
-                            column_schema::ColumnType::I64 => data_types::ColumnType::I64,
-                            column_schema::ColumnType::U64 => data_types::ColumnType::U64,
-                            column_schema::ColumnType::F64 => data_types::ColumnType::F64,
-                            column_schema::ColumnType::Bool => data_types::ColumnType::Bool,
-                            column_schema::ColumnType::String => data_types::ColumnType::String,
-                            column_schema::ColumnType::Time => data_types::ColumnType::Time,
-                            column_schema::ColumnType::Tag => data_types::ColumnType::Tag,
-                            column_schema::ColumnType::Unspecified => {
-                                return Err("unknown column type".into())
-                            }
-                        })
-                    }
-                }
             }
         }
 
-        pub mod sharder {
+        pub mod table {
             pub mod v1 {
-                include!(concat!(env!("OUT_DIR"), "/influxdata.iox.sharder.v1.rs"));
+                include!(concat!(env!("OUT_DIR"), "/influxdata.iox.table.v1.rs"));
                 include!(concat!(
                     env!("OUT_DIR"),
-                    "/influxdata.iox.sharder.v1.serde.rs"
+                    "/influxdata.iox.table.v1.serde.rs"
                 ));
             }
         }
@@ -181,32 +231,6 @@ pub mod influxdata {
             pub mod v1 {
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.wal.v1.rs"));
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.wal.v1.serde.rs"));
-            }
-        }
-
-        pub mod write_buffer {
-            pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/influxdata.iox.write_buffer.v1.rs"
-                ));
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/influxdata.iox.write_buffer.v1.serde.rs"
-                ));
-            }
-        }
-
-        pub mod write_summary {
-            pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/influxdata.iox.write_summary.v1.rs"
-                ));
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/influxdata.iox.write_summary.v1.serde.rs"
-                ));
             }
         }
     }
@@ -275,19 +299,12 @@ pub use influxdata::platform::storage::*;
 
 pub mod google;
 
-#[cfg(any(feature = "data_types_conversions", test))]
-pub mod compactor;
-#[cfg(any(feature = "data_types_conversions", test))]
-pub mod delete_predicate;
-#[cfg(any(feature = "data_types_conversions", test))]
-pub mod ingester;
-#[cfg(any(feature = "data_types_conversions", test))]
-pub mod write_info;
-
 pub use prost::{DecodeError, EncodeError};
 
 #[cfg(test)]
 mod tests {
+    use crate::influxdata::iox::gossip::Topic;
+
     use super::*;
 
     #[test]
@@ -307,38 +324,28 @@ mod tests {
     }
 
     #[test]
-    fn test_column_schema() {
-        use influxdata::iox::schema::v1::*;
+    fn test_gossip_topics() {
+        let topics = [
+            Topic::SchemaChanges,
+            Topic::NewParquetFiles,
+            Topic::CompactionEvents,
+            Topic::SchemaCacheConsistency,
+        ];
 
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::I64).unwrap(),
-            data_types::ColumnType::I64,
-        );
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::U64).unwrap(),
-            data_types::ColumnType::U64,
-        );
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::F64).unwrap(),
-            data_types::ColumnType::F64,
-        );
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::Bool).unwrap(),
-            data_types::ColumnType::Bool,
-        );
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::String).unwrap(),
-            data_types::ColumnType::String,
-        );
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::Time).unwrap(),
-            data_types::ColumnType::Time,
-        );
-        assert_eq!(
-            data_types::ColumnType::try_from(column_schema::ColumnType::Tag).unwrap(),
-            data_types::ColumnType::Tag,
-        );
+        for topic in topics {
+            let v = u64::from(topic);
+            let got = Topic::try_from(v).expect("failed to round-trip topic");
+            assert_eq!(got, topic);
+        }
 
-        assert!(data_types::ColumnType::try_from(column_schema::ColumnType::Unspecified).is_err());
+        // Adding a new topic? Add it to the test cases too and then add it to
+        // this match (that forces a compile-time error and makes you read this
+        // message).
+        match topics[0] {
+            Topic::SchemaChanges => {}
+            Topic::NewParquetFiles => {}
+            Topic::CompactionEvents => {}
+            Topic::SchemaCacheConsistency => {}
+        }
     }
 }

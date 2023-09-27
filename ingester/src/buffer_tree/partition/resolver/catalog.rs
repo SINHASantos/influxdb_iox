@@ -5,15 +5,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
-use data_types::{NamespaceId, Partition, PartitionKey, ShardId, TableId};
+use data_types::{
+    build_sort_key_from_sort_key_ids_and_columns, Column, NamespaceId, Partition, PartitionKey,
+    TableId,
+};
 use iox_catalog::interface::Catalog;
 use observability_deps::tracing::debug;
+use parking_lot::Mutex;
 
 use super::r#trait::PartitionProvider;
 use crate::{
     buffer_tree::{
-        partition::{PartitionData, SortKeyState},
-        table::TableName,
+        namespace::NamespaceName,
+        partition::{counter::PartitionCounter, PartitionData, SortKeyState},
+        table::metadata::TableMetadata,
     },
     deferred_load::DeferredLoad,
 };
@@ -40,14 +45,25 @@ impl CatalogPartitionResolver {
     async fn get(
         &self,
         partition_key: PartitionKey,
-        shard_id: ShardId,
         table_id: TableId,
     ) -> Result<Partition, iox_catalog::interface::Error> {
         self.catalog
             .repositories()
             .await
             .partitions()
-            .create_or_get(partition_key, shard_id, table_id)
+            .create_or_get(partition_key, table_id)
+            .await
+    }
+
+    async fn get_columns(
+        &self,
+        table_id: TableId,
+    ) -> Result<Vec<Column>, iox_catalog::interface::Error> {
+        self.catalog
+            .repositories()
+            .await
+            .columns()
+            .list_by_table_id(table_id)
             .await
     }
 }
@@ -57,48 +73,77 @@ impl PartitionProvider for CatalogPartitionResolver {
     async fn get_partition(
         &self,
         partition_key: PartitionKey,
-        shard_id: ShardId,
         namespace_id: NamespaceId,
+        namespace_name: Arc<DeferredLoad<NamespaceName>>,
         table_id: TableId,
-        table_name: Arc<DeferredLoad<TableName>>,
-    ) -> PartitionData {
+        table: Arc<DeferredLoad<TableMetadata>>,
+        partition_counter: Arc<PartitionCounter>,
+    ) -> Arc<Mutex<PartitionData>> {
         debug!(
             %partition_key,
-            %shard_id, %table_id, %table_name, "upserting partition in catalog"
+            %table_id,
+            %table,
+            "upserting partition in catalog"
         );
         let p = Backoff::new(&self.backoff_config)
             .retry_all_errors("resolve partition", || {
-                self.get(partition_key.clone(), shard_id, table_id)
+                self.get(partition_key.clone(), table_id)
             })
             .await
             .expect("retry forever");
 
-        PartitionData::new(
-            p.id,
+        let p_sort_key = p.sort_key();
+        let p_sort_key_ids = p.sort_key_ids_none_if_empty();
+
+        // fetch columns of the table to build sort_key from sort_key_ids
+        let columns = Backoff::new(&self.backoff_config)
+            .retry_all_errors("resolve partition's table columns", || {
+                self.get_columns(table_id)
+            })
+            .await
+            .expect("retry forever");
+
+        // build sort_key from sort_key_ids and columns
+        let sort_key =
+            build_sort_key_from_sort_key_ids_and_columns(&p_sort_key_ids, columns.into_iter());
+
+        // This is here to catch bugs and will be removed once the sort_key is removed from the partition
+        assert_eq!(sort_key, p_sort_key);
+
+        Arc::new(Mutex::new(PartitionData::new(
+            p.transition_partition_id(),
             // Use the caller's partition key instance, as it MAY be shared with
             // other instance, but the instance returned from the catalog
             // definitely has no other refs.
             partition_key,
-            shard_id,
             namespace_id,
+            namespace_name,
             table_id,
-            table_name,
-            SortKeyState::Provided(p.sort_key()),
-            p.persisted_sequence_number,
-        )
+            table,
+            SortKeyState::Provided(sort_key, p_sort_key_ids.cloned()),
+            partition_counter,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    // Harmless in tests - saves a bunch of extra vars.
+    #![allow(clippy::await_holding_lock)]
+
+    use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
     use assert_matches::assert_matches;
-    use data_types::ShardIndex;
+    use iox_catalog::{
+        partition_lookup,
+        test_helpers::{arbitrary_namespace, arbitrary_table},
+    };
 
     use super::*;
+    use crate::buffer_tree::table::metadata::TableName;
 
     const TABLE_NAME: &str = "bananas";
+    const NAMESPACE_NAME: &str = "ns-bananas";
     const PARTITION_KEY: &str = "platanos";
 
     #[tokio::test]
@@ -107,29 +152,13 @@ mod tests {
         let catalog: Arc<dyn Catalog> =
             Arc::new(iox_catalog::mem::MemCatalog::new(Arc::clone(&metrics)));
 
-        let (shard_id, namespace_id, table_id) = {
+        let (namespace_id, table_id) = {
             let mut repos = catalog.repositories().await;
-            let t = repos.topics().create_or_get("platanos").await.unwrap();
-            let q = repos.query_pools().create_or_get("platanos").await.unwrap();
-            let ns = repos
-                .namespaces()
-                .create(TABLE_NAME, None, t.id, q.id)
-                .await
-                .unwrap();
+            let ns = arbitrary_namespace(&mut *repos, NAMESPACE_NAME).await;
 
-            let shard = repos
-                .shards()
-                .create_or_get(&t, ShardIndex::new(0))
-                .await
-                .unwrap();
+            let table = arbitrary_table(&mut *repos, TABLE_NAME, &ns).await;
 
-            let table = repos
-                .tables()
-                .create_or_get(TABLE_NAME, ns.id)
-                .await
-                .unwrap();
-
-            (shard.id, ns.id, table.id)
+            (ns.id, table.id)
         };
 
         let callers_partition_key = PartitionKey::from(PARTITION_KEY);
@@ -138,33 +167,44 @@ mod tests {
         let got = resolver
             .get_partition(
                 callers_partition_key.clone(),
-                shard_id,
                 namespace_id,
+                Arc::new(DeferredLoad::new(
+                    Duration::from_secs(1),
+                    async { NamespaceName::from(NAMESPACE_NAME) },
+                    &metrics,
+                )),
                 table_id,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
+                Arc::new(DeferredLoad::new(
+                    Duration::from_secs(1),
+                    async {
+                        TableMetadata::new_for_testing(
+                            TableName::from(TABLE_NAME),
+                            Default::default(),
+                        )
+                    },
+                    &metrics,
+                )),
+                Arc::new(PartitionCounter::new(NonZeroUsize::new(1).unwrap())),
             )
             .await;
 
         // Ensure the table name is available.
-        let _ = got.table_name().get().await;
+        let _ = got.lock().table().get().await.name();
 
-        assert_eq!(got.namespace_id(), namespace_id);
-        assert_eq!(got.table_name().to_string(), table_name.to_string());
-        assert_matches!(got.sort_key(), SortKeyState::Provided(None));
-        assert_eq!(got.max_persisted_sequence_number(), None);
-        assert!(got.partition_key.ptr_eq(&callers_partition_key));
+        assert_eq!(got.lock().namespace_id(), namespace_id);
+        assert_eq!(
+            got.lock().table().get().await.name().to_string(),
+            table_name.to_string()
+        );
+        assert_matches!(got.lock().sort_key(), SortKeyState::Provided(None, None));
+        assert!(got.lock().partition_key.ptr_eq(&callers_partition_key));
 
-        let got = catalog
-            .repositories()
-            .await
-            .partitions()
-            .get_by_id(got.partition_id)
+        let mut repos = catalog.repositories().await;
+        let id = got.lock().partition_id.clone();
+        let got = partition_lookup(repos.as_mut(), &id)
             .await
             .unwrap()
             .expect("partition not created");
-        assert_eq!(got.shard_id, shard_id);
         assert_eq!(got.table_id, table_id);
         assert_eq!(got.partition_key, PartitionKey::from(PARTITION_KEY));
     }

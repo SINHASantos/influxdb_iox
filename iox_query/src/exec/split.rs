@@ -63,11 +63,12 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
     logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
+    physical_expr::PhysicalSortRequirement,
     physical_plan::{
         expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
-        ColumnarValue, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
-        SendableRecordBatchStream, Statistics,
+        ColumnarValue, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+        PhysicalExpr, SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };
@@ -206,6 +207,17 @@ impl ExecutionPlan for StreamSplitExec {
         vec![Distribution::SinglePartition]
     }
 
+    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+        // require that the output ordering of the child is preserved
+        // (so that this node logically splits what was desired)
+        let requirement = self
+            .input
+            .output_ordering()
+            .map(PhysicalSortRequirement::from_sort_exprs);
+
+        vec![requirement]
+    }
+
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![Arc::clone(&self.input)]
     }
@@ -255,14 +267,6 @@ impl ExecutionPlan for StreamSplitExec {
         }
     }
 
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(f, "StreamSplitExec")
-            }
-        }
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -271,6 +275,16 @@ impl ExecutionPlan for StreamSplitExec {
         // For now, don't return any statistics (in the future we
         // could potentially estimate the output cardinalities)
         Statistics::default()
+    }
+}
+
+impl DisplayAs for StreamSplitExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "StreamSplitExec")
+            }
+        }
     }
 }
 
@@ -473,7 +487,7 @@ fn negate(v: &ColumnarValue) -> Result<ColumnarValue> {
             } else {
                 let msg = format!(
                     "Expected boolean literal, but got type {:?}",
-                    val.get_datatype()
+                    val.data_type()
                 );
                 Err(DataFusionError::Internal(msg))
             }
@@ -498,8 +512,8 @@ fn and(left: &ColumnarValue, right: &ColumnarValue) -> Result<ColumnarValue> {
             } else {
                 let msg = format!(
                     "Expected two boolean literals, but got type {:?} and type {:?}",
-                    val_left.get_datatype(),
-                    val_right.get_datatype()
+                    val_left.data_type(),
+                    val_right.data_type()
                 );
                 Err(DataFusionError::Internal(msg))
             }

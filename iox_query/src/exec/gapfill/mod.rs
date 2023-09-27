@@ -2,6 +2,7 @@
 //! a gap-filling extension to DataFusion
 
 mod algo;
+mod buffered_input;
 #[cfg(test)]
 mod exec_tests;
 mod params;
@@ -19,11 +20,14 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::{context::TaskContext, memory_pool::MemoryConsumer},
     logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
-    physical_expr::{create_physical_expr, execution_props::ExecutionProps, PhysicalSortExpr},
+    physical_expr::{
+        create_physical_expr, execution_props::ExecutionProps, PhysicalSortExpr,
+        PhysicalSortRequirement,
+    },
     physical_plan::{
         expressions::Column,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
-        DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
         SendableRecordBatchStream, Statistics,
     },
     prelude::Expr,
@@ -34,21 +38,26 @@ use self::stream::GapFillStream;
 /// A logical node that represents the gap filling operation.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct GapFill {
-    input: Arc<LogicalPlan>,
-    group_expr: Vec<Expr>,
-    aggr_expr: Vec<Expr>,
-    params: GapFillParams,
+    /// The incoming logical plan
+    pub input: Arc<LogicalPlan>,
+    /// Grouping expressions
+    pub group_expr: Vec<Expr>,
+    /// Aggregate expressions
+    pub aggr_expr: Vec<Expr>,
+    /// Parameters to configure the behavior of the
+    /// gap-filling operation
+    pub params: GapFillParams,
 }
 
 /// Parameters to the GapFill operation
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct GapFillParams {
+pub struct GapFillParams {
     /// The stride argument from the call to DATE_BIN_GAPFILL
     pub stride: Expr,
     /// The source time column
     pub time_column: Expr,
     /// The origin argument from the call to DATE_BIN_GAPFILL
-    pub origin: Expr,
+    pub origin: Option<Expr>,
     /// The time range of the time column inferred from predicates
     /// in the overall query. The lower bound may be [`Bound::Unbounded`]
     /// which implies that gap-filling should just start from the
@@ -67,26 +76,25 @@ pub enum FillStrategy {
     /// This is the InfluxQL behavior for `FILL(NULL)` or `FILL(NONE)`.
     Null,
     /// Fill with the most recent value in the input column.
-    Prev,
+    /// Null values in the input are preserved.
+    #[allow(dead_code)]
+    PrevNullAsIntentional,
     /// Fill with the most recent non-null value in the input column.
     /// This is the InfluxQL behavior for `FILL(PREVIOUS)`.
-    #[allow(dead_code)]
     PrevNullAsMissing,
     /// Fill the gaps between points linearly.
     /// Null values will not be considered as missing, so two non-null values
     /// with a null in between will not be filled.
-    #[allow(dead_code)]
     LinearInterpolate,
 }
 
 impl GapFillParams {
     // Extract the expressions so they can be optimized.
     fn expressions(&self) -> Vec<Expr> {
-        let mut exprs = vec![
-            self.stride.clone(),
-            self.time_column.clone(),
-            self.origin.clone(),
-        ];
+        let mut exprs = vec![self.stride.clone(), self.time_column.clone()];
+        if let Some(e) = self.origin.as_ref() {
+            exprs.push(e.clone())
+        }
         if let Some(start) = bound_extract(&self.time_range.start) {
             exprs.push(start.clone());
         }
@@ -107,7 +115,7 @@ impl GapFillParams {
         let mut iter = exprs.iter().cloned();
         let stride = iter.next().unwrap();
         let time_column = iter.next().unwrap();
-        let origin = iter.next().unwrap();
+        let origin = self.origin.as_ref().map(|_| iter.next().unwrap());
         let time_range = try_map_range(&self.time_range, |b| {
             try_map_bound(b.as_ref(), |_| {
                 Ok(iter.next().expect("expr count should match template"))
@@ -149,7 +157,8 @@ impl GapFillParams {
 }
 
 impl GapFill {
-    pub(crate) fn try_new(
+    /// Create a new gap-filling operator.
+    pub fn try_new(
         input: Arc<LogicalPlan>,
         group_expr: Vec<Expr>,
         aggr_expr: Vec<Expr>,
@@ -207,19 +216,25 @@ impl UserDefinedLogicalNodeCore for GapFill {
             .fill_strategy
             .iter()
             .map(|(e, fs)| match fs {
-                FillStrategy::Prev => format!("LOCF({})", e),
-                FillStrategy::PrevNullAsMissing => format!("LOCF(null-as-missing, {})", e),
+                FillStrategy::PrevNullAsIntentional => format!("LOCF(null-as-intentional, {})", e),
+                FillStrategy::PrevNullAsMissing => format!("LOCF({})", e),
                 FillStrategy::LinearInterpolate => format!("INTERPOLATE({})", e),
                 FillStrategy::Null => e.to_string(),
             })
             .collect::<Vec<String>>()
             .join(", ");
+
+        let group_expr = self
+            .group_expr
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+
         write!(
             f,
-            "{}: groupBy=[{:?}], aggr=[[{}]], time_column={}, stride={}, range={:?}",
+            "{}: groupBy=[{group_expr}], aggr=[[{aggr_expr}]], time_column={}, stride={}, range={:?}",
             self.name(),
-            self.group_expr,
-            aggr_expr,
             self.params.time_column,
             self.params.stride,
             self.params.time_range,
@@ -289,12 +304,12 @@ pub(crate) fn plan_gap_fill(
         })
     })?;
 
-    let origin = create_physical_expr(
-        &gap_fill.params.origin,
-        input_dfschema,
-        input_schema,
-        execution_props,
-    )?;
+    let origin = gap_fill
+        .params
+        .origin
+        .as_ref()
+        .map(|e| create_physical_expr(e, input_dfschema, input_schema, execution_props))
+        .transpose()?;
 
     let fill_strategy = gap_fill
         .params
@@ -374,7 +389,7 @@ struct GapFillExecParams {
     /// The timestamp column produced by date_bin
     time_column: Column,
     /// The origin argument from the all to DATE_BIN_GAPFILL
-    origin: Arc<dyn PhysicalExpr>,
+    origin: Option<Arc<dyn PhysicalExpr>>,
     /// The time range of source input to DATE_BIN_GAPFILL.
     /// Inferred from predicates in the overall query.
     time_range: Range<Bound<Arc<dyn PhysicalExpr>>>,
@@ -463,8 +478,10 @@ impl ExecutionPlan for GapFillExec {
         self.input.output_ordering()
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<&[PhysicalSortExpr]>> {
-        vec![Some(&self.sort_expr)]
+    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+        vec![Some(PhysicalSortRequirement::from_sort_exprs(
+            &self.sort_expr,
+        ))]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -517,17 +534,25 @@ impl ExecutionPlan for GapFillExec {
         )?))
     }
 
+    fn statistics(&self) -> Statistics {
+        Statistics::default()
+    }
+}
+
+impl DisplayAs for GapFillExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let group_expr: Vec<_> = self.group_expr.iter().map(|e| e.to_string()).collect();
                 let aggr_expr: Vec<_> = self
                     .params
                     .fill_strategy
                     .iter()
                     .map(|(e, fs)| match fs {
-                        FillStrategy::Prev => format!("LOCF({})", e),
-                        FillStrategy::PrevNullAsMissing => format!("LOCF(null-as-missing, {})", e),
+                        FillStrategy::PrevNullAsIntentional => {
+                            format!("LOCF(null-as-intentional, {})", e)
+                        }
+                        FillStrategy::PrevNullAsMissing => format!("LOCF({})", e),
                         FillStrategy::LinearInterpolate => format!("INTERPOLATE({})", e),
                         FillStrategy::Null => e.to_string(),
                     })
@@ -546,10 +571,6 @@ impl ExecutionPlan for GapFillExec {
                 )
             }
         }
-    }
-
-    fn statistics(&self) -> Statistics {
-        Statistics::default()
     }
 }
 
@@ -605,7 +626,7 @@ mod test {
             GapFillParams {
                 stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
                 time_column: col("time"),
-                origin: lit_timestamp_nano(0),
+                origin: None,
                 time_range: Range {
                     start: Bound::Included(lit_timestamp_nano(1000)),
                     end: Bound::Unbounded,
@@ -623,7 +644,8 @@ mod test {
         let exprs = gapfill_as_node.expressions();
         let want_exprs = gapfill.group_expr.len()
             + gapfill.aggr_expr.len()
-            + 3 // stride, time, origin
+            + 2 // stride, time
+            + gapfill.params.origin.iter().count()
             + bound_extract(&gapfill.params.time_range.start).iter().count()
             + bound_extract(&gapfill.params.time_range.end).iter().count();
         assert_eq!(want_exprs, exprs.len());
@@ -639,14 +661,50 @@ mod test {
 
     #[test]
     fn test_from_template() {
-        for time_range in vec![
-            Range {
-                start: Bound::Included(lit_timestamp_nano(1000)),
-                end: Bound::Excluded(lit_timestamp_nano(2000)),
+        for params in vec![
+            // no origin, no start bound
+            GapFillParams {
+                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                time_column: col("time"),
+                origin: None,
+                time_range: Range {
+                    start: Bound::Unbounded,
+                    end: Bound::Excluded(lit_timestamp_nano(2000)),
+                },
+                fill_strategy: fill_strategy_null(vec![col("temp")]),
             },
-            Range {
-                start: Bound::Unbounded,
-                end: Bound::Excluded(lit_timestamp_nano(2000)),
+            // no origin, yes start bound
+            GapFillParams {
+                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                time_column: col("time"),
+                origin: None,
+                time_range: Range {
+                    start: Bound::Included(lit_timestamp_nano(1000)),
+                    end: Bound::Excluded(lit_timestamp_nano(2000)),
+                },
+                fill_strategy: fill_strategy_null(vec![col("temp")]),
+            },
+            // yes origin, no start bound
+            GapFillParams {
+                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                time_column: col("time"),
+                origin: Some(lit_timestamp_nano(1_000_000_000)),
+                time_range: Range {
+                    start: Bound::Unbounded,
+                    end: Bound::Excluded(lit_timestamp_nano(2000)),
+                },
+                fill_strategy: fill_strategy_null(vec![col("temp")]),
+            },
+            // yes origin, yes start bound
+            GapFillParams {
+                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                time_column: col("time"),
+                origin: Some(lit_timestamp_nano(1_000_000_000)),
+                time_range: Range {
+                    start: Bound::Included(lit_timestamp_nano(1000)),
+                    end: Bound::Excluded(lit_timestamp_nano(2000)),
+                },
+                fill_strategy: fill_strategy_null(vec![col("temp")]),
             },
         ] {
             let scan = table_scan().unwrap();
@@ -654,13 +712,7 @@ mod test {
                 Arc::new(scan.clone()),
                 vec![col("loc"), col("time")],
                 vec![col("temp")],
-                GapFillParams {
-                    stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
-                    time_column: col("time"),
-                    origin: lit_timestamp_nano(0),
-                    time_range,
-                    fill_strategy: fill_strategy_null(vec![col("temp")]),
-                },
+                params,
             )
             .unwrap();
             assert_gapfill_from_template_roundtrip(&gapfill);
@@ -680,7 +732,7 @@ mod test {
             GapFillParams {
                 stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
                 time_column: col("time"),
-                origin: lit_timestamp_nano(0),
+                origin: None,
                 time_range: Range {
                     start: Bound::Included(lit_timestamp_nano(1000)),
                     end: Bound::Excluded(lit_timestamp_nano(2000)),
@@ -696,7 +748,7 @@ mod test {
             format_logical_plan(&plan),
             @r###"
         ---
-        - " GapFill: groupBy=[[loc, time]], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(TimestampNanosecond(1000, None))..Excluded(TimestampNanosecond(2000, None))"
+        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "   TableScan: temps"
         "###
         );
@@ -727,14 +779,12 @@ mod test {
             explain,
             @r###"
         ---
-        - " ProjectionExec: expr=[date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as minute, AVG(temps.temp)@1 as AVG(temps.temp)]"
-        - "   GapFillExec: group_expr=[date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0], aggr_expr=[AVG(temps.temp)@1], stride=60000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
-        - "     SortExec: expr=[date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 ASC]"
-        - "       AggregateExec: mode=Final, gby=[date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
-        - "         AggregateExec: mode=Partial, gby=[datebin(60000, time@0, 0) as date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
-        - "           CoalesceBatchesExec: target_batch_size=8192"
-        - "             FilterExec: time@0 >= 315532800000000000 AND time@0 < 347155200000000000"
-        - "               EmptyExec: produce_one_row=false"
+        - " ProjectionExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as minute, AVG(temps.temp)@1 as AVG(temps.temp)]"
+        - "   GapFillExec: group_expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0], aggr_expr=[AVG(temps.temp)@1], stride=60000000000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
+        - "     SortExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 ASC]"
+        - "       AggregateExec: mode=Final, gby=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
+        - "         AggregateExec: mode=Partial, gby=[date_bin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
+        - "           EmptyExec: produce_one_row=false"
         "###
         );
         Ok(())
@@ -759,14 +809,12 @@ mod test {
             explain,
             @r###"
         ---
-        - " ProjectionExec: expr=[loc@0 as loc, date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as minute, concat(Utf8(\"zz\"),temps.loc)@2 as loczz, AVG(temps.temp)@3 as AVG(temps.temp)]"
-        - "   GapFillExec: group_expr=[loc@0, date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1, concat(Utf8(\"zz\"),temps.loc)@2], aggr_expr=[AVG(temps.temp)@3], stride=60000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
-        - "     SortExec: expr=[loc@0 ASC,concat(Utf8(\"zz\"),temps.loc)@2 ASC,date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC]"
-        - "       AggregateExec: mode=Final, gby=[loc@0 as loc, date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(Utf8(\"zz\"),temps.loc)@2 as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
-        - "         AggregateExec: mode=Partial, gby=[loc@1 as loc, datebin(60000, time@0, 0) as date_bin_gapfill(IntervalDayTime(\"60000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
-        - "           CoalesceBatchesExec: target_batch_size=8192"
-        - "             FilterExec: time@0 >= 315532800000000000 AND time@0 < 347155200000000000"
-        - "               EmptyExec: produce_one_row=false"
+        - " ProjectionExec: expr=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as minute, concat(Utf8(\"zz\"),temps.loc)@2 as loczz, AVG(temps.temp)@3 as AVG(temps.temp)]"
+        - "   GapFillExec: group_expr=[loc@0, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1, concat(Utf8(\"zz\"),temps.loc)@2], aggr_expr=[AVG(temps.temp)@3], stride=60000000000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
+        - "     SortExec: expr=[loc@0 ASC,concat(Utf8(\"zz\"),temps.loc)@2 ASC,date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC]"
+        - "       AggregateExec: mode=Final, gby=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(Utf8(\"zz\"),temps.loc)@2 as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
+        - "         AggregateExec: mode=Partial, gby=[loc@1 as loc, date_bin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
+        - "           EmptyExec: produce_one_row=false"
         "###
         );
         Ok(())

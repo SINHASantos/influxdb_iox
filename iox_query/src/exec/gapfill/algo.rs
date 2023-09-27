@@ -7,7 +7,7 @@ use std::{ops::Range, sync::Arc};
 
 use arrow::{
     array::{Array, ArrayRef, TimestampNanosecondArray, UInt64Array},
-    compute::{kernels::take, SortColumn},
+    compute::{kernels::take, partition},
     datatypes::SchemaRef,
     record_batch::RecordBatch,
 };
@@ -45,16 +45,19 @@ use super::{params::GapFillParams, FillStrategy};
 ///  │                    ╟────╫───┼───┼─────────────╫───┼───┼─────────────╢
 ///  │                  2 ║    ║   │   │             ║   │   │             ║
 ///  │                    ╟────╫───┼───┼─────────────╫───┼───┼─────────────╢
-///  │                  3 ║    ║   │   │             ║   │   │             ║
 ///  │                      .                .                     .
 /// output_batch_size       .                .                     .
 ///  │                      .                .                     .
+///  │                    ╟────╫───┼───┼─────────────╫───┼───┼─────────────╢
 ///  │              n - 1 ║    ║   │   │             ║   │   │             ║
 ///  │                    ╟────╫───┼───┼─────────────╫───┼───┼─────────────╢
 ///  ┴────              n ║    ║   │   │             ║   │   │             ║
 ///                       ╟────╫───┼───┼─────────────╫───┼───┼─────────────╢
-/// trailing row    n + 1 ║    ║   │   │             ║   │   │             ║
-///                       ╙────╨───┴───┴─────────────╨───┴───┴─────────────╜
+/// trailing row(s) n + 1 ║    ║   │   │             ║   │   │             ║
+///                       ╟────╫───┼───┼─────────────╫───┼───┼─────────────╢
+///                         .                .                     .
+///                         .                .                     .
+///                         .                .                     .
 /// ```
 ///
 /// Just before generating output, the cursor will generally point at offset 1
@@ -69,13 +72,19 @@ use super::{params::GapFillParams, FillStrategy};
 ///       (using the [`take`](take::take) kernel) when we are generating trailing gaps, i.e.,
 ///       when all of the input rows have been output for a series in the previous batch,
 ///       but there still remains missing rows to produce at the end.
-/// - Having one additional _trailing row_ at the end ensures that `GapFiller` can
+/// - Having at least one additional _trailing row_ at the end ensures that `GapFiller` can
 ///       infer whether there is trailing gaps to produce at the beginning of the
 ///       next batch, since it can discover if the last row starts a new series.
+/// - If there are columns that have a fill strategy of [`LinearInterpolate`], then more
+///       trailing rows may be necessary to find the next non-null value for the column.
+///
+/// [`LinearInterpolate`]: FillStrategy::LinearInterpolate
 #[derive(Debug)]
 pub(super) struct GapFiller {
     /// The static parameters of gap-filling: time range start, end and the stride.
     params: GapFillParams,
+    /// The number of rows to produce in each output batch.
+    batch_size: usize,
     /// The current state of gap-filling, including the next timestamp,
     /// the offset of the next input row, and remaining space in output batch.
     cursor: Cursor,
@@ -83,9 +92,25 @@ pub(super) struct GapFiller {
 
 impl GapFiller {
     /// Initialize a [GapFiller] at the beginning of an input record batch.
-    pub fn new(params: GapFillParams) -> Self {
+    pub fn new(params: GapFillParams, batch_size: usize) -> Self {
         let cursor = Cursor::new(&params);
-        Self { params, cursor }
+        Self {
+            params,
+            batch_size,
+            cursor,
+        }
+    }
+
+    /// Given that the cursor points at the input row that will be
+    /// the first row in the next output batch, return the offset
+    /// of last input row that could possibly be in the output.
+    ///
+    /// This offset is used by ['BufferedInput`] to determine how many
+    /// rows need to be buffered.
+    ///
+    /// [`BufferedInput`]: super::BufferedInput
+    pub(super) fn last_output_row_offset(&self) -> usize {
+        self.cursor.next_input_offset + self.batch_size - 1
     }
 
     /// Returns true if there are no more output rows to produce given
@@ -100,14 +125,13 @@ impl GapFiller {
     /// schema at member `0`.
     pub fn build_gapfilled_output(
         &mut self,
-        batch_size: usize,
         schema: SchemaRef,
         input_time_array: (usize, &TimestampNanosecondArray),
         group_arrays: &[(usize, ArrayRef)],
         aggr_arrays: &[(usize, ArrayRef)],
     ) -> Result<RecordBatch> {
-        let series_ends = self.plan_output_batch(batch_size, input_time_array.1, group_arrays)?;
-        self.cursor.remaining_output_batch_size = batch_size;
+        let series_ends = self.plan_output_batch(input_time_array.1, group_arrays)?;
+        self.cursor.remaining_output_batch_size = self.batch_size;
         self.build_output(
             schema,
             input_time_array,
@@ -139,7 +163,6 @@ impl GapFiller {
     /// to partition input rows into series.
     fn plan_output_batch(
         &mut self,
-        batch_size: usize,
         input_time_array: &TimestampNanosecondArray,
         group_arr: &[(usize, ArrayRef)],
     ) -> Result<Vec<usize>> {
@@ -151,13 +174,10 @@ impl GapFiller {
 
         let sort_columns = group_arr
             .iter()
-            .map(|(_, arr)| SortColumn {
-                values: Arc::clone(arr),
-                options: None,
-            })
+            .map(|(_, arr)| Arc::clone(arr))
             .collect::<Vec<_>>();
-        let mut ranges = arrow::compute::lexicographical_partition_ranges(&sort_columns)
-            .map_err(DataFusionError::ArrowError)?;
+
+        let mut ranges = partition(&sort_columns)?.ranges().into_iter();
 
         let mut series_ends = vec![];
         let mut cursor = self.cursor.clone_for_aggr_col(None)?;
@@ -165,7 +185,7 @@ impl GapFiller {
 
         let start_offset = cursor.next_input_offset;
         assert!(start_offset <= 1, "input is sliced after it is consumed");
-        while output_row_count < batch_size {
+        while output_row_count < self.batch_size {
             match ranges.next() {
                 Some(Range { end, .. }) => {
                     assert!(
@@ -208,13 +228,19 @@ impl GapFiller {
         let (time_idx, input_time_array) = input_time_array;
         let time_vec = cursor.build_time_vec(&self.params, series_ends, input_time_array)?;
         let output_time_len = time_vec.len();
-        output_arrays.push((time_idx, Arc::new(TimestampNanosecondArray::from(time_vec))));
+        output_arrays.push((
+            time_idx,
+            Arc::new(
+                TimestampNanosecondArray::from(time_vec)
+                    .with_timezone_opt(input_time_array.timezone()),
+            ),
+        ));
         // There may not be any aggregate or group columns, so use this cursor state as the new
         // GapFiller cursor once this output batch is complete.
         let mut final_cursor = cursor;
 
         // build the other group columns
-        for (idx, ga) in group_arr.iter() {
+        for (idx, ga) in group_arr {
             let mut cursor = self.cursor.clone_for_aggr_col(None)?;
             let take_vec =
                 cursor.build_group_take_vec(&self.params, series_ends, input_time_array)?;
@@ -230,7 +256,7 @@ impl GapFiller {
         }
 
         // Build the aggregate columns
-        for (idx, aa) in aggr_arr.iter() {
+        for (idx, aa) in aggr_arr {
             let mut cursor = self.cursor.clone_for_aggr_col(Some(*idx))?;
             let output_array =
                 cursor.build_aggr_col(&self.params, series_ends, input_time_array, aa)?;
@@ -397,7 +423,7 @@ impl Cursor {
     /// Update this cursor to reflect that `offset` older rows are being sliced off from the
     /// buffered input.
     fn slice(&mut self, offset: usize, batch: &RecordBatch) -> Result<()> {
-        for (idx, aggr_col_state) in self.aggr_col_states.iter_mut() {
+        for (idx, aggr_col_state) in &mut self.aggr_col_states {
             aggr_col_state.slice(offset, batch.column(*idx))?;
         }
         self.next_input_offset -= offset;
@@ -520,7 +546,7 @@ impl Cursor {
             AggrColState::Null => {
                 self.build_aggr_fill_null(params, series_ends, input_time_array, input_aggr_array)
             }
-            AggrColState::Prev { .. } | AggrColState::PrevNullAsMissing { .. } => {
+            AggrColState::PrevNullAsIntentional { .. } | AggrColState::PrevNullAsMissing { .. } => {
                 self.build_aggr_fill_prev(params, series_ends, input_time_array, input_aggr_array)
             }
             AggrColState::PrevNullAsMissingStashed { .. } => self.build_aggr_fill_prev_stashed(
@@ -633,7 +659,7 @@ impl Cursor {
             ..
         } = aggr_builder;
         self.set_aggr_col_state(match null_as_missing {
-            false => AggrColState::Prev {
+            false => AggrColState::PrevNullAsIntentional {
                 offset: prev_offset,
             },
             true => AggrColState::PrevNullAsMissing {
@@ -693,7 +719,7 @@ impl Cursor {
         series_ends: &[usize],
         vec_builder: &mut impl VecBuilder,
     ) -> Result<()> {
-        for series in series_ends.iter() {
+        for series in series_ends {
             if self
                 .next_ts
                 .map_or(false, |next_ts| next_ts > params.last_ts)
@@ -801,8 +827,8 @@ impl Cursor {
 enum AggrColState {
     /// For [FillStrategy::Null] there is no state to maintain.
     Null,
-    /// For [FillStrategy::Prev].
-    Prev { offset: Option<u64> },
+    /// For [FillStrategy::PrevNullAsIntentional].
+    PrevNullAsIntentional { offset: Option<u64> },
     /// For [FillStrategy::PrevNullAsMissing].
     PrevNullAsMissing { offset: Option<u64> },
     /// For [FillStrategy::PrevNullAsMissing], when
@@ -823,7 +849,7 @@ impl AggrColState {
     fn new(fill_strategy: &FillStrategy) -> Self {
         match fill_strategy {
             FillStrategy::Null => Self::Null,
-            FillStrategy::Prev => Self::Prev { offset: None },
+            FillStrategy::PrevNullAsIntentional => Self::PrevNullAsIntentional { offset: None },
             FillStrategy::PrevNullAsMissing => Self::PrevNullAsMissing { offset: None },
             FillStrategy::LinearInterpolate => Self::LinearInterpolate(None),
         }
@@ -833,11 +859,11 @@ impl AggrColState {
     ///
     /// # Panics
     ///
-    /// This method will panic if `self` is not [AggrColState::Prev]
+    /// This method will panic if `self` is not [AggrColState::PrevNullAsIntentional]
     /// or [AggrColState::PrevNullAsMissing].
     fn prev_offset(&self) -> Option<u64> {
         match self {
-            Self::Prev { offset } | Self::PrevNullAsMissing { offset } => *offset,
+            Self::PrevNullAsIntentional { offset } | Self::PrevNullAsMissing { offset } => *offset,
             _ => unreachable!(),
         }
     }
@@ -853,9 +879,8 @@ impl AggrColState {
                 let stash = StashedAggrBuilder::create_stash(array, *v)?;
                 *self = Self::PrevNullAsMissingStashed { stash };
             }
-            Self::Prev { offset: Some(v) } | Self::PrevNullAsMissing { offset: Some(v) } => {
-                *v -= offset
-            }
+            Self::PrevNullAsIntentional { offset: Some(v) }
+            | Self::PrevNullAsMissing { offset: Some(v) } => *v -= offset,
             _ => (),
         };
         Ok(())
@@ -900,6 +925,7 @@ trait VecBuilder {
 }
 
 /// The state of an input row relative to gap-filled output.
+#[derive(Debug)]
 enum RowStatus {
     /// This row had a null timestamp in the input.
     NullTimestamp {
@@ -942,7 +968,7 @@ impl StashedAggrBuilder<'_> {
     /// `input_aggr_array` at `offset` for use with the [`interleave`](arrow::compute::interleave)
     /// kernel.
     fn create_stash(input_aggr_array: &ArrayRef, offset: u64) -> Result<ArrayRef> {
-        let take_arr = vec![None, Some(offset)].into();
+        let take_arr: UInt64Array = vec![None, Some(offset)].into();
         let stash =
             take::take(input_aggr_array, &take_arr, None).map_err(DataFusionError::ArrowError)?;
         Ok(stash)
@@ -1017,7 +1043,7 @@ mod tests {
     use arrow_util::test_util::batches_to_lines;
     use datafusion::error::Result;
     use hashbrown::HashMap;
-    use schema::InfluxColumnType;
+    use schema::{InfluxColumnType, TIME_DATA_TIMEZONE};
 
     use crate::exec::gapfill::{
         algo::{AggrColState, Cursor},
@@ -1162,12 +1188,14 @@ mod tests {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &[series], &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &[series], &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_null(&params, &[series], &input_times, &input_aggr_array)
             .unwrap();
@@ -1208,12 +1236,14 @@ mod tests {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &[series], &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &[series], &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr =
             cursor.build_aggr_fill_null(&params, &[series], &input_times, &input_aggr_array)?;
         insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
@@ -1261,12 +1291,14 @@ mod tests {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &[series], &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &[series], &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_prev(&params, &[series], &input_times, &input_aggr_array)
             .unwrap();
@@ -1317,12 +1349,14 @@ mod tests {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &[series], &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &[series], &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_prev(&params, &[series], &input_times, &input_aggr_array)
             .unwrap();
@@ -1358,7 +1392,8 @@ mod tests {
             // 1000
             Some(1050),
             // 1100
-        ]);
+        ])
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let input_aggr_array: ArrayRef = Arc::new(Float64Array::from(vec![10.0, 11.0]));
         let series_ends = vec![1, 2];
 
@@ -1373,12 +1408,14 @@ mod tests {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &series_ends, &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &series_ends, &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_null(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
@@ -1413,7 +1450,8 @@ mod tests {
             Some(1000),
             Some(1050),
             Some(1100),
-        ]);
+        ])
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let input_aggr_array: ArrayRef = Arc::new(Float64Array::from(vec![
             // 950
             // 1000
@@ -1437,12 +1475,14 @@ mod tests {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &series_ends, &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &series_ends, &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_prev(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
@@ -1485,7 +1525,8 @@ mod tests {
             Some(1050),
             Some(1100),
             Some(1100),
-        ]);
+        ])
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let input_aggr_array: ArrayRef = Arc::new(Float64Array::from(vec![
             // Some(9.0) //  950
             // ^^^^^^^^^ this element has been sliced off
@@ -1526,12 +1567,14 @@ mod tests {
             .collect(),
         };
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &series_ends, &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &series_ends, &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_prev_stashed(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
@@ -1596,7 +1639,7 @@ mod tests {
     }
 
     fn prev_fill_strategy(idx: usize) -> HashMap<usize, FillStrategy> {
-        std::iter::once((idx, FillStrategy::Prev)).collect()
+        std::iter::once((idx, FillStrategy::PrevNullAsIntentional)).collect()
     }
 
     fn prev_null_as_missing_fill_strategy(idx: usize) -> HashMap<usize, FillStrategy> {

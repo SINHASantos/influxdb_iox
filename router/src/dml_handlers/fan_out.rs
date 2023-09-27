@@ -1,7 +1,7 @@
-use std::{fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{DeletePredicate, NamespaceId, NamespaceName};
+use data_types::{NamespaceName, NamespaceSchema};
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use trace::ctx::SpanContext;
 
@@ -40,9 +40,8 @@ where
     U: Iterator<Item = T::WriteInput> + Send + Sync,
 {
     type WriteInput = I;
-    type WriteOutput = Vec<T::WriteOutput>;
+    type WriteOutput = ();
     type WriteError = T::WriteError;
-    type DeleteError = T::DeleteError;
 
     /// Concurrently execute the write inputs in `input` against the inner
     /// handler, returning early and aborting in-flight writes if an error
@@ -50,38 +49,25 @@ where
     async fn write(
         &self,
         namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
+        namespace_schema: Arc<NamespaceSchema>,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
-        let results = input
+        input
             .into_iter()
             .map(|v| {
                 let namespace = namespace.clone();
+                let namespace_schema = Arc::clone(&namespace_schema);
                 let span_ctx = span_ctx.clone();
                 async move {
                     self.inner
-                        .write(&namespace, namespace_id, v, span_ctx)
+                        .write(&namespace, namespace_schema, v, span_ctx)
                         .await
                 }
             })
             .collect::<FuturesUnordered<_>>()
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(results)
-    }
-
-    /// Pass the delete through to the inner handler.
-    async fn delete(
-        &self,
-        namespace: &NamespaceName<'static>,
-        namespace_id: NamespaceId,
-        table_name: &str,
-        predicate: &DeletePredicate,
-        span_ctx: Option<SpanContext>,
-    ) -> Result<(), Self::DeleteError> {
-        self.inner
-            .delete(namespace, namespace_id, table_name, predicate, span_ctx)
-            .await
+        Ok(())
     }
 }

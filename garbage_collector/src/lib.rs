@@ -11,11 +11,17 @@
     clippy::todo,
     clippy::dbg_macro,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 #![allow(clippy::missing_docs_in_private_items)]
+
+// Workaround for "unused crate" lint false positives.
+use clap as _;
+use workspace_hack as _;
 
 use crate::{
     objectstore::{checker as os_checker, deleter as os_deleter, lister as os_lister},
@@ -30,7 +36,7 @@ use object_store::DynObjectStore;
 use observability_deps::tracing::*;
 use snafu::prelude::*;
 use std::{fmt::Debug, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::{select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Logic for listing, checking and deleting files in object storage
@@ -96,23 +102,51 @@ impl GarbageCollector {
         let (tx1, rx1) = mpsc::channel(BUFFER_SIZE);
         let (tx2, rx2) = mpsc::channel(BUFFER_SIZE);
 
-        let os_lister = tokio::spawn(os_lister::perform(
-            shutdown.clone(),
-            Arc::clone(&object_store),
-            tx1,
-            sub_config.objectstore_sleep_interval_minutes,
-        ));
-        let os_checker = tokio::spawn(os_checker::perform(
-            Arc::clone(&catalog),
-            chrono::Duration::from_std(sub_config.objectstore_cutoff).map_err(|e| {
-                Error::CutoffError {
-                    message: e.to_string(),
-                }
-            })?,
-            rx1,
-            tx2,
-        ));
+        let sdt = shutdown.clone();
+        let osa = Arc::clone(&object_store);
+
+        let os_lister = tokio::spawn(async move {
+            select! {
+                ret = os_lister::perform(
+                    osa,
+                    tx1,
+                    sub_config.objectstore_sleep_interval_minutes,
+                    sub_config.objectstore_sleep_interval_batch_milliseconds,
+                ) => {
+                    ret
+                },
+                _ = sdt.cancelled() => {
+                    Ok(())
+                },
+            }
+        });
+
+        let cat = Arc::clone(&catalog);
+        let sdt = shutdown.clone();
+        let cutoff = chrono::Duration::from_std(sub_config.objectstore_cutoff).map_err(|e| {
+            Error::CutoffError {
+                message: e.to_string(),
+            }
+        })?;
+
+        let os_checker = tokio::spawn(async move {
+            select! {
+                ret = os_checker::perform(
+                    cat,
+                    cutoff,
+                    rx1,
+                    tx2,
+                ) => {
+                    ret
+                },
+                _ = sdt.cancelled() => {
+                    Ok(())
+                },
+            }
+        });
+
         let os_deleter = tokio::spawn(os_deleter::perform(
+            shutdown.clone(),
             object_store,
             dry_run,
             sub_config.objectstore_concurrent_deletes,
@@ -134,6 +168,7 @@ impl GarbageCollector {
             shutdown.clone(),
             catalog,
             sub_config.retention_sleep_interval_minutes,
+            sub_config.dry_run,
         ));
 
         Ok(Self {
@@ -262,7 +297,11 @@ mod tests {
     async fn deletes_untracked_files_older_than_the_cutoff() {
         let setup = OldFileSetup::new();
 
-        let config = build_config(setup.data_dir_arg(), []).await;
+        let config = build_config(
+            setup.data_dir_arg(),
+            ["--objectstore-sleep-interval-minutes=0"],
+        )
+        .await;
         tokio::spawn(async {
             main(config).await.unwrap();
         });
@@ -326,7 +365,7 @@ mod tests {
         #[rustfmt::skip]
         let cfg = CatalogDsnConfig::parse_from([
             "dummy-program-name",
-            "--catalog", "memory",
+            "--catalog-dsn", "memory",
         ]);
 
         let metrics = metric::Registry::default().into();

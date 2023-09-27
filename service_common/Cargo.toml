@@ -6,9 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.66"
-bytes = "1.4"
+async-trait = "0.1.73"
+bytes = "1.5"
 datafusion = { workspace = true }
+executor = { path = "../executor" }
 iox_query = { path = "../iox_query" }
 iox_query_influxql = { path = "../iox_query_influxql" }
 iox_query_influxrpc = { path = "../iox_query_influxrpc" }
@@ -16,7 +17,7 @@ flightsql = { path = "../flightsql" }
 metric = { path = "../metric" }
 parking_lot = "0.12"
 predicate = { path = "../predicate" }
-tonic = "0.8"
+tonic = { workspace = true }
 trace = { path = "../trace" }
 tracker = { path = "../tracker" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

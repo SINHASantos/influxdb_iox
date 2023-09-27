@@ -2,9 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use backoff::BackoffConfig;
-use data_types::{
-    NamespaceId, Partition, PartitionId, PartitionKey, SequenceNumber, ShardId, TableId,
-};
+use data_types::{NamespaceId, Partition, PartitionKey, TableId, TransitionPartitionId};
 use iox_catalog::interface::Catalog;
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
@@ -12,24 +10,20 @@ use parking_lot::Mutex;
 use super::r#trait::PartitionProvider;
 use crate::{
     buffer_tree::{
-        partition::{resolver::SortKeyResolver, PartitionData, SortKeyState},
-        table::TableName,
+        namespace::NamespaceName,
+        partition::{
+            counter::PartitionCounter, resolver::SortKeyResolver, PartitionData, SortKeyState,
+        },
+        table::metadata::TableMetadata,
     },
     deferred_load::DeferredLoad,
 };
 
-/// The data-carrying value of a `(shard_id, table_id, partition_key)` lookup.
-#[derive(Debug)]
-struct Entry {
-    partition_id: PartitionId,
-    max_sequence_number: Option<SequenceNumber>,
-}
-
-/// A read-through cache mapping `(shard_id, table_id, partition_key)` tuples to
-/// `(partition_id, max_sequence_number)`.
+/// A read-through cache mapping `(table_id, partition_key)` tuples to
+/// `partition_id`.
 ///
 /// This data is safe to cache as only one ingester is ever responsible for a
-/// given table partition, and this amortises partition persist marker discovery
+/// given table partition, and this amortises partition discovery
 /// queries during startup, eliminating them from the ingest hot path in the
 /// common startup case (an ingester restart with no new partitions to add).
 ///
@@ -38,14 +32,12 @@ struct Entry {
 /// Excluding map overhead, and assuming partition keys in the form
 /// "YYYY-MM-DD", each entry takes:
 ///
-///   - Partition key: String (8 len + 8 cap + 8 ptr + data len) = 34 bytes
-///   - ShardId: 8 bytes
-///   - TableId: 8 bytes
-///   - PartitionId: 8 bytes
-///   - Optional sequence number: 16 bytes
+///   - `PartitionKey`: String (8 len + 8 cap + 8 ptr + data len) = 34 bytes
+///   - `TableId`: 8 bytes
+///   - `TransitionPartitionId`: 8 bytes
 ///
-/// For a total of 74 bytes per entry - approx 1,690 entries can be held in 1Mb
-/// of memory.
+/// For a total of 50 bytes per entry - approx 20,971 entries can be held in
+/// 1MiB of memory.
 ///
 /// Each cache hit _removes_ the entry from the cache - this eliminates the
 /// memory overhead for items that were hit. This is the expected (only valid!)
@@ -70,14 +62,14 @@ pub(crate) struct PartitionCache<T> {
     /// Cached entries.
     ///
     /// First lookup level is the shared partition keys - this eliminates
-    /// needing to share the string key per shard_id/table_id in memory which
-    /// would be the case if using either as the first level lookup. This is
-    /// cheaper (memory) than using Arc refs to share the keys.
+    /// needing to share the string key per table_id in memory which would be
+    /// the case if inverted. This is cheaper (memory) than using Arc refs to
+    /// share the keys.
     ///
     /// It's also likely a smaller N (more tables than partition keys) making it
     /// a faster search for cache misses.
     #[allow(clippy::type_complexity)]
-    entries: Mutex<HashMap<PartitionKey, HashMap<ShardId, HashMap<TableId, Entry>>>>,
+    entries: Mutex<HashMap<PartitionKey, HashMap<TableId, TransitionPartitionId>>>,
 
     /// Data needed to construct the [`SortKeyResolver`] for cached entries.
     catalog: Arc<dyn Catalog>,
@@ -85,6 +77,8 @@ pub(crate) struct PartitionCache<T> {
     /// The maximum amount of time a [`SortKeyResolver`] may wait until
     /// pre-fetching the sort key in the background.
     max_smear: Duration,
+
+    metrics: Arc<metric::Registry>,
 }
 
 impl<T> PartitionCache<T> {
@@ -102,32 +96,22 @@ impl<T> PartitionCache<T> {
         max_smear: Duration,
         catalog: Arc<dyn Catalog>,
         backoff_config: BackoffConfig,
+        metrics: Arc<metric::Registry>,
     ) -> Self
     where
         P: IntoIterator<Item = Partition>,
     {
-        let mut entries = HashMap::<PartitionKey, HashMap<ShardId, HashMap<TableId, Entry>>>::new();
+        let mut entries = HashMap::<PartitionKey, HashMap<TableId, TransitionPartitionId>>::new();
         for p in partitions.into_iter() {
             entries
-                .entry(p.partition_key)
+                .entry(p.partition_key.clone())
                 .or_default()
-                .entry(p.shard_id)
-                .or_default()
-                .insert(
-                    p.table_id,
-                    Entry {
-                        partition_id: p.id,
-                        max_sequence_number: p.persisted_sequence_number,
-                    },
-                );
+                .insert(p.table_id, p.transition_partition_id());
         }
 
         // Minimise the overhead of the maps.
-        for shards in entries.values_mut() {
-            for tables in shards.values_mut() {
-                tables.shrink_to_fit();
-            }
-            shards.shrink_to_fit();
+        for tables in entries.values_mut() {
+            tables.shrink_to_fit();
         }
         entries.shrink_to_fit();
 
@@ -137,17 +121,17 @@ impl<T> PartitionCache<T> {
             catalog,
             backoff_config,
             max_smear,
+            metrics,
         }
     }
 
-    /// Search for an cached entry matching the `(partition_key, shard_id, table_id)`
+    /// Search for a cached entry matching the `(partition_key, table_id)`
     /// tuple.
     fn find(
         &self,
-        shard_id: ShardId,
         table_id: TableId,
         partition_key: &PartitionKey,
-    ) -> Option<(PartitionKey, Entry)> {
+    ) -> Option<(PartitionKey, TransitionPartitionId)> {
         let mut entries = self.entries.lock();
 
         // Look up the partition key provided by the caller.
@@ -159,27 +143,18 @@ impl<T> PartitionCache<T> {
         // key in the PartitionData.
         let key = entries.get_key_value(partition_key)?.0.clone();
         let partition = entries.get_mut(partition_key).unwrap();
-        let shard = partition.get_mut(&shard_id)?;
 
-        let e = shard.remove(&table_id)?;
+        let partition_id = partition.remove(&table_id)?;
 
-        // As an item was just removed from the shard map, check if it is now
-        // empty.
-        if shard.is_empty() {
-            // Remove the shard from the partition map to reclaim the memory it
-            // was using.
-            partition.remove(&shard_id);
-
-            // As a shard was removed, likewise the partition may now be empty!
-            if partition.is_empty() {
-                entries.remove(partition_key);
-                entries.shrink_to_fit();
-            } else {
-                partition.shrink_to_fit();
-            }
+        // As a entry was removed, check if it is now empty.
+        if partition.is_empty() {
+            entries.remove(partition_key);
+            entries.shrink_to_fit();
+        } else {
+            partition.shrink_to_fit();
         }
 
-        Some((key, e))
+        Some((key, partition_id))
     }
 }
 
@@ -191,65 +166,82 @@ where
     async fn get_partition(
         &self,
         partition_key: PartitionKey,
-        shard_id: ShardId,
         namespace_id: NamespaceId,
+        namespace_name: Arc<DeferredLoad<NamespaceName>>,
         table_id: TableId,
-        table_name: Arc<DeferredLoad<TableName>>,
-    ) -> PartitionData {
+        table: Arc<DeferredLoad<TableMetadata>>,
+        partition_counter: Arc<PartitionCounter>,
+    ) -> Arc<Mutex<PartitionData>> {
         // Use the cached PartitionKey instead of the caller's partition_key,
         // instead preferring to reuse the already-shared Arc<str> in the cache.
 
-        if let Some((key, cached)) = self.find(shard_id, table_id, &partition_key) {
+        if let Some((key, partition_id)) = self.find(table_id, &partition_key) {
             debug!(%table_id, %partition_key, "partition cache hit");
 
             // Initialise a deferred resolver for the sort key.
             let sort_key_resolver = DeferredLoad::new(
                 self.max_smear,
                 SortKeyResolver::new(
-                    cached.partition_id,
+                    partition_key.clone(),
+                    table_id,
                     Arc::clone(&__self.catalog),
                     self.backoff_config.clone(),
                 )
                 .fetch(),
+                &self.metrics,
             );
 
             // Use the returned partition key instead of the callers - this
             // allows the backing str memory to be reused across all partitions
             // using the same key!
-            return PartitionData::new(
-                cached.partition_id,
+            return Arc::new(Mutex::new(PartitionData::new(
+                partition_id,
                 key,
-                shard_id,
                 namespace_id,
+                namespace_name,
                 table_id,
-                table_name,
+                table,
                 SortKeyState::Deferred(Arc::new(sort_key_resolver)),
-                cached.max_sequence_number,
-            );
+                partition_counter,
+            )));
         }
 
         debug!(%table_id, %partition_key, "partition cache miss");
 
         // Otherwise delegate to the catalog / inner impl.
         self.inner
-            .get_partition(partition_key, shard_id, namespace_id, table_id, table_name)
+            .get_partition(
+                partition_key,
+                namespace_id,
+                namespace_name,
+                table_id,
+                table,
+                partition_counter,
+            )
             .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Harmless in tests - saves a bunch of extra vars.
+    #![allow(clippy::await_holding_lock)]
+
+    use std::num::NonZeroUsize;
+
+    use data_types::SortedColumnSet;
     use iox_catalog::mem::MemCatalog;
 
     use super::*;
-    use crate::buffer_tree::partition::resolver::MockPartitionProvider;
-
-    const PARTITION_KEY: &str = "bananas";
-    const PARTITION_ID: PartitionId = PartitionId::new(42);
-    const SHARD_ID: ShardId = ShardId::new(1);
-    const NAMESPACE_ID: NamespaceId = NamespaceId::new(2);
-    const TABLE_ID: TableId = TableId::new(3);
-    const TABLE_NAME: &str = "platanos";
+    use crate::{
+        buffer_tree::partition::resolver::mock::MockPartitionProvider,
+        test_util::{
+            defer_namespace_name_1_sec, defer_table_metadata_1_sec, PartitionDataBuilder,
+            ARBITRARY_CATALOG_PARTITION_ID, ARBITRARY_NAMESPACE_ID, ARBITRARY_NAMESPACE_NAME,
+            ARBITRARY_PARTITION_KEY, ARBITRARY_PARTITION_KEY_STR, ARBITRARY_TABLE_ID,
+            ARBITRARY_TABLE_NAME, ARBITRARY_TRANSITION_PARTITION_ID,
+        },
+    };
 
     fn new_cache<P>(
         inner: MockPartitionProvider,
@@ -264,42 +256,39 @@ mod tests {
             Duration::from_secs(10_000_000),
             Arc::new(MemCatalog::new(Arc::new(metric::Registry::default()))),
             BackoffConfig::default(),
+            Arc::new(metric::Registry::default()),
         )
     }
 
     #[tokio::test]
     async fn test_miss() {
-        let data = PartitionData::new(
-            PARTITION_ID,
-            PARTITION_KEY.into(),
-            SHARD_ID,
-            NAMESPACE_ID,
-            TABLE_ID,
-            Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                TableName::from(TABLE_NAME)
-            })),
-            SortKeyState::Provided(None),
-            None,
-        );
-        let inner = MockPartitionProvider::default().with_partition(data);
+        let inner = MockPartitionProvider::default().with_partition(PartitionDataBuilder::new());
 
         let cache = new_cache(inner, []);
         let got = cache
             .get_partition(
-                PARTITION_KEY.into(),
-                SHARD_ID,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
+                ARBITRARY_PARTITION_KEY.clone(),
+                ARBITRARY_NAMESPACE_ID,
+                defer_namespace_name_1_sec(),
+                ARBITRARY_TABLE_ID,
+                defer_table_metadata_1_sec(),
+                Arc::new(PartitionCounter::new(NonZeroUsize::new(1).unwrap())),
             )
             .await;
 
-        assert_eq!(got.partition_id(), PARTITION_ID);
-        assert_eq!(got.shard_id(), SHARD_ID);
-        assert_eq!(got.table_id(), TABLE_ID);
-        assert_eq!(&**got.table_name().get().await, TABLE_NAME);
+        assert_eq!(
+            got.lock().partition_id(),
+            &*ARBITRARY_TRANSITION_PARTITION_ID
+        );
+        assert_eq!(got.lock().table_id(), ARBITRARY_TABLE_ID);
+        assert_eq!(
+            &**got.lock().table().get().await.name(),
+            &**ARBITRARY_TABLE_NAME
+        );
+        assert_eq!(
+            &**got.lock().namespace_name().get().await,
+            &***ARBITRARY_NAMESPACE_NAME
+        );
         assert!(cache.inner.is_empty());
     }
 
@@ -307,37 +296,47 @@ mod tests {
     async fn test_hit() {
         let inner = MockPartitionProvider::default();
 
-        let stored_partition_key = PartitionKey::from(PARTITION_KEY);
-        let partition = Partition {
-            id: PARTITION_ID,
-            shard_id: SHARD_ID,
-            table_id: TABLE_ID,
-            partition_key: stored_partition_key.clone(),
-            sort_key: vec!["dos".to_string(), "bananas".to_string()],
-            persisted_sequence_number: Default::default(),
-            new_file_at: Default::default(),
-        };
+        let stored_partition_key = PartitionKey::from(ARBITRARY_PARTITION_KEY_STR);
+        let partition = Partition::new_in_memory_only(
+            ARBITRARY_CATALOG_PARTITION_ID,
+            ARBITRARY_TABLE_ID,
+            stored_partition_key.clone(),
+            Some(vec!["dos".to_string(), "bananas".to_string()]),
+            SortedColumnSet::from([1, 2]),
+            Default::default(),
+        );
 
         let cache = new_cache(inner, [partition]);
 
-        let callers_partition_key = PartitionKey::from(PARTITION_KEY);
+        let callers_partition_key = PartitionKey::from(ARBITRARY_PARTITION_KEY_STR);
         let got = cache
             .get_partition(
                 callers_partition_key.clone(),
-                SHARD_ID,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
+                ARBITRARY_NAMESPACE_ID,
+                defer_namespace_name_1_sec(),
+                ARBITRARY_TABLE_ID,
+                defer_table_metadata_1_sec(),
+                Arc::new(PartitionCounter::new(NonZeroUsize::new(1).unwrap())),
             )
             .await;
 
-        assert_eq!(got.partition_id(), PARTITION_ID);
-        assert_eq!(got.shard_id(), SHARD_ID);
-        assert_eq!(got.table_id(), TABLE_ID);
-        assert_eq!(&**got.table_name().get().await, TABLE_NAME);
-        assert_eq!(*got.partition_key(), PartitionKey::from(PARTITION_KEY));
+        assert_eq!(
+            got.lock().partition_id(),
+            &*ARBITRARY_TRANSITION_PARTITION_ID
+        );
+        assert_eq!(got.lock().table_id(), ARBITRARY_TABLE_ID);
+        assert_eq!(
+            &**got.lock().table().get().await.name(),
+            &**ARBITRARY_TABLE_NAME
+        );
+        assert_eq!(
+            &**got.lock().namespace_name().get().await,
+            &***ARBITRARY_NAMESPACE_NAME
+        );
+        assert_eq!(
+            *got.lock().partition_key(),
+            PartitionKey::from(ARBITRARY_PARTITION_KEY_STR)
+        );
 
         // The cache should have been cleaned up as it was consumed.
         assert!(cache.entries.lock().is_empty());
@@ -345,145 +344,81 @@ mod tests {
         // Assert the partition key from the cache was used for the lifetime of
         // the partition, so that it is shared with the cache + other partitions
         // that share the same partition key across all tables.
-        assert!(got.partition_key().ptr_eq(&stored_partition_key));
+        assert!(got.lock().partition_key().ptr_eq(&stored_partition_key));
         // It does not use the short-lived caller's partition key (derived from
         // the DML op it is processing).
-        assert!(!got.partition_key().ptr_eq(&callers_partition_key));
+        assert!(!got.lock().partition_key().ptr_eq(&callers_partition_key));
     }
 
     #[tokio::test]
     async fn test_miss_partition_key() {
         let other_key = PartitionKey::from("test");
-        let other_key_id = PartitionId::new(99);
-        let inner = MockPartitionProvider::default().with_partition(PartitionData::new(
-            other_key_id,
-            other_key.clone(),
-            SHARD_ID,
-            NAMESPACE_ID,
-            TABLE_ID,
-            Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                TableName::from(TABLE_NAME)
-            })),
-            SortKeyState::Provided(None),
-            None,
-        ));
+        let other_partition_id = TransitionPartitionId::new(ARBITRARY_TABLE_ID, &other_key);
+        let inner = MockPartitionProvider::default()
+            .with_partition(PartitionDataBuilder::new().with_partition_key(other_key.clone()));
 
-        let partition = Partition {
-            id: PARTITION_ID,
-            shard_id: SHARD_ID,
-            table_id: TABLE_ID,
-            partition_key: PARTITION_KEY.into(),
-            sort_key: Default::default(),
-            persisted_sequence_number: Default::default(),
-            new_file_at: Default::default(),
-        };
+        let partition = Partition::new_in_memory_only(
+            ARBITRARY_CATALOG_PARTITION_ID,
+            ARBITRARY_TABLE_ID,
+            ARBITRARY_PARTITION_KEY.clone(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
 
         let cache = new_cache(inner, [partition]);
         let got = cache
             .get_partition(
-                other_key.clone(),
-                SHARD_ID,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
+                other_key,
+                ARBITRARY_NAMESPACE_ID,
+                defer_namespace_name_1_sec(),
+                ARBITRARY_TABLE_ID,
+                defer_table_metadata_1_sec(),
+                Arc::new(PartitionCounter::new(NonZeroUsize::new(1).unwrap())),
             )
             .await;
 
-        assert_eq!(got.partition_id(), other_key_id);
-        assert_eq!(got.shard_id(), SHARD_ID);
-        assert_eq!(got.table_id(), TABLE_ID);
-        assert_eq!(&**got.table_name().get().await, TABLE_NAME);
+        assert_eq!(got.lock().partition_id(), &other_partition_id);
+        assert_eq!(got.lock().table_id(), ARBITRARY_TABLE_ID);
+        assert_eq!(
+            &**got.lock().table().get().await.name(),
+            &**ARBITRARY_TABLE_NAME
+        );
     }
 
     #[tokio::test]
     async fn test_miss_table_id() {
         let other_table = TableId::new(1234);
-        let inner = MockPartitionProvider::default().with_partition(PartitionData::new(
-            PARTITION_ID,
-            PARTITION_KEY.into(),
-            SHARD_ID,
-            NAMESPACE_ID,
-            other_table,
-            Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                TableName::from(TABLE_NAME)
-            })),
-            SortKeyState::Provided(None),
-            None,
-        ));
+        let other_partition_id = TransitionPartitionId::new(other_table, &ARBITRARY_PARTITION_KEY);
+        let inner = MockPartitionProvider::default()
+            .with_partition(PartitionDataBuilder::new().with_table_id(other_table));
 
-        let partition = Partition {
-            id: PARTITION_ID,
-            shard_id: SHARD_ID,
-            table_id: TABLE_ID,
-            partition_key: PARTITION_KEY.into(),
-            sort_key: Default::default(),
-            persisted_sequence_number: Default::default(),
-            new_file_at: Default::default(),
-        };
+        let partition = Partition::new_in_memory_only(
+            ARBITRARY_CATALOG_PARTITION_ID,
+            ARBITRARY_TABLE_ID,
+            ARBITRARY_PARTITION_KEY.clone(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
 
         let cache = new_cache(inner, [partition]);
         let got = cache
             .get_partition(
-                PARTITION_KEY.into(),
-                SHARD_ID,
-                NAMESPACE_ID,
+                ARBITRARY_PARTITION_KEY.clone(),
+                ARBITRARY_NAMESPACE_ID,
+                defer_namespace_name_1_sec(),
                 other_table,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
+                defer_table_metadata_1_sec(),
+                Arc::new(PartitionCounter::new(NonZeroUsize::new(1).unwrap())),
             )
             .await;
 
-        assert_eq!(got.partition_id(), PARTITION_ID);
-        assert_eq!(got.shard_id(), SHARD_ID);
-        assert_eq!(got.table_id(), other_table);
-        assert_eq!(&**got.table_name().get().await, TABLE_NAME);
-    }
-
-    #[tokio::test]
-    async fn test_miss_shard_id() {
-        let other_shard = ShardId::new(1234);
-        let inner = MockPartitionProvider::default().with_partition(PartitionData::new(
-            PARTITION_ID,
-            PARTITION_KEY.into(),
-            other_shard,
-            NAMESPACE_ID,
-            TABLE_ID,
-            Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                TableName::from(TABLE_NAME)
-            })),
-            SortKeyState::Provided(None),
-            None,
-        ));
-
-        let partition = Partition {
-            id: PARTITION_ID,
-            shard_id: SHARD_ID,
-            table_id: TABLE_ID,
-            partition_key: PARTITION_KEY.into(),
-            sort_key: Default::default(),
-            persisted_sequence_number: Default::default(),
-            new_file_at: Default::default(),
-        };
-
-        let cache = new_cache(inner, [partition]);
-        let got = cache
-            .get_partition(
-                PARTITION_KEY.into(),
-                other_shard,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
-            )
-            .await;
-
-        assert_eq!(got.partition_id(), PARTITION_ID);
-        assert_eq!(got.shard_id(), other_shard);
-        assert_eq!(got.table_id(), TABLE_ID);
-        assert_eq!(&**got.table_name().get().await, TABLE_NAME);
+        assert_eq!(got.lock().partition_id(), &other_partition_id);
+        assert_eq!(got.lock().table_id(), other_table);
+        assert_eq!(
+            &**got.lock().table().get().await.name(),
+            &**ARBITRARY_TABLE_NAME
+        );
     }
 }

@@ -5,9 +5,9 @@
 //! compatible with the [Go implementation], however, this
 //! implementation uses a [nom] combinator-based parser rather than
 //! attempting to port the imperative Go logic so there are likely
-//! some small diferences.
+//! some small differences.
 //!
-//! 2. A [builder](crate::builder::LineProtocolBuilder) to contruct valid [InfluxDB Line Protocol]
+//! 2. A [builder](crate::builder::LineProtocolBuilder) to construct valid [InfluxDB Line Protocol]
 //!
 //! # Example
 //!
@@ -63,7 +63,8 @@
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 
 pub mod builder;
@@ -96,6 +97,9 @@ use std::{
 pub enum Error {
     #[snafu(display(r#"Must not contain duplicate tags, but "{}" was repeated"#, tag_key))]
     DuplicateTag { tag_key: String },
+
+    #[snafu(display(r#"Invalid measurement was provided"#))]
+    MeasurementValueInvalid,
 
     #[snafu(display(r#"No fields were provided"#))]
     FieldSetMissing,
@@ -135,6 +139,9 @@ pub enum Error {
         trailing_content
     ))]
     CannotParseEntireLine { trailing_content: String },
+
+    #[snafu(display(r#"Tag Set Malformed"#))]
+    TagSetMalformed,
 
     // TODO: Replace this with specific failures.
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]
@@ -255,7 +262,7 @@ impl<'a> Display for ParsedLine<'a> {
 #[derive(Debug)]
 pub struct Series<'a> {
     raw_input: &'a str,
-    pub measurement: EscapedStr<'a>,
+    pub measurement: Measurement<'a>,
     pub tag_set: Option<TagSet<'a>>,
 }
 
@@ -347,6 +354,8 @@ impl<'a> Series<'a> {
         }
     }
 }
+
+pub type Measurement<'a> = EscapedStr<'a>;
 
 /// The [field] keys and values that appear in the line of line protocol.
 ///
@@ -508,7 +517,7 @@ impl PartialEq<String> for EscapedStr<'_> {
     }
 }
 
-/// Parses a new line-delimited string into an interator of
+/// Parses a new line-delimited string into an iterator of
 /// [`ParsedLine`]. See the [crate-level documentation](self) for more
 /// information and examples.
 pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> {
@@ -625,9 +634,7 @@ fn parse_line(i: &str) -> IResult<&str, ParsedLine<'_>> {
 }
 
 fn series(i: &str) -> IResult<&str, Series<'_>> {
-    let tag_set = preceded(tag(","), tag_set);
-    let series = tuple((measurement, opt(tag_set)));
-
+    let series = tuple((measurement, maybe_tagset));
     let series_and_raw_input = parse_and_recognize(series);
 
     map(
@@ -640,16 +647,43 @@ fn series(i: &str) -> IResult<&str, Series<'_>> {
     )(i)
 }
 
-fn measurement(i: &str) -> IResult<&str, EscapedStr<'_>> {
-    let normal_char = take_while1(|c| !is_whitespace_boundary_char(c) && c != ',' && c != '\\');
+/// Tagsets are optional, but if a comma follows the measurement, then we must have at least one tag=value pair.
+/// anything else is an error
+fn maybe_tagset(i: &str) -> IResult<&str, Option<TagSet<'_>>, Error> {
+    match tag::<&str, &str, Error>(",")(i) {
+        Err(nom::Err::Error(_)) => Ok((i, None)),
+        Ok((remainder, _)) => {
+            match tag_set(remainder) {
+                Ok((i, ts)) => {
+                    // reaching here, we must find a tagset, which is at least one tag=value pair.
+                    if ts.is_empty() {
+                        return Err(nom::Err::Error(Error::TagSetMalformed));
+                    }
+                    Ok((i, Some(ts)))
+                }
+                Err(nom::Err::Error(_)) => TagSetMalformedSnafu.fail().map_err(nom::Err::Error),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn measurement(i: &str) -> IResult<&str, Measurement<'_>, Error> {
+    let normal_char = take_while1(|c| {
+        !is_whitespace_boundary_char(c) && !is_null_char(c) && c != ',' && c != '\\'
+    });
 
     let space = map(tag(" "), |_| " ");
     let comma = map(tag(","), |_| ",");
     let backslash = map(tag("\\"), |_| "\\");
 
-    let escaped = alt((space, comma, backslash));
+    let escaped = alt((comma, space, backslash));
 
-    escape_or_fallback(normal_char, "\\", escaped)(i)
+    match escape_or_fallback(normal_char, "\\", escaped)(i) {
+        Err(nom::Err::Error(_)) => MeasurementValueInvalidSnafu.fail().map_err(nom::Err::Error),
+        other => other,
+    }
 }
 
 fn tag_set(i: &str) -> IResult<&str, TagSet<'_>> {
@@ -763,8 +797,8 @@ fn field_string_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
     // quotes.
     let string_data = alt((
         map(tag(r#"\""#), |_| r#"""#), // escaped double quote -> double quote
-        map(tag(r#"\\"#), |_| r#"\"#), // escaped backslash --> single backslash
-        tag(r#"\"#),                   // unescaped single backslash
+        map(tag(r"\\"), |_| r"\"),     // escaped backslash --> single backslash
+        tag(r"\"),                     // unescaped single backslash
         take_while1(|c| c != '\\' && c != '"'), // anything else w/ no special handling
     ));
 
@@ -822,6 +856,10 @@ fn whitespace(i: &str) -> IResult<&str, &str> {
 
 fn is_whitespace_boundary_char(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n'
+}
+
+fn is_null_char(c: char) -> bool {
+    c == '\0'
 }
 
 /// While not all of these escape characters are required to be
@@ -1138,6 +1176,16 @@ mod test {
     }
 
     #[test]
+    fn parse_lines_returns_all_lines_even_when_a_line_errors() {
+        let input = ",tag1=1,tag2=2 value=1 123\nm,tag1=one,tag2=2 value=1 123";
+        let vals = super::parse_lines(input).collect::<Vec<Result<_>>>();
+        assert!(matches!(
+            &vals[..],
+            &[Err(Error::MeasurementValueInvalid), Ok(_)]
+        ));
+    }
+
+    #[test]
     fn escaped_str_basic() {
         // Demonstrate how strings without any escapes are handled.
         let es = EscapedStr::from("Foo");
@@ -1246,12 +1294,82 @@ mod test {
         assert_eq!(vals.unwrap().len(), 0);
     }
 
+    // tests that an incomplete tag=value pair returns an error about a malformed tagset
+    #[test]
+    fn parse_tag_no_value() {
+        let input = "testmeasure,foo= bar=1i";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::TagSetMalformed)));
+    }
+
+    // tests that just a comma after the measurement is an error
+    #[test]
+    fn parse_no_tagset() {
+        let input = "testmeasure, bar=1i";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::TagSetMalformed)));
+    }
+
+    #[test]
+    fn parse_no_measurement() {
+        let input = ",tag1=1,tag2=2 value=1 123";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+
+        // accepts `field=1` as measurement, and errors on missing field
+        let input = "field=1 1234";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::FieldSetMissing)));
+    }
+
+    // matches behavior in influxdb golang parser
+    #[test]
+    fn parse_measurement_with_eq() {
+        let input = "tag1=1 field=1 1234";
+        let vals = parse(input);
+        assert!(vals.is_ok());
+
+        let input = "tag1=1,tag2=2 value=1 123";
+        let vals = parse(input);
+        assert!(vals.is_ok());
+    }
+
+    #[test]
+    fn parse_null_measurement() {
+        let input = "\0 field=1 1234";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+
+        let input = "\0,tag1=1,tag2=2 value=1 123";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+    }
+
+    #[test]
+    fn parse_where_nulls_accepted() {
+        let input = "m,tag\x001=one,tag2=2 value=1 123
+            m,tag1=o\0ne,tag2=2 value=1 123
+            m,tag1=one,tag2=\0 value=1 123
+            m,tag1=one,tag2=2 val\0ue=1 123
+            m,tag1=one,tag2=2 value=\"v\0\" 123";
+        let vals = parse(input);
+        assert!(vals.is_ok());
+        assert_eq!(vals.unwrap().len(), 5);
+    }
+
     #[test]
     fn parse_no_fields() {
         let input = "foo 1234";
         let vals = parse(input);
 
         assert!(matches!(vals, Err(super::Error::FieldSetMissing)));
+    }
+
+    #[test]
+    fn parse_null_in_field_value() {
+        let input = "m,tag1=one,tag2=2 value=\0 123";
+        let vals = parse(input);
+        assert!(vals.is_err());
     }
 
     #[test]
@@ -1339,11 +1457,11 @@ mod test {
             // Examples from
             // https://docs.influxdata.com/influxdb/v1.8/write_protocols/line_protocol_tutorial/#special-characters
             (r#"foo asdf="too hot/cold""#, r#"too hot/cold"#),
-            (r#"foo asdf="too hot\cold""#, r#"too hot\cold"#),
-            (r#"foo asdf="too hot\\cold""#, r#"too hot\cold"#),
-            (r#"foo asdf="too hot\\\cold""#, r#"too hot\\cold"#),
-            (r#"foo asdf="too hot\\\\cold""#, r#"too hot\\cold"#),
-            (r#"foo asdf="too hot\\\\\cold""#, r#"too hot\\\cold"#),
+            (r#"foo asdf="too hot\cold""#, r"too hot\cold"),
+            (r#"foo asdf="too hot\\cold""#, r"too hot\cold"),
+            (r#"foo asdf="too hot\\\cold""#, r"too hot\\cold"),
+            (r#"foo asdf="too hot\\\\cold""#, r"too hot\\cold"),
+            (r#"foo asdf="too hot\\\\\cold""#, r"too hot\\\cold"),
         ];
 
         for (input, expected_parsed_string_value) in test_data {
@@ -1792,30 +1910,30 @@ bar value2=2i 123"#;
 
     #[test]
     fn measurement_allows_escaping_comma() {
-        assert_fully_parsed!(measurement(r#"wea\,ther"#), r#"wea,ther"#);
+        assert_fully_parsed!(measurement(r"wea\,ther"), r#"wea,ther"#);
     }
 
     #[test]
     fn measurement_allows_escaping_space() {
-        assert_fully_parsed!(measurement(r#"wea\ ther"#), r#"wea ther"#);
+        assert_fully_parsed!(measurement(r"wea\ ther"), r#"wea ther"#);
     }
 
     #[test]
     fn measurement_allows_escaping_backslash() {
-        assert_fully_parsed!(measurement(r#"\\wea\\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(measurement(r"\\wea\\ther"), r"\wea\ther");
     }
 
     #[test]
     fn measurement_allows_backslash_with_unknown_escape() {
-        assert_fully_parsed!(measurement(r#"\wea\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(measurement(r"\wea\ther"), r"\wea\ther");
     }
 
     #[test]
     fn measurement_allows_literal_newline_as_unknown_escape() {
         assert_fully_parsed!(
             measurement(
-                r#"weat\
-her"#
+                r"weat\
+her"
             ),
             "weat\\\nher",
         );
@@ -1834,7 +1952,7 @@ her"#,
 
     #[test]
     fn measurement_disallows_ending_in_backslash() {
-        let parsed = measurement(r#"weather\"#);
+        let parsed = measurement(r"weather\");
         assert!(matches!(
             parsed,
             Err(nom::Err::Failure(super::Error::EndsWithBackslash))
@@ -1843,35 +1961,35 @@ her"#,
 
     #[test]
     fn tag_key_allows_escaping_comma() {
-        assert_fully_parsed!(tag_key(r#"wea\,ther"#), r#"wea,ther"#);
+        assert_fully_parsed!(tag_key(r"wea\,ther"), r#"wea,ther"#);
     }
 
     #[test]
     fn tag_key_allows_escaping_equal() {
-        assert_fully_parsed!(tag_key(r#"wea\=ther"#), r#"wea=ther"#);
+        assert_fully_parsed!(tag_key(r"wea\=ther"), r#"wea=ther"#);
     }
 
     #[test]
     fn tag_key_allows_escaping_space() {
-        assert_fully_parsed!(tag_key(r#"wea\ ther"#), r#"wea ther"#);
+        assert_fully_parsed!(tag_key(r"wea\ ther"), r#"wea ther"#);
     }
 
     #[test]
     fn tag_key_allows_escaping_backslash() {
-        assert_fully_parsed!(tag_key(r#"\\wea\\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(tag_key(r"\\wea\\ther"), r"\wea\ther");
     }
 
     #[test]
     fn tag_key_allows_backslash_with_unknown_escape() {
-        assert_fully_parsed!(tag_key(r#"\wea\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(tag_key(r"\wea\ther"), r"\wea\ther");
     }
 
     #[test]
     fn tag_key_allows_literal_newline_as_unknown_escape() {
         assert_fully_parsed!(
             tag_key(
-                r#"weat\
-her"#
+                r"weat\
+her"
             ),
             "weat\\\nher",
         );
@@ -1890,7 +2008,7 @@ her"#,
 
     #[test]
     fn tag_key_disallows_ending_in_backslash() {
-        let parsed = tag_key(r#"weather\"#);
+        let parsed = tag_key(r"weather\");
         assert!(matches!(
             parsed,
             Err(nom::Err::Failure(super::Error::EndsWithBackslash))
@@ -1899,35 +2017,35 @@ her"#,
 
     #[test]
     fn tag_value_allows_escaping_comma() {
-        assert_fully_parsed!(tag_value(r#"wea\,ther"#), r#"wea,ther"#);
+        assert_fully_parsed!(tag_value(r"wea\,ther"), r#"wea,ther"#);
     }
 
     #[test]
     fn tag_value_allows_escaping_equal() {
-        assert_fully_parsed!(tag_value(r#"wea\=ther"#), r#"wea=ther"#);
+        assert_fully_parsed!(tag_value(r"wea\=ther"), r#"wea=ther"#);
     }
 
     #[test]
     fn tag_value_allows_escaping_space() {
-        assert_fully_parsed!(tag_value(r#"wea\ ther"#), r#"wea ther"#);
+        assert_fully_parsed!(tag_value(r"wea\ ther"), r#"wea ther"#);
     }
 
     #[test]
     fn tag_value_allows_escaping_backslash() {
-        assert_fully_parsed!(tag_value(r#"\\wea\\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(tag_value(r"\\wea\\ther"), r"\wea\ther");
     }
 
     #[test]
     fn tag_value_allows_backslash_with_unknown_escape() {
-        assert_fully_parsed!(tag_value(r#"\wea\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(tag_value(r"\wea\ther"), r"\wea\ther");
     }
 
     #[test]
     fn tag_value_allows_literal_newline_as_unknown_escape() {
         assert_fully_parsed!(
             tag_value(
-                r#"weat\
-her"#
+                r"weat\
+her"
             ),
             "weat\\\nher",
         );
@@ -1946,7 +2064,7 @@ her"#,
 
     #[test]
     fn tag_value_disallows_ending_in_backslash() {
-        let parsed = tag_value(r#"weather\"#);
+        let parsed = tag_value(r"weather\");
         assert!(matches!(
             parsed,
             Err(nom::Err::Failure(super::Error::EndsWithBackslash))
@@ -1955,35 +2073,35 @@ her"#,
 
     #[test]
     fn field_key_allows_escaping_comma() {
-        assert_fully_parsed!(field_key(r#"wea\,ther"#), r#"wea,ther"#);
+        assert_fully_parsed!(field_key(r"wea\,ther"), r#"wea,ther"#);
     }
 
     #[test]
     fn field_key_allows_escaping_equal() {
-        assert_fully_parsed!(field_key(r#"wea\=ther"#), r#"wea=ther"#);
+        assert_fully_parsed!(field_key(r"wea\=ther"), r#"wea=ther"#);
     }
 
     #[test]
     fn field_key_allows_escaping_space() {
-        assert_fully_parsed!(field_key(r#"wea\ ther"#), r#"wea ther"#);
+        assert_fully_parsed!(field_key(r"wea\ ther"), r#"wea ther"#);
     }
 
     #[test]
     fn field_key_allows_escaping_backslash() {
-        assert_fully_parsed!(field_key(r#"\\wea\\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(field_key(r"\\wea\\ther"), r"\wea\ther");
     }
 
     #[test]
     fn field_key_allows_backslash_with_unknown_escape() {
-        assert_fully_parsed!(field_key(r#"\wea\ther"#), r#"\wea\ther"#);
+        assert_fully_parsed!(field_key(r"\wea\ther"), r"\wea\ther");
     }
 
     #[test]
     fn field_key_allows_literal_newline_as_unknown_escape() {
         assert_fully_parsed!(
             field_key(
-                r#"weat\
-her"#
+                r"weat\
+her"
             ),
             "weat\\\nher",
         );
@@ -2002,7 +2120,7 @@ her"#,
 
     #[test]
     fn field_key_disallows_ending_in_backslash() {
-        let parsed = field_key(r#"weather\"#);
+        let parsed = field_key(r"weather\");
         assert!(matches!(
             parsed,
             Err(nom::Err::Failure(super::Error::EndsWithBackslash))

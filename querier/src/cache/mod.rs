@@ -10,21 +10,18 @@ use tokio::runtime::Handle;
 
 use self::{
     namespace::NamespaceCache, object_store::ObjectStoreCache, parquet_file::ParquetFileCache,
-    partition::PartitionCache, processed_tombstones::ProcessedTombstonesCache,
-    projected_schema::ProjectedSchemaCache, ram::RamSize, tombstones::TombstoneCache,
+    partition::PartitionCache, projected_schema::ProjectedSchemaCache, ram::RamSize,
 };
 
 pub mod namespace;
 pub mod object_store;
 pub mod parquet_file;
 pub mod partition;
-pub mod processed_tombstones;
 pub mod projected_schema;
 mod ram;
-pub mod tombstones;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 /// Caches request to the [`Catalog`].
 #[derive(Debug)]
@@ -38,14 +35,8 @@ pub struct CatalogCache {
     /// Namespace cache.
     namespace_cache: NamespaceCache,
 
-    /// Processed tombstone cache.
-    processed_tombstones_cache: ProcessedTombstonesCache,
-
     /// Parquet file cache
     parquet_file_cache: ParquetFileCache,
-
-    /// tombstone cache
-    tombstone_cache: TombstoneCache,
 
     /// Projected schema cache.
     projected_schema_cache: ProjectedSchemaCache,
@@ -122,11 +113,13 @@ impl CatalogCache {
             "ram_metadata",
             RamSize(ram_pool_metadata_bytes),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
         let ram_pool_data = Arc::new(ResourcePool::new(
             "ram_data",
             RamSize(ram_pool_data_bytes),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
 
         let partition_cache = PartitionCache::new(
@@ -146,23 +139,7 @@ impl CatalogCache {
             handle,
             testing,
         );
-        let processed_tombstones_cache = ProcessedTombstonesCache::new(
-            Arc::clone(&catalog),
-            backoff_config.clone(),
-            Arc::clone(&time_provider),
-            &metric_registry,
-            Arc::clone(&ram_pool_metadata),
-            testing,
-        );
         let parquet_file_cache = ParquetFileCache::new(
-            Arc::clone(&catalog),
-            backoff_config.clone(),
-            Arc::clone(&time_provider),
-            &metric_registry,
-            Arc::clone(&ram_pool_metadata),
-            testing,
-        );
-        let tombstone_cache = TombstoneCache::new(
             Arc::clone(&catalog),
             backoff_config.clone(),
             Arc::clone(&time_provider),
@@ -182,6 +159,7 @@ impl CatalogCache {
             Arc::clone(&time_provider),
             &metric_registry,
             Arc::clone(&ram_pool_data),
+            handle,
             testing,
         );
 
@@ -189,9 +167,7 @@ impl CatalogCache {
             catalog,
             partition_cache,
             namespace_cache,
-            processed_tombstones_cache,
             parquet_file_cache,
-            tombstone_cache,
             projected_schema_cache,
             object_store_cache,
             metric_registry,
@@ -224,30 +200,14 @@ impl CatalogCache {
         &self.partition_cache
     }
 
-    /// Processed tombstone cache.
-    pub(crate) fn processed_tombstones(&self) -> &ProcessedTombstonesCache {
-        &self.processed_tombstones_cache
-    }
-
     /// Parquet file cache.
     pub(crate) fn parquet_file(&self) -> &ParquetFileCache {
         &self.parquet_file_cache
     }
 
-    /// Tombstone cache.
-    pub(crate) fn tombstone(&self) -> &TombstoneCache {
-        &self.tombstone_cache
-    }
-
     /// Projected schema cache.
     pub(crate) fn projected_schema(&self) -> &ProjectedSchemaCache {
         &self.projected_schema_cache
-    }
-
-    /// Object store cache.
-    #[allow(dead_code)]
-    pub(crate) fn object_store(&self) -> &ObjectStoreCache {
-        &self.object_store_cache
     }
 
     /// Parquet store that points to the cached object store.

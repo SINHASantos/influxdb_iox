@@ -4,18 +4,19 @@
 pub(crate) mod context;
 pub mod field;
 pub mod fieldlist;
-pub(crate) mod gapfill;
+pub mod gapfill;
+mod metrics;
 mod non_null_checker;
-mod query_tracing;
+pub mod query_tracing;
 mod schema_pivot;
 pub mod seriesset;
 pub(crate) mod split;
 pub mod stringset;
 use datafusion_util::config::register_iox_object_store;
 use executor::DedicatedExecutor;
+use metric::Registry;
 use object_store::DynObjectStore;
 use parquet_file::storage::StorageId;
-use trace::span::{SpanExt, SpanRecorder};
 mod cross_rt_stream;
 
 use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
@@ -23,19 +24,22 @@ use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 use datafusion::{
     self,
     execution::{
-        context::SessionState,
         disk_manager::DiskManagerConfig,
+        memory_pool::MemoryPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
     logical_expr::{expr_rewriter::normalize_col, Extension},
     logical_expr::{Expr, LogicalPlan},
-    prelude::SessionContext,
 };
 
 pub use context::{IOxSessionConfig, IOxSessionContext, SessionContextIOxExt};
 use schema_pivot::SchemaPivotNode;
 
+use crate::exec::metrics::DataFusionMemoryPoolMetricsBridge;
+
 use self::{non_null_checker::NonNullCheckerNode, split::StreamSplitNode};
+
+const TESTING_MEM_POOL_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
 /// Configuration for an Executor
 #[derive(Debug, Clone)]
@@ -48,6 +52,9 @@ pub struct ExecutorConfig {
 
     /// Object stores
     pub object_stores: HashMap<StorageId, Arc<DynObjectStore>>,
+
+    /// Metric registry
+    pub metric_registry: Arc<Registry>,
 
     /// Memory pool size in bytes.
     pub mem_pool_size: usize,
@@ -77,9 +84,10 @@ pub struct DedicatedExecutors {
 }
 
 impl DedicatedExecutors {
-    pub fn new(num_threads: NonZeroUsize) -> Self {
-        let query_exec = DedicatedExecutor::new("IOx Query", num_threads);
-        let reorg_exec = DedicatedExecutor::new("IOx Reorg", num_threads);
+    pub fn new(num_threads: NonZeroUsize, metric_registry: Arc<Registry>) -> Self {
+        let query_exec =
+            DedicatedExecutor::new("IOx Query", num_threads, Arc::clone(&metric_registry));
+        let reorg_exec = DedicatedExecutor::new("IOx Reorg", num_threads, metric_registry);
 
         Self {
             query_exec,
@@ -138,18 +146,26 @@ pub enum ExecutorType {
 impl Executor {
     /// Creates a new executor with a two dedicated thread pools, each
     /// with num_threads
-    pub fn new(num_threads: NonZeroUsize, mem_pool_size: usize) -> Self {
+    pub fn new(
+        num_threads: NonZeroUsize,
+        mem_pool_size: usize,
+        metric_registry: Arc<Registry>,
+    ) -> Self {
         Self::new_with_config(ExecutorConfig {
             num_threads,
             target_query_partitions: num_threads,
             object_stores: HashMap::default(),
+            metric_registry,
             mem_pool_size,
         })
     }
 
     /// Create new executor based on a specific config.
     pub fn new_with_config(config: ExecutorConfig) -> Self {
-        let executors = Arc::new(DedicatedExecutors::new(config.num_threads));
+        let executors = Arc::new(DedicatedExecutors::new(
+            config.num_threads,
+            Arc::clone(&config.metric_registry),
+        ));
         Self::new_with_config_and_executors(config, executors)
     }
 
@@ -160,7 +176,8 @@ impl Executor {
             num_threads: NonZeroUsize::new(1).unwrap(),
             target_query_partitions: NonZeroUsize::new(1).unwrap(),
             object_stores: HashMap::default(),
-            mem_pool_size: 1024 * 1024 * 1024, // 1GB
+            metric_registry: Arc::new(Registry::default()),
+            mem_pool_size: TESTING_MEM_POOL_SIZE,
         };
         let executors = Arc::new(DedicatedExecutors::new_testing());
         Self::new_with_config_and_executors(config, executors)
@@ -187,6 +204,24 @@ impl Executor {
             register_iox_object_store(&runtime, id, Arc::clone(store));
         }
 
+        // As there should only be a single memory pool for any executor,
+        // verify that there was no existing instrument registered (for another pool)
+        let mut created = false;
+        let created_captured = &mut created;
+        let bridge =
+            DataFusionMemoryPoolMetricsBridge::new(&runtime.memory_pool, config.mem_pool_size);
+        let bridge_ctor = move || {
+            *created_captured = true;
+            bridge
+        };
+        config
+            .metric_registry
+            .register_instrument("datafusion_pool", bridge_ctor);
+        assert!(
+            created,
+            "More than one execution pool created: previously existing instrument"
+        );
+
         Self {
             executors,
             config,
@@ -201,18 +236,6 @@ impl Executor {
         let exec = self.executor(executor_type).clone();
         IOxSessionConfig::new(exec, Arc::clone(&self.runtime))
             .with_target_partitions(self.config.target_query_partitions)
-    }
-
-    /// Get IOx context from DataFusion state.
-    pub fn new_context_from_df(
-        &self,
-        executor_type: ExecutorType,
-        state: &SessionState,
-    ) -> IOxSessionContext {
-        let inner = SessionContext::with_state(state.clone());
-        let exec = self.executor(executor_type).clone();
-        let recorder = SpanRecorder::new(state.span_ctx().child_span("Query Execution"));
-        IOxSessionContext::new(inner, exec, recorder)
     }
 
     /// Create a new execution context, suitable for executing a new query or system task
@@ -245,6 +268,11 @@ impl Executor {
     pub async fn join(&self) {
         self.executors.query_exec.join().await;
         self.executors.reorg_exec.join().await;
+    }
+
+    /// Returns the memory pool associated with this `Executor`
+    pub fn pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.runtime.memory_pool)
     }
 }
 
@@ -354,12 +382,6 @@ pub fn make_stream_split(input: LogicalPlan, split_exprs: Vec<Expr>) -> LogicalP
     LogicalPlan::Extension(Extension { node })
 }
 
-/// A type that can provide `IOxSessionContext` for query
-pub trait ExecutionContextProvider {
-    /// Returns a new execution context suitable for running queries
-    fn new_query_context(&self, span_ctx: Option<trace::ctx::SpanContext>) -> IOxSessionContext;
-}
-
 #[cfg(test)]
 mod tests {
     use arrow::{
@@ -368,9 +390,17 @@ mod tests {
     };
     use datafusion::{
         datasource::{provider_as_source, MemTable},
+        error::DataFusionError,
         logical_expr::LogicalPlanBuilder,
+        physical_expr::PhysicalSortExpr,
+        physical_plan::{
+            expressions::Column, sorts::sort::SortExec, DisplayAs, ExecutionPlan, RecordBatchStream,
+        },
     };
+    use futures::{stream::BoxStream, Stream, StreamExt};
+    use metric::{Observation, RawReporter};
     use stringset::StringSet;
+    use tokio::sync::Barrier;
 
     use super::*;
     use crate::exec::stringset::StringSetRef;
@@ -535,6 +565,54 @@ mod tests {
         assert_eq!(results, to_set(&["f1", "f2"]));
     }
 
+    #[tokio::test]
+    async fn test_metrics_integration() {
+        let exec = Executor::new_testing();
+
+        // start w/o any reservation
+        assert_eq!(
+            PoolMetrics::read(&exec.config.metric_registry),
+            PoolMetrics {
+                reserved: 0,
+                limit: TESTING_MEM_POOL_SIZE as u64,
+            },
+        );
+
+        // block some reservation
+        let test_input = Arc::new(TestExec::default());
+        let schema = test_input.schema();
+        let plan = Arc::new(SortExec::new(
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("c", &schema).unwrap()),
+                options: Default::default(),
+            }],
+            Arc::clone(&test_input) as _,
+        ));
+        let ctx = exec.new_context(ExecutorType::Query);
+        let handle = tokio::spawn(async move {
+            ctx.collect(plan).await.unwrap();
+        });
+        test_input.wait().await;
+        assert_eq!(
+            PoolMetrics::read(&exec.config.metric_registry),
+            PoolMetrics {
+                reserved: 896,
+                limit: TESTING_MEM_POOL_SIZE as u64,
+            },
+        );
+        test_input.wait_for_finish().await;
+
+        // end w/o any reservation
+        handle.await.unwrap();
+        assert_eq!(
+            PoolMetrics::read(&exec.config.metric_registry),
+            PoolMetrics {
+                reserved: 0,
+                limit: TESTING_MEM_POOL_SIZE as u64,
+            },
+        );
+    }
+
     /// return a set for testing
     fn to_set(strs: &[&str]) -> StringSetRef {
         StringSetRef::new(strs.iter().map(|s| s.to_string()).collect::<StringSet>())
@@ -559,5 +637,164 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct TestExec {
+        schema: SchemaRef,
+        // Barrier after a batch has been produced
+        barrier: Arc<Barrier>,
+        // Barrier right before the operator is complete
+        barrier_finish: Arc<Barrier>,
+    }
+
+    impl Default for TestExec {
+        fn default() -> Self {
+            Self {
+                schema: Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                    "c",
+                    DataType::Int64,
+                    true,
+                )])),
+                barrier: Arc::new(Barrier::new(2)),
+                barrier_finish: Arc::new(Barrier::new(2)),
+            }
+        }
+    }
+
+    impl TestExec {
+        /// wait for the first output to be produced
+        pub async fn wait(&self) {
+            self.barrier.wait().await;
+        }
+
+        /// wait for output to be done
+        pub async fn wait_for_finish(&self) {
+            self.barrier_finish.wait().await;
+        }
+    }
+
+    impl DisplayAs for TestExec {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "TestExec")
+        }
+    }
+
+    impl ExecutionPlan for TestExec {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
+        }
+
+        fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+            None
+        }
+
+        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            unimplemented!()
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream>
+        {
+            let barrier = Arc::clone(&self.barrier);
+            let schema = Arc::clone(&self.schema);
+            let barrier_finish = Arc::clone(&self.barrier_finish);
+            let schema_finish = Arc::clone(&self.schema);
+            let stream = futures::stream::iter([Ok(RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![Arc::new(Int64Array::from(vec![1i64; 100]))],
+            )
+            .unwrap())])
+            .chain(futures::stream::once(async move {
+                barrier.wait().await;
+                Ok(RecordBatch::new_empty(schema))
+            }))
+            .chain(futures::stream::once(async move {
+                barrier_finish.wait().await;
+                Ok(RecordBatch::new_empty(schema_finish))
+            }));
+            let stream = BoxRecordBatchStream {
+                schema: Arc::clone(&self.schema),
+                inner: stream.boxed(),
+            };
+            Ok(Box::pin(stream))
+        }
+
+        fn statistics(&self) -> datafusion::physical_plan::Statistics {
+            Default::default()
+        }
+    }
+
+    struct BoxRecordBatchStream {
+        schema: SchemaRef,
+        inner: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    }
+
+    impl Stream for BoxRecordBatchStream {
+        type Item = Result<RecordBatch, DataFusionError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = &mut *self;
+            this.inner.poll_next_unpin(cx)
+        }
+    }
+
+    impl RecordBatchStream for BoxRecordBatchStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PoolMetrics {
+        reserved: u64,
+        limit: u64,
+    }
+
+    impl PoolMetrics {
+        fn read(registry: &Registry) -> Self {
+            let mut reporter = RawReporter::default();
+            registry.report(&mut reporter);
+            let metric = reporter.metric("datafusion_mem_pool_bytes").unwrap();
+
+            let reserved = metric.observation(&[("state", "reserved")]).unwrap();
+            let Observation::U64Gauge(reserved) = reserved else {
+                panic!("wrong metric type")
+            };
+            let limit = metric.observation(&[("state", "limit")]).unwrap();
+            let Observation::U64Gauge(limit) = limit else {
+                panic!("wrong metric type")
+            };
+
+            Self {
+                reserved: *reserved,
+                limit: *limit,
+            }
+        }
     }
 }

@@ -1,34 +1,38 @@
-use self::query_access::QuerierTableChunkPruner;
-use self::state_reconciler::Reconciler;
 use crate::{
-    ingester::{self, IngesterPartition},
+    cache::{
+        namespace::CachedTable,
+        partition::{CachedPartition, PartitionRequest},
+    },
+    ingester::{self, IngesterConnection, IngesterPartition},
     parquet::ChunkAdapter,
-    IngesterConnection,
+    CONCURRENT_CHUNK_CREATION_JOBS,
 };
-use data_types::{ColumnId, DeletePredicate, NamespaceId, PartitionId, ShardIndex, TableId};
-use datafusion::error::DataFusionError;
-use futures::join;
-use iox_query::{exec::Executor, provider, provider::ChunkPruner, QueryChunk};
-use observability_deps::tracing::{debug, trace};
-use predicate::Predicate;
-use schema::Schema;
-use sharder::JumpHash;
+use data_types::{
+    ColumnId, NamespaceId, ParquetFile, TableId, TimestampMinMax, TransitionPartitionId,
+    MAX_NANO_TIME, MIN_NANO_TIME,
+};
+use datafusion::{error::DataFusionError, prelude::Expr};
+use futures::{join, StreamExt};
+use iox_query::{
+    chunk_statistics::create_chunk_statistics, provider, pruning::prune_summaries, QueryChunk,
+};
+use observability_deps::tracing::debug;
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use schema::{Schema, TIME_COLUMN_NAME};
 use snafu::{ResultExt, Snafu};
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::time::Duration;
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 use trace::span::{Span, SpanRecorder};
 use uuid::Uuid;
 
-pub use self::query_access::metrics::PruneMetrics;
-pub(crate) use self::query_access::MetricPruningObserver;
+pub use self::metrics::PruneMetrics;
 
+mod metrics;
 mod query_access;
-mod state_reconciler;
 
 #[cfg(test)]
 mod test_util;
@@ -37,24 +41,7 @@ mod test_util;
 #[allow(clippy::large_enum_variant)]
 pub enum Error {
     #[snafu(display("Error getting partitions from ingester: {}", source))]
-    GettingIngesterPartitions { source: ingester::Error },
-
-    #[snafu(display(
-        "Ingester '{}' and '{}' both provide data for partition {}",
-        ingester1,
-        ingester2,
-        partition
-    ))]
-    IngestersOverlap {
-        ingester1: Arc<str>,
-        ingester2: Arc<str>,
-        partition: PartitionId,
-    },
-
-    #[snafu(display("Cannot combine ingester data with catalog/cache: {}", source))]
-    StateFusion {
-        source: state_reconciler::ReconcileError,
-    },
+    GettingIngesterPartitions { source: ingester::DynError },
 
     #[snafu(display("Chunk pruning failed: {}", source))]
     ChunkPruning { source: provider::Error },
@@ -70,7 +57,6 @@ impl From<Error> for DataFusionError {
 
 /// Args to create a [`QuerierTable`].
 pub struct QuerierTableArgs {
-    pub sharder: Option<Arc<JumpHash<Arc<ShardIndex>>>>,
     pub namespace_id: NamespaceId,
     pub namespace_name: Arc<str>,
     pub namespace_retention_period: Option<Duration>,
@@ -79,17 +65,12 @@ pub struct QuerierTableArgs {
     pub schema: Schema,
     pub ingester_connection: Option<Arc<dyn IngesterConnection>>,
     pub chunk_adapter: Arc<ChunkAdapter>,
-    pub exec: Arc<Executor>,
     pub prune_metrics: Arc<PruneMetrics>,
 }
 
 /// Table representation for the querier.
 #[derive(Debug)]
 pub struct QuerierTable {
-    /// Sharder to query for which shards are responsible for the table's data. If not specified,
-    /// query all ingesters because we're using the RPC write path.
-    sharder: Option<Arc<JumpHash<Arc<ShardIndex>>>>,
-
     /// Namespace the table is in
     namespace_name: Arc<str>,
 
@@ -114,9 +95,6 @@ pub struct QuerierTable {
     /// Interface to create chunks for this table.
     chunk_adapter: Arc<ChunkAdapter>,
 
-    /// Executor for queries.
-    exec: Arc<Executor>,
-
     /// Metrics for chunk pruning.
     prune_metrics: Arc<PruneMetrics>,
 }
@@ -125,7 +103,6 @@ impl QuerierTable {
     /// Create new table.
     pub fn new(args: QuerierTableArgs) -> Self {
         let QuerierTableArgs {
-            sharder,
             namespace_id,
             namespace_name,
             namespace_retention_period,
@@ -134,12 +111,10 @@ impl QuerierTable {
             schema,
             ingester_connection,
             chunk_adapter,
-            exec,
             prune_metrics,
         } = args;
 
         Self {
-            sharder,
             namespace_name,
             namespace_id,
             namespace_retention_period,
@@ -148,7 +123,6 @@ impl QuerierTable {
             schema,
             ingester_connection,
             chunk_adapter,
-            exec,
             prune_metrics,
         }
     }
@@ -159,7 +133,6 @@ impl QuerierTable {
     }
 
     /// Table ID.
-    #[allow(dead_code)]
     pub fn id(&self) -> TableId {
         self.table_id
     }
@@ -170,19 +143,14 @@ impl QuerierTable {
     }
 
     /// Query all chunks within this table.
-    ///
-    /// This currently contains all parquet files linked to their unprocessed tombstones.
     pub async fn chunks(
         &self,
-        predicate: &Predicate,
+        filters: &[Expr],
         span: Option<Span>,
         projection: Option<&Vec<usize>>,
     ) -> Result<Vec<Arc<dyn QueryChunk>>> {
         let mut span_recorder = SpanRecorder::new(span);
-        match self
-            .chunks_inner(predicate, &span_recorder, projection)
-            .await
-        {
+        match self.chunks_inner(filters, &span_recorder, projection).await {
             Ok(chunks) => {
                 span_recorder.ok("got chunks");
                 Ok(chunks)
@@ -196,99 +164,62 @@ impl QuerierTable {
 
     async fn chunks_inner(
         &self,
-        predicate: &Predicate,
+        filters: &[Expr],
         span_recorder: &SpanRecorder,
         projection: Option<&Vec<usize>>,
     ) -> Result<Vec<Arc<dyn QueryChunk>>> {
         debug!(
-            ?predicate,
+            ?filters,
             namespace=%self.namespace_name,
             table_name=%self.table_name(),
             "Fetching all chunks"
         );
 
-        let (predicate, retention_delete_pred) = match self.namespace_retention_period {
-            // The retention is not fininte, add predicate to filter out data outside retention
-            // period
-            Some(retention_period) => {
-                let retention_time_ns = self
-                    .chunk_adapter
-                    .catalog_cache()
-                    .time_provider()
-                    .now()
-                    .timestamp_nanos()
-                    - retention_period.as_nanos() as i64;
-
-                // Add predicate to only keep chunks inside the retention period: time >=
-                // retention_period
-                let predicate = predicate.clone().with_retention(retention_time_ns);
-
-                // Expression used to add to delete predicate to delete data older than retention
-                // period time < retention_time
-                let retention_delete_pred = Some(Arc::new(
-                    DeletePredicate::retention_delete_predicate(retention_time_ns),
-                ));
-
-                (Cow::Owned(predicate), retention_delete_pred)
-            }
-            // inifite retention, no need to add predicate
-            None => (Cow::Borrowed(predicate), None),
-        };
-
         let catalog_cache = self.chunk_adapter.catalog_cache();
 
-        // ask ingesters for data, also optimistically fetching catalog
-        // contents at the same time to pre-warm cache
-        let (partitions, _parquet_files, _tombstones) = join!(
-            self.ingester_partitions(
-                &predicate,
-                span_recorder.child_span("ingester partitions"),
-                projection,
-            ),
-            catalog_cache.parquet_file().get(
-                self.id(),
-                None,
-                None,
-                span_recorder.child_span("cache GET parquet_file (pre-warm")
-            ),
-            catalog_cache.tombstone().get(
-                self.id(),
-                None,
-                span_recorder.child_span("cache GET tombstone (pre-warm)")
-            ),
+        // Ask ingesters for data, also optimistically fetching catalog
+        // contents at the same time to pre-warm cache.
+        //
+        // We don't wanna wait for the cache though because we have a the actual cache request later anyways that might
+        // even invalidate what we did during warm-up. The cache system keeps requests running in the background
+        // anyways, so if the warm-up fetched up-to-date data, we'll get that from the cache later.
+        let ingester_ready = CancellationToken::new();
+        let (partitions, _) = join!(
+            async {
+                let partitions = self
+                    .ingester_partitions(
+                        filters,
+                        span_recorder.child_span("ingester partitions"),
+                        projection,
+                    )
+                    .await;
+                ingester_ready.cancel();
+                partitions
+            },
+            async {
+                tokio::select! {
+                    _ = catalog_cache.parquet_file().get(
+                        self.id(),
+                        None,
+                        span_recorder.child_span("cache GET parquet_file (pre-warm)")
+                    ) => {},
+                    _ = ingester_ready.cancelled() => {},
+                }
+            },
         );
 
         // handle errors / cache refresh
         let partitions = partitions?;
 
-        // determine max parquet sequence number for cache invalidation, if using the write buffer
-        // path.
-        let max_parquet_sequence_number = if self.rpc_write() {
-            None
-        } else {
+        // Determine number of persisted parquet files per ingester UUID seen in the ingester query
+        // responses for cache invalidation. If `persisted_file_counts_by_ingester_uuid` is empty,
+        // then there are no results from the ingesters.
+        let persisted_file_counts_by_ingester_uuid = collect_persisted_file_counts(
+            partitions.len(),
             partitions
                 .iter()
-                .flat_map(|p| p.parquet_max_sequence_number())
-                .max()
-        };
-        let max_tombstone_sequence_number = partitions
-            .iter()
-            .flat_map(|p| p.tombstone_max_sequence_number())
-            .max();
-
-        // If using the RPC write path, determine number of persisted parquet files per ingester
-        // UUID seen in the ingester query responses for cache invalidation. If this is an empty
-        // HashMap, then there are no results from the ingesters.
-        let persisted_file_counts_by_ingester_uuid = if self.rpc_write() {
-            Some(collect_persisted_file_counts(
-                partitions.len(),
-                partitions
-                    .iter()
-                    .map(|p| (p.ingester_uuid(), p.completed_persistence_count())),
-            ))
-        } else {
-            None
-        };
+                .map(|p| (p.ingester_uuid(), p.completed_persistence_count())),
+        );
 
         debug!(
             namespace=%self.namespace_name,
@@ -298,20 +229,20 @@ impl QuerierTable {
         );
 
         // Now fetch the actual contents of the catalog we need
-        // NB: Pass max parquet/tombstone sequence numbers to `get`
-        //     to ensure cache is refreshed if we learned about new files/tombstones.
-        let (parquet_files, tombstones) = join!(
-            catalog_cache.parquet_file().get(
+        // NB: Pass max parquet sequence numbers to `get`
+        //     to ensure cache is refreshed if we learned about new files.
+        let parquet_files = catalog_cache
+            .parquet_file()
+            .get(
                 self.id(),
-                max_parquet_sequence_number,
-                persisted_file_counts_by_ingester_uuid,
+                Some(persisted_file_counts_by_ingester_uuid),
                 span_recorder.child_span("cache GET parquet_file"),
-            ),
-            catalog_cache.tombstone().get(
-                self.id(),
-                max_tombstone_sequence_number,
-                span_recorder.child_span("cache GET tombstone")
             )
+            .await;
+        let num_initial_parquet_file_chunks = parquet_files.files.len();
+        debug!(
+            num_chunks = num_initial_parquet_file_chunks,
+            "Fetched Parquet file chunks"
         );
 
         let columns: HashSet<ColumnId> = parquet_files
@@ -331,72 +262,244 @@ impl QuerierTable {
             .await;
         let Some(cached_table) = cached_namespace
             .as_ref()
-            .and_then(|ns| ns.tables.get(self.table_name.as_ref())) else {
-                return Ok(vec![]);
-            };
+            .and_then(|ns| ns.tables.get(self.table_name.as_ref()))
+        else {
+            return Ok(vec![]);
+        };
+        let cached_partitions = self
+            .fetch_cached_partitions(
+                cached_table,
+                &partitions,
+                &parquet_files.files,
+                span_recorder.child_span("fetch cached partitions"),
+            )
+            .await;
 
-        let reconciler = Reconciler::new(
-            Arc::clone(&self.table_name),
-            Arc::clone(&self.namespace_name),
-            Arc::clone(self.chunk_adapter.catalog_cache()),
-            self.rpc_write(),
-        );
+        // prune partitons
+        let cached_partitions = self
+            .prune_partitions(
+                cached_partitions,
+                cached_table,
+                filters,
+                span_recorder.child_span("prune partitions"),
+            )
+            .await;
+        let mut num_intermediate_parquet_files = 0;
+        let parquet_files = parquet_files.files.iter().filter_map(|f| {
+            match cached_partitions.get(&f.partition_id) {
+                Some(cached_partition) => {
+                    num_intermediate_parquet_files += 1;
+                    Some((Arc::clone(f), Arc::clone(cached_partition)))
+                }
+                None => {
+                    self.prune_metrics
+                        .was_pruned_early(f.row_count as u64, f.file_size_bytes as u64);
+                    None
+                }
+            }
+        });
 
         // create parquet files
         let parquet_files = self
             .chunk_adapter
             .new_chunks(
                 Arc::clone(cached_table),
-                Arc::clone(&parquet_files.files),
-                &predicate,
-                MetricPruningObserver::new(Arc::clone(&self.prune_metrics)),
+                parquet_files,
+                filters,
                 span_recorder.child_span("new_chunks"),
             )
             .await;
+        let num_final_parquet_file_chunks = parquet_files.len();
 
-        let chunks = reconciler
-            .reconcile(
-                partitions,
-                tombstones.to_vec(),
-                retention_delete_pred,
-                parquet_files,
-                span_recorder.child_span("reconcile"),
+        // build final chunk list from ingester chunks + pruned parquet file chunks
+        let chunks: Vec<_> = partitions
+            .into_iter()
+            .map(|mut c| {
+                // If we have a cached partition, set this partition's column ranges to the
+                // cached column ranges. If not, this partition is likely from the ingester
+                // and doesn't have a catalog entry yet-- set its stats based on an empty range.
+                c.set_partition_column_ranges(
+                    &cached_partitions
+                        .get(&c.partition_id())
+                        .map(|cached_partition| Arc::clone(&cached_partition.column_ranges))
+                        .unwrap_or_default(),
+                );
+                c
+            })
+            .flat_map(|c| c.into_chunks().into_iter())
+            .map(|c| Arc::new(c) as Arc<dyn QueryChunk>)
+            .chain(
+                parquet_files
+                    .into_iter()
+                    .map(|c| Arc::new(c) as Arc<dyn QueryChunk>),
             )
-            .await
-            .context(StateFusionSnafu)?;
-        trace!("Fetched chunks");
+            .collect();
 
-        let num_initial_chunks = chunks.len();
-        let chunks = self
-            .chunk_pruner()
-            .prune_chunks(
-                self.table_name(),
-                // use up-to-date schema
-                &cached_table.schema,
-                chunks,
-                &predicate,
-            )
-            .context(ChunkPruningSnafu)?;
         debug!(
-            %predicate,
-            num_initial_chunks,
-            num_final_chunks=chunks.len(),
+            ?filters,
+            num_initial_parquet_file_chunks,
+            num_intermediate_parquet_files,
+            num_final_parquet_file_chunks,
+            num_ingester_chunks = chunks.len() - num_final_parquet_file_chunks,
             "pruned with pushed down predicates"
         );
         Ok(chunks)
     }
 
-    /// Get a chunk pruner that can be used to prune chunks retrieved via [`chunks`](Self::chunks)
-    pub fn chunk_pruner(&self) -> Arc<dyn ChunkPruner> {
-        Arc::new(QuerierTableChunkPruner::new(Arc::clone(
-            &self.prune_metrics,
-        )))
+    async fn fetch_cached_partitions(
+        &self,
+        cached_table: &Arc<CachedTable>,
+        ingester_partitions: &[IngesterPartition],
+        parquet_files: &[Arc<ParquetFile>],
+        span: Option<Span>,
+    ) -> Vec<Arc<CachedPartition>> {
+        let span_recorder = SpanRecorder::new(span);
+
+        let mut should_cover: HashMap<TransitionPartitionId, HashSet<ColumnId>> =
+            HashMap::with_capacity(ingester_partitions.len());
+
+        // Be optimistic and assume that all partitions cover the entire columns set. This avoids resizing the HashSets.
+        let n_table_cols = cached_table.column_id_map.len();
+        let default_hash_set = || HashSet::<ColumnId>::with_capacity(n_table_cols);
+
+        // For ingester partitions we only need the column ranges -- which are static -- not the
+        // sort key. So it is sufficient to collect the partition IDs.
+        for p in ingester_partitions {
+            should_cover
+                .entry(p.partition_id())
+                .or_insert_with(default_hash_set);
+        }
+
+        // For parquet files we must ensure that the -- potentially evolving -- sort key coveres
+        // the primary key.
+        let pk = cached_table
+            .primary_key_column_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        for f in parquet_files {
+            should_cover
+                .entry(f.partition_id.clone())
+                .or_insert_with(default_hash_set)
+                .extend(f.column_set.iter().copied().filter(|id| pk.contains(id)));
+        }
+
+        // batch request all partitions
+        let requests = should_cover
+            .into_iter()
+            .map(|(id, cover)| PartitionRequest {
+                partition_id: id,
+                sort_key_should_cover: cover.into_iter().collect(),
+            })
+            .collect();
+        self.chunk_adapter
+            .catalog_cache()
+            .partition()
+            .get(
+                Arc::clone(cached_table),
+                requests,
+                span_recorder.child_span("fetch partitions"),
+            )
+            .await
+    }
+
+    async fn prune_partitions(
+        &self,
+        partitions: Vec<Arc<CachedPartition>>,
+        cached_table: &Arc<CachedTable>,
+        filters: &[Expr],
+        span: Option<Span>,
+    ) -> HashMap<TransitionPartitionId, Arc<CachedPartition>> {
+        let span_recorder = SpanRecorder::new(span);
+
+        let projections = partitions
+            .iter()
+            .map(|p| {
+                let mut projection = p
+                    .column_ranges
+                    .keys()
+                    .filter_map(|col| cached_table.column_id_map_rev.get(col).copied())
+                    .collect::<Vec<_>>();
+
+                // "time" is always required, otherwise DataFusion will be confused since it is marked as "not NULL"
+                if !p.column_ranges.contains_key(TIME_COLUMN_NAME) {
+                    if let Some(col_id) = cached_table.column_id_map_rev.get(TIME_COLUMN_NAME) {
+                        projection.push(*col_id);
+                    }
+                }
+
+                projection.sort();
+                projection.into()
+            })
+            .collect::<Vec<Box<[ColumnId]>>>();
+
+        let unique_projections = projections.iter().cloned().collect::<HashSet<_>>();
+        let mut unique_projections = unique_projections.into_iter().collect::<Vec<_>>();
+        unique_projections.sort();
+        let mut rng = StdRng::seed_from_u64(cached_table.id.get() as u64);
+        unique_projections.shuffle(&mut rng);
+
+        let projection_to_schema = futures::stream::iter(unique_projections)
+            .map(|column_ids| {
+                let span_recorder = &span_recorder;
+                let cached_table = Arc::clone(cached_table);
+                async move {
+                    let schema = self
+                        .chunk_adapter
+                        .catalog_cache()
+                        .projected_schema()
+                        .get(
+                            cached_table,
+                            column_ids.clone(),
+                            span_recorder.child_span("cache GET projected schema"),
+                        )
+                        .await;
+                    (column_ids, schema)
+                }
+            })
+            .buffer_unordered(CONCURRENT_CHUNK_CREATION_JOBS)
+            .collect::<HashMap<_, _>>()
+            .await;
+
+        let summaries = partitions
+            .iter()
+            .zip(projections)
+            .map(|(p, projection)| {
+                let schema = projection_to_schema
+                    .get(&projection)
+                    .expect("just gathered all projections");
+
+                // provide "all time" fall back for time column because DataFusion doesn't like if we set this to NULL
+                let ts_min_max = (!p.column_ranges.contains_key(TIME_COLUMN_NAME))
+                    .then(|| TimestampMinMax::new(MIN_NANO_TIME, MAX_NANO_TIME));
+
+                let stats =
+                    create_chunk_statistics(None, schema, ts_min_max, Some(&p.column_ranges));
+                (Arc::new(stats), Arc::clone(schema.inner()))
+            })
+            .collect::<Vec<_>>();
+
+        match prune_summaries(&cached_table.schema, &summaries, filters) {
+            Ok(mask) => partitions
+                .into_iter()
+                .zip(mask)
+                .filter(|(_p, m)| *m)
+                .map(|(p, _m)| (p.id.clone(), p))
+                .collect(),
+            Err(e) => {
+                debug!(
+                    %e,
+                    "cannot prune partitions",
+                );
+                partitions.into_iter().map(|p| (p.id.clone(), p)).collect()
+            }
+        }
     }
 
     /// Get partitions from ingesters.
     async fn ingester_partitions(
         &self,
-        predicate: &Predicate,
+        filters: &[Expr],
         span: Option<Span>,
         projection: Option<&Vec<usize>>,
     ) -> Result<Vec<IngesterPartition>> {
@@ -406,7 +509,7 @@ impl QuerierTable {
             match self
                 .ingester_partitions_inner(
                     Arc::clone(ingester_connection),
-                    predicate,
+                    filters,
                     &span_recorder,
                     projection,
                 )
@@ -431,7 +534,7 @@ impl QuerierTable {
     async fn ingester_partitions_inner(
         &self,
         ingester_connection: Arc<dyn IngesterConnection>,
-        predicate: &Predicate,
+        filters: &[Expr],
         span_recorder: &SpanRecorder,
         projection: Option<&Vec<usize>>,
     ) -> Result<Vec<IngesterPartition>> {
@@ -439,38 +542,29 @@ impl QuerierTable {
         // The provided projection should include all columns needed by the query
         let columns = self.schema.select_given_and_pk_columns(projection);
 
-        // Get the shard indexes responsible for this table's data from the sharder to
-        // determine which ingester(s) to query.
-        // Currently, the sharder will only return one shard index per table, but in the
-        // near future, the sharder might return more than one shard index for one table.
-        let shard_indexes = self
-            .sharder
-            .as_ref()
-            .map(|sharder| vec![**sharder.shard_for_query(&self.table_name, &self.namespace_name)]);
-
         // get cached table w/o any must-coverage information
-        let Some(cached_table) = self.chunk_adapter
+        let Some(cached_table) = self
+            .chunk_adapter
             .catalog_cache()
             .namespace()
             .get(
                 Arc::clone(&self.namespace_name),
                 &[],
-                span_recorder.child_span("get namespace")
+                span_recorder.child_span("get namespace"),
             )
             .await
             .and_then(|ns| ns.tables.get(&self.table_name).cloned())
         else {
-            return Ok(vec![])
+            return Ok(vec![]);
         };
 
         // get any chunks from the ingester(s)
         let partitions_result = ingester_connection
             .partitions(
-                shard_indexes,
                 self.namespace_id,
                 cached_table,
                 columns,
-                predicate,
+                filters,
                 span_recorder.child_span("IngesterConnection partitions"),
             )
             .await
@@ -478,32 +572,7 @@ impl QuerierTable {
 
         let partitions = partitions_result?;
 
-        if !self.rpc_write() {
-            // check that partitions from ingesters don't overlap
-            let mut seen = HashMap::with_capacity(partitions.len());
-            for partition in &partitions {
-                match seen.entry(partition.partition_id()) {
-                    Entry::Occupied(o) => {
-                        return Err(Error::IngestersOverlap {
-                            ingester1: Arc::clone(o.get()),
-                            ingester2: Arc::clone(partition.ingester()),
-                            partition: partition.partition_id(),
-                        })
-                    }
-                    Entry::Vacant(v) => {
-                        v.insert(Arc::clone(partition.ingester()));
-                    }
-                }
-            }
-        }
-
         Ok(partitions)
-    }
-
-    /// Whether we're using the RPC write path or not. Write buffer mode will always specify a
-    /// sharder; the RPC write path never will.
-    fn rpc_write(&self) -> bool {
-        self.sharder.is_none()
     }
 
     /// clear the parquet file cache
@@ -514,15 +583,6 @@ impl QuerierTable {
             .parquet_file()
             .expire(self.table_id)
     }
-
-    /// clear the tombstone cache
-    #[cfg(test)]
-    fn clear_tombstone_cache(&self) {
-        self.chunk_adapter
-            .catalog_cache()
-            .tombstone()
-            .expire(self.table_id)
-    }
 }
 
 // Given metadata from a list of ingester request [`PartitionData`]s, sum the total completed
@@ -531,15 +591,13 @@ impl QuerierTable {
 // therefore needs to refresh its view of the catalog.
 fn collect_persisted_file_counts(
     capacity: usize,
-    partitions: impl Iterator<Item = (Option<Uuid>, u64)>,
+    partitions: impl Iterator<Item = (Uuid, u64)>,
 ) -> HashMap<Uuid, u64> {
     partitions.fold(
         HashMap::with_capacity(capacity),
         |mut map, (uuid, count)| {
-            if let Some(uuid) = uuid {
-                let sum = map.entry(uuid).or_default();
-                *sum += count;
-            }
+            let sum = map.entry(uuid).or_default();
+            *sum += count;
             map
         },
     )
@@ -549,20 +607,29 @@ fn collect_persisted_file_counts(
 mod tests {
     use super::*;
     use crate::{
+        cache::test_util::{assert_cache_access_metric_count, assert_catalog_access_metric_count},
         ingester::{test_util::MockIngesterConnection, IngesterPartition},
         table::test_util::{querier_table, IngesterPartitionBuilder},
     };
+    use arrow::datatypes::DataType;
     use arrow_util::assert_batches_eq;
-    use assert_matches::assert_matches;
-    use data_types::{ChunkId, ColumnType, CompactionLevel, SequenceNumber};
-    use iox_query::exec::IOxSessionContext;
+    use chrono::{Datelike, TimeZone, Utc};
+    use data_types::{ChunkId, ColumnType};
+    use datafusion::{
+        prelude::{col, lit},
+        scalar::ScalarValue,
+    };
+    use datafusion_util::make_range_expr;
+    use generated_types::influxdata::iox::partition_template::v1::{
+        template_part::Part, PartitionTemplate, TemplatePart,
+    };
+    use iox_query::{chunk_statistics::ColumnRange, exec::IOxSessionContext};
     use iox_tests::{TestCatalog, TestParquetFileBuilder, TestTable};
-    use iox_time::TimeProvider;
-    use predicate::Predicate;
-    use schema::{builder::SchemaBuilder, InfluxFieldType};
+    use metric::{Observation, RawReporter};
+    use schema::{builder::SchemaBuilder, InfluxFieldType, TIME_COLUMN_NAME, TIME_DATA_TIMEZONE};
     use std::sync::Arc;
     use test_helpers::maybe_start_logging;
-    use trace::{span::SpanStatus, RingBufferTraceCollector};
+    use trace::RingBufferTraceCollector;
 
     #[test]
     fn sum_up_persisted_file_counts() {
@@ -572,107 +639,13 @@ mod tests {
             "Expected output to be empty, instead was: {output:?}"
         );
 
-        // If there's no UUIDs, don't count anything
-        let input = [(None, 10)];
+        let uuid1 = Uuid::new_v4();
+        let uuid2 = Uuid::new_v4();
+        let input = [(uuid1, 20), (uuid1, 22), (uuid2, 30)];
         let output = collect_persisted_file_counts(input.len(), input.into_iter());
-        assert!(
-            output.is_empty(),
-            "Expected output to be empty, instead was: {output:?}"
-        );
-
-        let uuid = Uuid::new_v4();
-        let input = [(Some(uuid), 20), (Some(uuid), 22), (None, 10)];
-        let output = collect_persisted_file_counts(input.len(), input.into_iter());
-        assert_eq!(output.len(), 1);
-        assert_eq!(*output.get(&uuid).unwrap(), 42);
-    }
-
-    #[tokio::test]
-    async fn test_prune_parquet_chunks_outside_retention() {
-        test_helpers::maybe_start_logging();
-
-        let catalog = TestCatalog::new();
-
-        // namespace with 1-hour retention policy
-        let ns = catalog.create_namespace_1hr_retention("ns").await;
-        let inside_retention = catalog.time_provider.now().timestamp_nanos(); // now
-        let outside_retention =
-            inside_retention - Duration::from_secs(2 * 60 * 60).as_nanos() as i64; // 2 hours ago
-
-        let shard = ns.create_shard(1).await;
-        let table = ns.create_table("cpu").await;
-
-        table.create_column("host", ColumnType::Tag).await;
-        table.create_column("time", ColumnType::Time).await;
-        table.create_column("load", ColumnType::F64).await;
-
-        let partition = table.with_shard(&shard).create_partition("a").await;
-
-        let querier_table = TestQuerierTable::new(&catalog, &table).await;
-
-        // no parquet files yet
-        assert!(querier_table.chunks().await.unwrap().is_empty());
-
-        // C1: partially inside retention
-        let lp = format!(
-            "
-                cpu,host=a load=1 {inside_retention}\n
-                cpu,host=aa load=11 {outside_retention}\n
-            "
-        );
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol(&lp)
-            .with_max_seq(1)
-            .with_min_time(outside_retention)
-            .with_max_time(inside_retention);
-        let file_partially_inside = partition.create_parquet_file(builder).await;
-
-        // C2: fully inside retention
-        let lp = format!(
-            "
-            cpu,host=b load=2 {inside_retention}\n
-            cpu,host=bb load=21 {inside_retention}\n
-            "
-        );
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol(&lp)
-            .with_max_seq(2)
-            .with_min_time(inside_retention)
-            .with_max_time(inside_retention);
-        let file_fully_inside = partition.create_parquet_file(builder).await;
-
-        // C3: fully outside retention
-        let lp = format!(
-            "
-            cpu,host=z load=0 {outside_retention}\n
-            cpu,host=zz load=01 {outside_retention}\n
-            "
-        );
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol(&lp)
-            .with_max_seq(3)
-            .with_min_time(outside_retention)
-            .with_max_time(outside_retention);
-        let _file_fully_outside = partition.create_parquet_file(builder).await;
-
-        // As we have now made new parquet files, force a cache refresh
-        querier_table.inner().clear_parquet_cache();
-        querier_table.inner().clear_tombstone_cache();
-
-        // Invoke chunks that will prune chunks fully outside retention C3
-        let mut chunks = querier_table.chunks().await.unwrap();
-        chunks.sort_by_key(|c| c.id());
-        assert_eq!(chunks.len(), 2);
-
-        // check IDs
-        assert_eq!(
-            chunks[0].id(),
-            ChunkId::new_test(file_partially_inside.parquet_file.id.get() as u128),
-        );
-        assert_eq!(
-            chunks[1].id(),
-            ChunkId::new_test(file_fully_inside.parquet_file.id.get() as u128),
-        );
+        assert_eq!(output.len(), 2);
+        assert_eq!(*output.get(&uuid1).unwrap(), 42);
+        assert_eq!(*output.get(&uuid2).unwrap(), 30);
     }
 
     #[tokio::test]
@@ -686,12 +659,9 @@ mod tests {
         let table1 = ns.create_table("table1").await;
         let table2 = ns.create_table("table2").await;
 
-        let shard1 = ns.create_shard(1).await;
-        let shard2 = ns.create_shard(2).await;
-
-        let partition11 = table1.with_shard(&shard1).create_partition("k").await;
-        let partition12 = table1.with_shard(&shard2).create_partition("k").await;
-        let partition21 = table2.with_shard(&shard1).create_partition("k").await;
+        let partition11 = table1.create_partition("k").await;
+        let partition12 = table1.create_partition("k").await;
+        let partition21 = table2.create_partition("k").await;
 
         table1.create_column("time", ColumnType::Time).await;
         table1.create_column("foo", ColumnType::F64).await;
@@ -705,91 +675,69 @@ mod tests {
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=1 11")
-            .with_max_seq(2)
             .with_min_time(11)
             .with_max_time(11);
         let file111 = partition11.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=2 22")
-            .with_max_seq(4)
             .with_min_time(22)
             .with_max_time(22);
         let file112 = partition11.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=3 33")
-            .with_max_seq(6)
             .with_min_time(33)
             .with_max_time(33);
         let file113 = partition11.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=4 44")
-            .with_max_seq(8)
             .with_min_time(44)
             .with_max_time(44);
         let file114 = partition11.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=5 55")
-            .with_max_seq(10)
             .with_min_time(55)
             .with_max_time(55);
         let file115 = partition11.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=5 55")
-            .with_max_seq(2)
             .with_min_time(55)
             .with_max_time(55);
         let file121 = partition12.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=10 100")
-            .with_max_seq(2)
             .with_min_time(99)
             .with_max_time(99);
         let file122 = partition12.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table1 foo=10 100")
-            .with_max_seq(2)
             .with_min_time(100)
             .with_max_time(100);
         let _file123 = partition12.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
             .with_line_protocol("table2 foo=6 66")
-            .with_max_seq(2)
             .with_min_time(66)
             .with_max_time(66);
         let _file211 = partition21.create_parquet_file(builder).await;
 
         file111.flag_for_delete().await;
 
-        let tombstone1 = table1
-            .with_shard(&shard1)
-            .create_tombstone(7, 1, 100, "foo=1")
-            .await;
-        tombstone1.mark_processed(&file112).await;
-        let tombstone2 = table1
-            .with_shard(&shard1)
-            .create_tombstone(8, 1, 100, "foo=1")
-            .await;
-        tombstone2.mark_processed(&file112).await;
-
         // As we have now made new parquet files, force a cache refresh
         querier_table.inner().clear_parquet_cache();
-        querier_table.inner().clear_tombstone_cache();
 
         // now we have some files
         // this contains all files except for:
         // - file111: marked for delete
         // - file221: wrong table
-        // - file123: filtered by predicate
-        let pred = Predicate::new().with_range(0, 100);
-        let mut chunks = querier_table.chunks_with_predicate(&pred).await.unwrap();
+        let filters = vec![make_range_expr(0, 100, TIME_COLUMN_NAME)];
+        let mut chunks = querier_table.chunks_with_predicate(&filters).await.unwrap();
         chunks.sort_by_key(|c| c.id());
         assert_eq!(chunks.len(), 6);
 
@@ -818,20 +766,6 @@ mod tests {
             chunks[5].id(),
             ChunkId::new_test(file122.parquet_file.id.get() as u128),
         );
-
-        // check delete predicates
-        // file112: marked as processed
-        assert_eq!(chunks[0].delete_predicates().len(), 0);
-        // file113: has delete predicate
-        assert_eq!(chunks[1].delete_predicates().len(), 2);
-        // file114: predicates are directly within the chunk range => assume they are materialized
-        assert_eq!(chunks[2].delete_predicates().len(), 0);
-        // file115: came after in sequence
-        assert_eq!(chunks[3].delete_predicates().len(), 0);
-        // file121: wrong shard
-        assert_eq!(chunks[4].delete_predicates().len(), 0);
-        // file122: wrong shard
-        assert_eq!(chunks[5].delete_predicates().len(), 0);
     }
 
     #[tokio::test]
@@ -840,30 +774,28 @@ mod tests {
         let catalog = TestCatalog::new();
         let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table = ns.create_table("table").await;
-        let shard = ns.create_shard(1).await;
-        let partition = table.with_shard(&shard).create_partition("k").await;
+        let partition = table.create_partition("k").await;
         let schema = make_schema_two_fields_two_tags(&table).await;
 
         // let add a partion from the ingester
-        let builder = IngesterPartitionBuilder::new(schema, &shard, &partition)
+        let builder = IngesterPartitionBuilder::new(schema, &partition)
             .with_lp(["table,tag1=val1,tag2=val2 foo=3,bar=4 11"]);
 
-        let ingester_partition =
-            builder.build_with_max_parquet_sequence_number(Some(SequenceNumber::new(1)));
+        let ingester_partition = builder.build();
 
         let querier_table = TestQuerierTable::new(&catalog, &table)
             .await
             .with_ingester_partition(ingester_partition);
 
         // Expect one chunk from the ingester
-        let pred = Predicate::new().with_range(0, 100);
+        let filters = vec![make_range_expr(0, 100, TIME_COLUMN_NAME)];
         let chunks = querier_table
-            .chunks_with_predicate_and_projection(&pred, Some(&vec![1])) // only select `foo` column
+            .chunks_with_predicate_and_projection(&filters, Some(&vec![1])) // only select `foo` column
             .await
             .unwrap();
         assert_eq!(chunks.len(), 1);
         let chunk = &chunks[0];
-        assert_eq!(chunk.chunk_type(), "IngesterPartition");
+        assert_eq!(chunk.chunk_type(), "ingester");
 
         // verify chunk schema
         let schema = chunk.schema();
@@ -904,277 +836,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compactor_collision() {
-        maybe_start_logging();
-        let catalog = TestCatalog::new();
-
-        let ns = catalog.create_namespace_1hr_retention("ns").await;
-        let table = ns.create_table("table").await;
-        let shard = ns.create_shard(1).await;
-        let partition = table.with_shard(&shard).create_partition("k").await;
-        let schema = make_schema(&table).await;
-
-        // create a parquet file that cannot be processed by the querier:
-        //
-        //
-        // --------------------------- sequence number ----------------------------->
-        // |           0           |           1           |           2           |
-        //
-        //
-        //                          Available Information:
-        // (        ingester reports as "persited"         )
-        //                                                 ( ingester in-mem data  )
-        //                         (                  parquet file                 )
-        //
-        //
-        //                        Desired Information:
-        //                         (  wanted parquet data  )
-        //                                                 ( ignored parquet data  )
-        //                                                 ( ingester in-mem data  )
-        //
-        //
-        // However there is no way to split the parquet data into the "wanted" and "ignored" part
-        // because we don't have row-level sequence numbers.
-
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=1 11")
-            .with_max_seq(2)
-            .with_compaction_level(CompactionLevel::FileNonOverlapped);
-        partition.create_parquet_file(builder).await;
-
-        let builder = IngesterPartitionBuilder::new(schema, &shard, &partition);
-        let ingester_partition =
-            builder.build_with_max_parquet_sequence_number(Some(SequenceNumber::new(1)));
-
-        let querier_table = TestQuerierTable::new(&catalog, &table)
-            .await
-            .with_ingester_partition(ingester_partition);
-
-        let err = querier_table.chunks().await.unwrap_err();
-        assert_matches!(err, Error::StateFusion { .. });
-    }
-
-    #[tokio::test]
-    async fn test_state_reconcile() {
-        maybe_start_logging();
-        let catalog = TestCatalog::new();
-        // infinite retention
-        let ns = catalog.create_namespace_with_retention("ns", None).await;
-        let table = ns.create_table("table").await;
-        let shard = ns.create_shard(1).await;
-        let partition1 = table.with_shard(&shard).create_partition("k1").await;
-        let partition2 = table.with_shard(&shard).create_partition("k2").await;
-        table.create_column("time", ColumnType::Time).await;
-        table.create_column("foo", ColumnType::F64).await;
-
-        // kept because max sequence number <= 2
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=1 11")
-            .with_max_seq(2);
-        let file1 = partition1.create_parquet_file(builder).await;
-
-        // pruned because min sequence number > 2
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=2 22")
-            .with_max_seq(3);
-        partition1.create_parquet_file(builder).await;
-
-        // kept because max sequence number <= 3
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=1 11")
-            .with_max_seq(3);
-        let file2 = partition2.create_parquet_file(builder).await;
-
-        // pruned because min sequence number > 3
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=2 22")
-            .with_max_seq(4);
-        partition2.create_parquet_file(builder).await;
-
-        // partition1: kept because sequence number <= 10
-        // partition2: kept because sequence number <= 11
-        table
-            .with_shard(&shard)
-            .create_tombstone(10, 1, 100, "foo=1")
-            .await;
-
-        // partition1: pruned because sequence number > 10
-        // partition2: kept because sequence number <= 11
-        table
-            .with_shard(&shard)
-            .create_tombstone(11, 1, 100, "foo=2")
-            .await;
-
-        // partition1: pruned because sequence number > 10
-        // partition2: pruned because sequence number > 11
-        table
-            .with_shard(&shard)
-            .create_tombstone(12, 1, 100, "foo=3")
-            .await;
-
-        let schema = SchemaBuilder::new()
-            .influx_field("foo", InfluxFieldType::Integer)
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let ingester_chunk_id1 = u128::MAX - 1;
-
-        let builder1 = IngesterPartitionBuilder::new(schema.clone(), &shard, &partition1);
-        let builder2 = IngesterPartitionBuilder::new(schema, &shard, &partition2);
-        let querier_table = TestQuerierTable::new(&catalog, &table)
-            .await
-            .with_ingester_partition(
-                // this chunk is kept
-                builder1
-                    .with_ingester_chunk_id(ingester_chunk_id1)
-                    .with_lp(["table foo=3i 33"])
-                    .build(
-                        // parquet max persisted sequence number
-                        Some(SequenceNumber::new(2)),
-                        // tombstone max persisted sequence number
-                        Some(SequenceNumber::new(10)),
-                    ),
-            )
-            .with_ingester_partition(
-                // this chunk is filtered out because it has no record batches but the reconciling
-                // still takes place
-                builder2.with_ingester_chunk_id(u128::MAX).build(
-                    // parquet max persisted sequence number
-                    Some(SequenceNumber::new(3)),
-                    // tombstone max persisted sequence number
-                    Some(SequenceNumber::new(11)),
-                ),
-            );
-
-        let mut chunks = querier_table.chunks().await.unwrap();
-
-        chunks.sort_by_key(|c| c.id());
-
-        // three chunks (two parquet files and one for the in-mem ingester data)
-        assert_eq!(chunks.len(), 3);
-
-        // check IDs
-        assert_eq!(
-            chunks[0].id(),
-            ChunkId::new_test(file1.parquet_file.id.get() as u128),
-        );
-        assert_eq!(
-            chunks[1].id(),
-            ChunkId::new_test(file2.parquet_file.id.get() as u128),
-        );
-        assert_eq!(chunks[2].id(), ChunkId::new_test(ingester_chunk_id1));
-
-        // check types
-        assert_eq!(chunks[0].chunk_type(), "parquet");
-        assert_eq!(chunks[1].chunk_type(), "parquet");
-        assert_eq!(chunks[2].chunk_type(), "IngesterPartition");
-
-        // check delete predicates
-        // parquet chunks have predicate attached
-        assert_eq!(chunks[0].delete_predicates().len(), 1);
-        assert_eq!(chunks[1].delete_predicates().len(), 2);
-        // ingester in-mem chunk doesn't need predicates, because the ingester has already
-        // materialized them for us
-        assert_eq!(chunks[2].delete_predicates().len(), 0);
-
-        // check spans
-        let root_span = querier_table
-            .traces
-            .spans()
-            .into_iter()
-            .find(|s| s.name == "root")
-            .expect("root span not found");
-        assert_eq!(root_span.status, SpanStatus::Ok);
-        let ip_span = querier_table
-            .traces
-            .spans()
-            .into_iter()
-            .find(|s| s.name == "ingester partitions")
-            .expect("ingester partitions span not found");
-        assert_eq!(ip_span.status, SpanStatus::Ok);
-    }
-
-    #[tokio::test]
-    async fn test_ingester_overlap_detection() {
-        maybe_start_logging();
-        let catalog = TestCatalog::new();
-
-        let ns = catalog.create_namespace_1hr_retention("ns").await;
-        let table = ns.create_table("table").await;
-        let shard = ns.create_shard(1).await;
-        let partition1 = table.with_shard(&shard).create_partition("k1").await;
-        let partition2 = table.with_shard(&shard).create_partition("k2").await;
-
-        let schema = SchemaBuilder::new()
-            .influx_field("foo", InfluxFieldType::Integer)
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let builder1 = IngesterPartitionBuilder::new(schema.clone(), &shard, &partition1);
-        let builder2 = IngesterPartitionBuilder::new(schema, &shard, &partition2);
-
-        let querier_table = TestQuerierTable::new(&catalog, &table)
-            .await
-            .with_ingester_partition(
-                builder1
-                    .clone()
-                    .with_ingester_chunk_id(1)
-                    .with_lp(vec!["table foo=1i 1"])
-                    .build(
-                        // parquet max persisted sequence number
-                        None, // tombstone max persisted sequence number
-                        None,
-                    ),
-            )
-            .with_ingester_partition(
-                builder2
-                    .with_ingester_chunk_id(2)
-                    .with_lp(vec!["table foo=2i 2"])
-                    .build(
-                        // parquet max persisted sequence number
-                        None, // tombstone max persisted sequence number
-                        None,
-                    ),
-            )
-            .with_ingester_partition(
-                builder1
-                    .with_ingester_chunk_id(3)
-                    .with_lp(vec!["table foo=3i 3"])
-                    .build(
-                        // parquet max persisted sequence number
-                        None, // tombstone max persisted sequence number
-                        None,
-                    ),
-            );
-
-        let err = querier_table.chunks().await.unwrap_err();
-
-        assert_matches!(err, Error::IngestersOverlap { .. });
-    }
-
-    #[tokio::test]
     async fn test_parquet_cache_refresh() {
         maybe_start_logging();
         let catalog = TestCatalog::new();
         let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table = ns.create_table("table1").await;
-        let shard = ns.create_shard(1).await;
-        let partition = table.with_shard(&shard).create_partition("k").await;
+        let partition = table.create_partition("k").await;
         let schema = make_schema(&table).await;
 
-        let builder =
-            IngesterPartitionBuilder::new(schema, &shard, &partition).with_lp(["table foo=1 1"]);
+        let builder = IngesterPartitionBuilder::new(schema, &partition).with_lp(["table foo=1 1"]);
 
         // Parquet file between with max sequence number 2
-        let pf_builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table1 foo=1 11")
-            .with_max_seq(2);
+        let pf_builder = TestParquetFileBuilder::default().with_line_protocol("table1 foo=1 11");
         partition.create_parquet_file(pf_builder).await;
 
-        let ingester_partition =
-            builder.build_with_max_parquet_sequence_number(Some(SequenceNumber::new(2)));
+        let ingester_partition = builder.build();
 
         let querier_table = TestQuerierTable::new(&catalog, &table)
             .await
@@ -1185,9 +861,7 @@ mod tests {
         assert_eq!(chunks.len(), 2);
 
         // Now, make a second chunk with max sequence number 3
-        let pf_builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table1 foo=1 22")
-            .with_max_seq(3);
+        let pf_builder = TestParquetFileBuilder::default().with_line_protocol("table1 foo=1 22");
         partition.create_parquet_file(pf_builder).await;
 
         // With the same ingester response, still expect 2 chunks: one
@@ -1195,10 +869,8 @@ mod tests {
         let chunks = querier_table.chunks().await.unwrap();
         assert_eq!(chunks.len(), 2);
 
-        // update the ingester response to return a new max parquet
-        // sequence number that includes the new file (3)
-        let ingester_partition =
-            builder.build_with_max_parquet_sequence_number(Some(SequenceNumber::new(3)));
+        // update the ingester response
+        let ingester_partition = builder.build();
 
         let querier_table = querier_table
             .clear_ingester_partitions()
@@ -1210,106 +882,262 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tombstone_cache_refresh() {
+    async fn test_custom_partitioning() {
         maybe_start_logging();
         let catalog = TestCatalog::new();
-        // infinite retention
-        let ns = catalog.create_namespace_with_retention("ns", None).await;
-        let table = ns.create_table("table1").await;
-        let shard = ns.create_shard(1).await;
-        let partition = table.with_shard(&shard).create_partition("k").await;
-        let schema = make_schema(&table).await;
-        // Expect 1 chunk with with one delete predicate
-        let querier_table = TestQuerierTable::new(&catalog, &table).await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
+        let table = ns
+            .create_table_with_partition_template(
+                "table",
+                Some(PartitionTemplate {
+                    parts: vec![TemplatePart {
+                        part: Some(Part::TagValue(String::from("tag1"))),
+                    }],
+                }),
+            )
+            .await;
+        let partition_a = table.create_partition("val1a").await;
+        let partition_b = table.create_partition("val1b").await;
+        let schema = make_schema_two_fields_two_tags(&table).await;
 
-        let builder =
-            IngesterPartitionBuilder::new(schema, &shard, &partition).with_lp(["table foo=1 1"]);
-
-        // parquet file with max sequence number 1
-        let pf_builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table1 foo=1 11")
-            .with_max_seq(1);
-        partition.create_parquet_file(pf_builder).await;
-
-        // tombstone with max sequence number 2
-        table
-            .with_shard(&shard)
-            .create_tombstone(2, 1, 100, "foo=1")
+        let file1 = partition_a
+            .create_parquet_file(
+                TestParquetFileBuilder::default()
+                    .with_line_protocol("table,tag1=val1a,tag2=val2a foo=3,bar=4 10")
+                    .with_min_time(10)
+                    .with_max_time(10),
+            )
+            .await;
+        let _file2 = partition_b
+            .create_parquet_file(
+                TestParquetFileBuilder::default()
+                    .with_line_protocol("table,tag1=val1b,tag2=val2b foo=3,bar=4 10")
+                    .with_min_time(10)
+                    .with_max_time(10),
+            )
             .await;
 
-        let max_parquet_sequence_number = Some(SequenceNumber::new(1));
-        let max_tombstone_sequence_number = Some(SequenceNumber::new(2));
-        let ingester_partition =
-            builder.build(max_parquet_sequence_number, max_tombstone_sequence_number);
+        let querier_table = TestQuerierTable::new(&catalog, &table)
+            .await
+            .with_ingester_partition(
+                IngesterPartitionBuilder::new(schema.clone(), &partition_a)
+                    .with_lp(["table,tag1=val1a,tag2=val2a foo=3,bar=4 11"])
+                    .with_column_ranges(Arc::new(HashMap::from([(
+                        Arc::from("tag1"),
+                        ColumnRange {
+                            min_value: Arc::new(ScalarValue::from("val1a")),
+                            max_value: Arc::new(ScalarValue::from("val1a")),
+                        },
+                    )])))
+                    .build(),
+            );
 
-        let querier_table = querier_table.with_ingester_partition(ingester_partition);
+        // Expect one chunk from the ingester because the ingester does its own pruning now
+        let filters = vec![col("tag1").eq(lit(ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::from("val1a")),
+        )))];
+        let mut chunks = querier_table
+            .chunks_with_predicate_and_projection(&filters, None)
+            .await
+            .unwrap();
+        chunks.sort_by_key(|c| c.chunk_type().to_owned());
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_type(), "ingester");
+        assert_eq!(chunks[1].chunk_type(), "parquet");
+        assert_eq!(
+            chunks[1].id().get().as_u128(),
+            file1.parquet_file.id.get() as u128
+        );
 
-        let deletes = num_deletes(querier_table.chunks().await.unwrap());
-        assert_eq!(&deletes, &[1, 0]);
-
-        // Now, make a second tombstone with max sequence number 3
-        table
-            .with_shard(&shard)
-            .create_tombstone(3, 1, 100, "foo=1")
-            .await;
-
-        // With the same ingester response, still expect 1 delete
-        // (because cache is not cleared)
-        let deletes = num_deletes(querier_table.chunks().await.unwrap());
-        assert_eq!(&deletes, &[1, 0]);
-
-        // update the ingester response to return a new max delete sequence number
-        let max_tombstone_sequence_number = Some(SequenceNumber::new(3));
-        let ingester_partition =
-            builder.build(max_parquet_sequence_number, max_tombstone_sequence_number);
-        let querier_table = querier_table
-            .clear_ingester_partitions()
-            .with_ingester_partition(ingester_partition);
-
-        // second tombstone should be found
-        let deletes = num_deletes(querier_table.chunks().await.unwrap());
-        assert_eq!(&deletes, &[2, 0]);
+        // check metrics
+        let mut reporter = RawReporter::default();
+        catalog.metric_registry().report(&mut reporter);
+        assert_eq!(
+            reporter
+                .metric("query_pruner_chunks")
+                .unwrap()
+                .observation(&[("result", "pruned_early")])
+                .unwrap(),
+            &Observation::U64Counter(1),
+        );
     }
 
     #[tokio::test]
-    async fn test_tombstone_cache_refresh_with_retention() {
+    async fn test_default_date_partitioning() {
         maybe_start_logging();
+
+        let t1_ns = 0i64;
+        let t2_ns = 100_000_000_000_000i64;
+        let t1 = Utc.timestamp_nanos(t1_ns);
+        let t2 = Utc.timestamp_nanos(t2_ns);
+        assert_eq!(t1.year(), t2.year());
+        assert_eq!(t1.month(), t2.month());
+        assert_ne!(t1.day(), t2.day());
+        println!("t1: {t1}, t2: {t2}");
+
         let catalog = TestCatalog::new();
-        // 1-hour retention
         let ns = catalog.create_namespace_1hr_retention("ns").await;
-        let table = ns.create_table("table1").await;
-        let shard = ns.create_shard(1).await;
-        let partition = table.with_shard(&shard).create_partition("k").await;
-        let schema = make_schema(&table).await;
-        // Expect 1 chunk with with one delete predicate
-        let querier_table = TestQuerierTable::new(&catalog, &table).await;
+        let table = ns.create_table("table").await;
+        let partition_a = table
+            .create_partition(&t1.format("%Y-%m-%d").to_string())
+            .await;
+        let partition_b = table
+            .create_partition(&t2.format("%Y-%m-%d").to_string())
+            .await;
+        make_schema(&table).await;
 
-        let builder =
-            IngesterPartitionBuilder::new(schema, &shard, &partition).with_lp(["table foo=1 1"]);
-
-        // parquet file with max sequence number 1
-        let pf_builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table1 foo=1 11")
-            .with_max_seq(1);
-        partition.create_parquet_file(pf_builder).await;
-
-        // tombstone with max sequence number 2
-        table
-            .with_shard(&shard)
-            .create_tombstone(2, 1, 100, "foo=1")
+        let _file1 = partition_a
+            .create_parquet_file(
+                TestParquetFileBuilder::default()
+                    .with_line_protocol(&format!("table foo=1 {}", t1_ns))
+                    .with_min_time(t1_ns)
+                    .with_max_time(t1_ns),
+            )
+            .await;
+        let file2 = partition_b
+            .create_parquet_file(
+                TestParquetFileBuilder::default()
+                    .with_line_protocol(&format!("table foo=2 {}", t2_ns))
+                    .with_min_time(t2_ns)
+                    .with_max_time(t2_ns),
+            )
             .await;
 
-        let max_parquet_sequence_number = Some(SequenceNumber::new(1));
-        let max_tombstone_sequence_number = Some(SequenceNumber::new(2));
-        let ingester_partition =
-            builder.build(max_parquet_sequence_number, max_tombstone_sequence_number);
+        let querier_table = TestQuerierTable::new(&catalog, &table).await;
 
-        let querier_table = querier_table.with_ingester_partition(ingester_partition);
+        let filters = vec![
+            col(TIME_COLUMN_NAME).gt_eq(lit(ScalarValue::TimestampNanosecond(
+                // use some cutoff that is in the middle of the second day
+                Some(t2_ns - 1_000),
+                TIME_DATA_TIMEZONE(),
+            ))),
+        ];
+        let mut chunks = querier_table
+            .chunks_with_predicate_and_projection(&filters, None)
+            .await
+            .unwrap();
+        chunks.sort_by_key(|c| c.chunk_type().to_owned());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type(), "parquet");
+        assert_eq!(
+            chunks[0].id().get().as_u128(),
+            file2.parquet_file.id.get() as u128
+        );
 
-        let deletes = num_deletes(querier_table.chunks().await.unwrap());
-        // For parquet: There must be two delete predicates: one from the tombstone, one from retention
-        // For ingester: one delete predicate from retention
-        assert_eq!(&deletes, &[2, 1]);
+        // check metrics
+        let mut reporter = RawReporter::default();
+        catalog.metric_registry().report(&mut reporter);
+        assert_eq!(
+            reporter
+                .metric("query_pruner_chunks")
+                .unwrap()
+                .observation(&[("result", "pruned_early")])
+                .unwrap(),
+            &Observation::U64Counter(1),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_caching() {
+        maybe_start_logging();
+        let catalog = TestCatalog::new();
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
+        let table = ns.create_table("table").await;
+        let partition_1 = table.create_partition("p1").await;
+        let partition_2 = table.create_partition("p2").await;
+        let schema = make_schema_two_fields_two_tags(&table).await;
+
+        partition_1
+            .create_parquet_file(
+                TestParquetFileBuilder::default().with_line_protocol("table foo=1,bar=1 11"),
+            )
+            .await;
+        partition_1
+            .create_parquet_file(
+                TestParquetFileBuilder::default().with_line_protocol("table foo=2,bar=2 22"),
+            )
+            .await;
+        partition_1
+            .create_parquet_file(
+                TestParquetFileBuilder::default().with_line_protocol("table foo=3,bar=3 33"),
+            )
+            .await;
+        partition_2
+            .create_parquet_file(
+                TestParquetFileBuilder::default().with_line_protocol("table foo=1,bar=1 11"),
+            )
+            .await;
+
+        let ingester_partition_builder = IngesterPartitionBuilder::new(
+            schema.select_by_names(&["foo", TIME_COLUMN_NAME]).unwrap(),
+            &partition_1,
+        )
+        .with_lp(["table foo=1 1"]);
+
+        // set up performs a few lookups
+        assert_catalog_access_metric_count(&catalog.metric_registry, "partition_get_by_hash_id", 4);
+
+        let querier_table = TestQuerierTable::new(&catalog, &table)
+            .await
+            .with_ingester_partition(ingester_partition_builder.build());
+
+        let chunks = querier_table.chunks().await.unwrap();
+        assert_eq!(chunks.len(), 5);
+        assert_catalog_access_metric_count(&catalog.metric_registry, "partition_get_by_hash_id", 4);
+        assert_catalog_access_metric_count(
+            &catalog.metric_registry,
+            "partition_get_by_hash_id_batch",
+            1,
+        );
+        assert_cache_access_metric_count(&catalog.metric_registry, "partition", 2);
+
+        let chunks = querier_table.chunks().await.unwrap();
+        assert_eq!(chunks.len(), 5);
+        assert_catalog_access_metric_count(&catalog.metric_registry, "partition_get_by_hash_id", 4);
+        assert_catalog_access_metric_count(
+            &catalog.metric_registry,
+            "partition_get_by_hash_id_batch",
+            1,
+        );
+        assert_cache_access_metric_count(&catalog.metric_registry, "partition", 4);
+
+        partition_2
+            .create_parquet_file(
+                TestParquetFileBuilder::default().with_line_protocol("table,tag1=a foo=1,bar=1 11"),
+            )
+            .await;
+        assert_catalog_access_metric_count(&catalog.metric_registry, "partition_get_by_hash_id", 5);
+        assert_catalog_access_metric_count(
+            &catalog.metric_registry,
+            "partition_get_by_hash_id_batch",
+            1,
+        );
+
+        // file not visible yet
+        let chunks = querier_table.chunks().await.unwrap();
+        assert_eq!(chunks.len(), 5);
+        assert_catalog_access_metric_count(&catalog.metric_registry, "partition_get_by_hash_id", 5);
+        assert_catalog_access_metric_count(
+            &catalog.metric_registry,
+            "partition_get_by_hash_id_batch",
+            1,
+        );
+        assert_cache_access_metric_count(&catalog.metric_registry, "partition", 6);
+
+        // change inster ID => invalidates cache
+        let querier_table = querier_table
+            .clear_ingester_partitions()
+            .with_ingester_partition(ingester_partition_builder.build());
+        let chunks = querier_table.chunks().await.unwrap();
+        assert_eq!(chunks.len(), 6);
+        assert_catalog_access_metric_count(&catalog.metric_registry, "partition_get_by_hash_id", 5);
+        assert_catalog_access_metric_count(
+            &catalog.metric_registry,
+            "partition_get_by_hash_id_batch",
+            2,
+        );
+        assert_cache_access_metric_count(&catalog.metric_registry, "partition", 8);
     }
 
     /// Adds a "foo" column to the table and returns the created schema
@@ -1387,22 +1215,22 @@ mod tests {
 
         /// Invokes querier_table.chunks modeling the ingester sending the partitions in this table
         async fn chunks(&self) -> Result<Vec<Arc<dyn QueryChunk>>> {
-            let pred = Predicate::default();
-            self.chunks_with_predicate(&pred).await
+            self.chunks_with_predicate(&[]).await
         }
 
         /// Invokes querier_table.chunks modeling the ingester sending the partitions in this table
         async fn chunks_with_predicate(
             &self,
-            pred: &Predicate,
+            filters: &[Expr],
         ) -> Result<Vec<Arc<dyn QueryChunk>>> {
-            self.chunks_with_predicate_and_projection(pred, None).await
+            self.chunks_with_predicate_and_projection(filters, None)
+                .await
         }
 
         /// Invokes querier_table.chunks modeling the ingester sending the partitions in this table
         async fn chunks_with_predicate_and_projection(
             &self,
-            pred: &Predicate,
+            filters: &[Expr],
             projection: Option<&Vec<usize>>,
         ) -> Result<Vec<Arc<dyn QueryChunk>>> {
             self.querier_table
@@ -1415,16 +1243,7 @@ mod tests {
                 .next_response(Ok(self.ingester_partitions.clone()));
 
             let span = Some(Span::root("root", Arc::clone(&self.traces) as _));
-            self.querier_table.chunks(pred, span, projection).await
+            self.querier_table.chunks(filters, span, projection).await
         }
-    }
-
-    /// returns the number of deletes in each chunk
-    fn num_deletes(mut chunks: Vec<Arc<dyn QueryChunk>>) -> Vec<usize> {
-        chunks.sort_by_key(|c| c.id());
-        chunks
-            .iter()
-            .map(|chunk| chunk.delete_predicates().len())
-            .collect()
     }
 }

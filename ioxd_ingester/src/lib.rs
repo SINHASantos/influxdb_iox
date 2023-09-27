@@ -1,12 +1,31 @@
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
+use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
-use clap_blocks::{ingester::IngesterConfig, write_buffer::WriteBufferConfig};
-use data_types::ShardIndex;
-use hyper::{Body, Request, Response};
-use ingester::{
-    handler::{IngestHandler, IngestHandlerImpl},
-    lifecycle::LifecycleConfig,
-    server::{grpc::GrpcDelegate, http::HttpDelegate, IngesterServer},
+use clap_blocks::ingester::IngesterConfig;
+use futures::FutureExt;
+use generated_types::influxdata::iox::{
+    catalog::v1::catalog_service_server::CatalogServiceServer,
+    ingester::v1::{
+        persist_service_server::PersistServiceServer, write_service_server::WriteServiceServer,
+    },
 };
+use hyper::{Body, Request, Response};
+use ingester::{GossipConfig, IngesterGuard, IngesterRpcInterface};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
 use ioxd_common::{
@@ -18,62 +37,76 @@ use ioxd_common::{
     setup_builder,
 };
 use metric::Registry;
-use object_store::DynObjectStore;
+use parquet_file::storage::ParquetStorage;
 use std::{
-    collections::BTreeMap,
     fmt::{Debug, Display},
-    sync::{atomic::AtomicU64, Arc},
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use trace::TraceCollector;
 
+/// Define a safe maximum ingester write response size.
+///
+/// The ingester SHOULD NOT ever generate a response larger than this.
+const MAX_OUTGOING_MSG_BYTES: usize = 1024 * 1024; // 1 MiB
+
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("Catalog error: {0}")]
-    Catalog(#[from] iox_catalog::interface::Error),
-
-    #[error("Topic name {0} not found in the catalog")]
-    TopicNotFound(String),
-
-    #[error("shard_index_range_start must be <= shard_index_range_end")]
-    ShardIndexRange,
-
     #[error("error initializing ingester: {0}")]
-    Ingester(#[from] ingester::handler::Error),
-
-    #[error("error initializing write buffer {0}")]
-    WriteBuffer(#[from] write_buffer::core::WriteBufferError),
+    Ingester(#[from] ingester::InitError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct IngesterServerType<I: IngestHandler> {
-    server: IngesterServer<I>,
+struct IngesterServerType<I: IngesterRpcInterface> {
+    server: IngesterGuard<I>,
+    shutdown: Mutex<Option<oneshot::Sender<CancellationToken>>>,
+    metrics: Arc<Registry>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
+    max_simultaneous_queries: usize,
+    max_incoming_msg_bytes: usize,
 }
 
-impl<I: IngestHandler> std::fmt::Debug for IngesterServerType<I> {
+impl<I: IngesterRpcInterface> IngesterServerType<I> {
+    pub fn new(
+        server: IngesterGuard<I>,
+        metrics: Arc<Registry>,
+        common_state: &CommonServerState,
+        max_simultaneous_queries: usize,
+        max_incoming_msg_bytes: usize,
+        shutdown: oneshot::Sender<CancellationToken>,
+    ) -> Self {
+        Self {
+            server,
+            shutdown: Mutex::new(Some(shutdown)),
+            metrics,
+            trace_collector: common_state.trace_collector(),
+            max_simultaneous_queries,
+            max_incoming_msg_bytes,
+        }
+    }
+}
+
+impl<I: IngesterRpcInterface> std::fmt::Debug for IngesterServerType<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Ingester")
     }
 }
 
-impl<I: IngestHandler> IngesterServerType<I> {
-    pub fn new(server: IngesterServer<I>, common_state: &CommonServerState) -> Self {
-        Self {
-            server,
-            trace_collector: common_state.trace_collector(),
-        }
-    }
-}
-
 #[async_trait]
-impl<I: IngestHandler + Sync + Send + Debug + 'static> ServerType for IngesterServerType<I> {
+impl<I: IngesterRpcInterface + Sync + Send + Debug + 'static> ServerType for IngesterServerType<I> {
+    /// Human name for this server type
+    fn name(&self) -> &str {
+        "ingester"
+    }
+
     /// Return the [`metric::Registry`] used by the ingester.
     fn metric_registry(&self) -> Arc<Registry> {
-        self.server.metric_registry()
+        Arc::clone(&self.metrics)
     }
 
     /// Returns the trace collector for ingester traces.
@@ -93,10 +126,28 @@ impl<I: IngestHandler + Sync + Send + Debug + 'static> ServerType for IngesterSe
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
 
-        add_service!(builder, self.server.grpc().flight_service());
-        add_service!(builder, self.server.grpc().write_info_service());
-        add_service!(builder, self.server.grpc().catalog_service());
-        add_service!(builder, self.server.grpc().persist_service());
+        add_service!(
+            builder,
+            CatalogServiceServer::new(self.server.rpc().catalog_service())
+        );
+        add_service!(
+            builder,
+            WriteServiceServer::new(self.server.rpc().write_service())
+                .max_decoding_message_size(self.max_incoming_msg_bytes)
+                .max_encoding_message_size(MAX_OUTGOING_MSG_BYTES)
+        );
+        add_service!(
+            builder,
+            PersistServiceServer::new(self.server.rpc().persist_service())
+        );
+        add_service!(
+            builder,
+            FlightServiceServer::new(
+                self.server
+                    .rpc()
+                    .query_service(self.max_simultaneous_queries)
+            )
+        );
 
         serve_builder!(builder);
 
@@ -108,8 +159,14 @@ impl<I: IngestHandler + Sync + Send + Debug + 'static> ServerType for IngesterSe
     }
 
     fn shutdown(&self, frontend: CancellationToken) {
-        frontend.cancel();
-        self.server.shutdown();
+        if let Some(c) = self
+            .shutdown
+            .lock()
+            .expect("shutdown mutex poisoned")
+            .take()
+        {
+            let _ = c.send(frontend);
+        }
     }
 }
 
@@ -122,7 +179,7 @@ pub enum IoxHttpError {
 impl IoxHttpError {
     fn status_code(&self) -> HttpApiErrorCode {
         match self {
-            IoxHttpError::NotFound => HttpApiErrorCode::NotFound,
+            Self::NotFound => HttpApiErrorCode::NotFound,
         }
     }
 }
@@ -141,81 +198,52 @@ impl HttpApiErrorSource for IoxHttpError {
     }
 }
 
+const PERSIST_BACKGROUND_FETCH_TIME: Duration = Duration::from_secs(30);
+
 /// Instantiate an ingester server type
 pub async fn create_ingester_server_type(
     common_state: &CommonServerState,
-    metric_registry: Arc<metric::Registry>,
     catalog: Arc<dyn Catalog>,
-    object_store: Arc<DynObjectStore>,
+    metrics: Arc<Registry>,
+    ingester_config: &IngesterConfig,
     exec: Arc<Executor>,
-    write_buffer_config: &WriteBufferConfig,
-    ingester_config: IngesterConfig,
+    object_store: ParquetStorage,
 ) -> Result<Arc<dyn ServerType>> {
-    let mut txn = catalog.start_transaction().await?;
-    let topic = txn
-        .topics()
-        .get_by_name(write_buffer_config.topic())
-        .await?
-        .ok_or_else(|| Error::TopicNotFound(write_buffer_config.topic().to_string()))?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    if ingester_config.shard_index_range_start > ingester_config.shard_index_range_end {
-        return Err(Error::ShardIndexRange);
-    }
+    let gossip = match ingester_config.gossip_config.gossip_bind_address {
+        None => GossipConfig::Disabled,
+        Some(v) => GossipConfig::Enabled {
+            bind_addr: v.into(),
+            peers: ingester_config.gossip_config.seed_list.clone(),
+        },
+    };
 
-    let shard_range =
-        ingester_config.shard_index_range_start..(ingester_config.shard_index_range_end + 1);
-    let shard_indexes: Vec<_> = shard_range.clone().map(ShardIndex::new).collect();
+    let grpc = ingester::new(
+        catalog,
+        Arc::clone(&metrics),
+        PERSIST_BACKGROUND_FETCH_TIME,
+        ingester_config.wal_directory.clone(),
+        Duration::from_secs(ingester_config.wal_rotation_period_seconds),
+        exec,
+        ingester_config.persist_max_parallelism,
+        ingester_config.persist_queue_depth,
+        ingester_config.persist_hot_partition_cost,
+        object_store,
+        gossip,
+        ingester_config
+            .max_partitions_per_namespace
+            .unwrap_or_else(|| NonZeroUsize::new(usize::MAX).unwrap()),
+        shutdown_rx.map(|v| v.expect("shutdown sender dropped without calling shutdown")),
+    )
+    .await?;
 
-    let mut shards = BTreeMap::new();
-    for shard_index in shard_indexes {
-        let s = txn.shards().create_or_get(&topic, shard_index).await?;
-        shards.insert(shard_index, s);
-    }
-    txn.commit().await?;
-
-    let trace_collector = common_state.trace_collector();
-
-    let write_buffer = write_buffer_config
-        .reading(
-            Arc::clone(&metric_registry),
-            Some(shard_range),
-            trace_collector.clone(),
-        )
-        .await?;
-
-    let lifecycle_config = LifecycleConfig::new(
-        ingester_config.pause_ingest_size_bytes,
-        ingester_config.persist_memory_threshold_bytes,
-        ingester_config.persist_partition_size_threshold_bytes,
-        Duration::from_secs(ingester_config.persist_partition_age_threshold_seconds),
-        Duration::from_secs(ingester_config.persist_partition_cold_threshold_seconds),
-        ingester_config.persist_partition_rows_max,
-    );
-    let grpc_catalog = Arc::clone(&catalog);
-    let ingest_handler = Arc::new(
-        IngestHandlerImpl::new(
-            lifecycle_config,
-            topic,
-            shards,
-            catalog,
-            object_store,
-            write_buffer,
-            exec,
-            Arc::clone(&metric_registry),
-            ingester_config.skip_to_oldest_available,
-            ingester_config.concurrent_request_limit,
-        )
-        .await?,
-    );
-    let http = HttpDelegate::new(Arc::clone(&ingest_handler));
-    let grpc = GrpcDelegate::new(
-        grpc_catalog,
-        Arc::clone(&ingest_handler),
-        Arc::new(AtomicU64::new(ingester_config.test_flight_do_get_panic)),
-    );
-
-    let ingester = IngesterServer::new(metric_registry, http, grpc, ingest_handler);
-    let server_type = Arc::new(IngesterServerType::new(ingester, common_state));
-
-    Ok(server_type)
+    Ok(Arc::new(IngesterServerType::new(
+        grpc,
+        metrics,
+        common_state,
+        ingester_config.concurrent_query_limit,
+        ingester_config.rpc_write_max_incoming_bytes,
+        shutdown_tx,
+    )))
 }

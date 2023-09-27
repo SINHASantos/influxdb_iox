@@ -4,8 +4,9 @@ use std::fmt::Display;
 
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, Any,
-    CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes,
-    CommandGetTables, CommandPreparedStatementQuery, CommandStatementQuery,
+    CommandGetCatalogs, CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys,
+    CommandGetImportedKeys, CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes,
+    CommandGetTables, CommandGetXdbcTypeInfo, CommandPreparedStatementQuery, CommandStatementQuery,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -54,7 +55,7 @@ impl Display for PreparedStatementHandle {
 /// Encode a PreparedStatementHandle as Bytes
 impl From<PreparedStatementHandle> for Bytes {
     fn from(value: PreparedStatementHandle) -> Self {
-        Bytes::from(value.query.into_bytes())
+        Self::from(value.query.into_bytes())
     }
 }
 
@@ -75,12 +76,28 @@ pub enum FlightSQLCommand {
     CommandGetSqlInfo(CommandGetSqlInfo),
     /// Get a list of the available catalogs. See [`CommandGetCatalogs`] for details.
     CommandGetCatalogs(CommandGetCatalogs),
+    /// Get a description of the foreign key columns in the given foreign key table
+    /// that reference the primary key or the columns representing a unique constraint
+    /// of the parent table (could be the same or a different table).
+    /// See [`CommandGetCrossReference`] for details.
+    CommandGetCrossReference(CommandGetCrossReference),
     /// Get a list of the available schemas. See [`CommandGetDbSchemas`]
     /// for details and how to interpret the parameters.
     CommandGetDbSchemas(CommandGetDbSchemas),
+    /// Get a description of the foreign key columns that reference the given
+    /// table's primary key columns (the foreign keys exported by a table) of a table.
+    /// See [`CommandGetExportedKeys`] for details.
+    CommandGetExportedKeys(CommandGetExportedKeys),
+    /// Get the foreign keys of a table. See [`CommandGetImportedKeys`] for details.
+    CommandGetImportedKeys(CommandGetImportedKeys),
+    /// Get a list of primary keys. See [`CommandGetPrimaryKeys`] for details.
+    CommandGetPrimaryKeys(CommandGetPrimaryKeys),
     /// Get a list of the available tables
     CommandGetTables(CommandGetTables),
-    /// Get a list of the available table tyypes
+    /// Get information about data types supported.
+    /// See [`CommandGetXdbcTypeInfo`] for details.
+    CommandGetXdbcTypeInfo(CommandGetXdbcTypeInfo),
+    /// Get a list of the available table types
     CommandGetTableTypes(CommandGetTableTypes),
     /// Create a prepared statement
     ActionCreatePreparedStatementRequest(ActionCreatePreparedStatementRequest),
@@ -91,7 +108,7 @@ pub enum FlightSQLCommand {
 impl Display for FlightSQLCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CommandStatementQuery(CommandStatementQuery { query }) => {
+            Self::CommandStatementQuery(CommandStatementQuery { query, .. }) => {
                 write!(f, "CommandStatementQuery{query}")
             }
             Self::CommandPreparedStatementQuery(h) => write!(f, "CommandPreparedStatementQuery{h}"),
@@ -99,6 +116,37 @@ impl Display for FlightSQLCommand {
                 write!(f, "CommandGetSqlInfo(...)")
             }
             Self::CommandGetCatalogs(CommandGetCatalogs {}) => write!(f, "CommandGetCatalogs"),
+            Self::CommandGetCrossReference(CommandGetCrossReference {
+                pk_catalog,
+                pk_db_schema,
+                pk_table,
+                fk_catalog,
+                fk_db_schema,
+                fk_table,
+            }) => {
+                write!(
+                    f,
+                    "CommandGetCrossReference(
+                        pk_catalog={},
+                        pk_db_schema={},
+                        pk_table={},
+                        fk_catalog={},
+                        fk_db_schema={},
+                        fk_table={}",
+                    pk_catalog.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    pk_db_schema
+                        .as_ref()
+                        .map(|c| c.as_str())
+                        .unwrap_or("<NONE>"),
+                    pk_table,
+                    fk_catalog.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    fk_db_schema
+                        .as_ref()
+                        .map(|c| c.as_str())
+                        .unwrap_or("<NONE>"),
+                    fk_table,
+                )
+            }
             Self::CommandGetDbSchemas(CommandGetDbSchemas {
                 catalog,
                 db_schema_filter_pattern,
@@ -111,6 +159,45 @@ impl Display for FlightSQLCommand {
                         .as_ref()
                         .map(|c| c.as_str())
                         .unwrap_or("<NONE>")
+                )
+            }
+            Self::CommandGetExportedKeys(CommandGetExportedKeys {
+                catalog,
+                db_schema,
+                table,
+            }) => {
+                write!(
+                    f,
+                    "CommandGetExportedKeys(catalog={}, db_schema={}, table={})",
+                    catalog.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    db_schema.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    table
+                )
+            }
+            Self::CommandGetImportedKeys(CommandGetImportedKeys {
+                catalog,
+                db_schema,
+                table,
+            }) => {
+                write!(
+                    f,
+                    "CommandGetImportedKeys(catalog={}, db_schema={}, table={})",
+                    catalog.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    db_schema.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    table
+                )
+            }
+            Self::CommandGetPrimaryKeys(CommandGetPrimaryKeys {
+                catalog,
+                db_schema,
+                table,
+            }) => {
+                write!(
+                    f,
+                    "CommandGetPrimaryKeys(catalog={}, db_schema={}, table={})",
+                    catalog.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    db_schema.as_ref().map(|c| c.as_str()).unwrap_or("<NONE>"),
+                    table
                 )
             }
             Self::CommandGetTables(CommandGetTables {
@@ -140,8 +227,16 @@ impl Display for FlightSQLCommand {
             Self::CommandGetTableTypes(CommandGetTableTypes {}) => {
                 write!(f, "CommandGetTableTypes")
             }
+            Self::CommandGetXdbcTypeInfo(CommandGetXdbcTypeInfo { data_type }) => {
+                write!(
+                    f,
+                    "CommandGetXdbcTypeInfo(data_type={})",
+                    data_type.as_ref().copied().unwrap_or(0),
+                )
+            }
             Self::ActionCreatePreparedStatementRequest(ActionCreatePreparedStatementRequest {
                 query,
+                ..
             }) => {
                 write!(f, "ActionCreatePreparedStatementRequest{query}")
             }
@@ -171,12 +266,22 @@ impl FlightSQLCommand {
             Ok(Self::CommandGetSqlInfo(decoded_cmd))
         } else if let Some(decoded_cmd) = Any::unpack::<CommandGetCatalogs>(&msg)? {
             Ok(Self::CommandGetCatalogs(decoded_cmd))
+        } else if let Some(decoded_cmd) = Any::unpack::<CommandGetCrossReference>(&msg)? {
+            Ok(Self::CommandGetCrossReference(decoded_cmd))
         } else if let Some(decoded_cmd) = Any::unpack::<CommandGetDbSchemas>(&msg)? {
             Ok(Self::CommandGetDbSchemas(decoded_cmd))
+        } else if let Some(decoded_cmd) = Any::unpack::<CommandGetExportedKeys>(&msg)? {
+            Ok(Self::CommandGetExportedKeys(decoded_cmd))
+        } else if let Some(decoded_cmd) = Any::unpack::<CommandGetImportedKeys>(&msg)? {
+            Ok(Self::CommandGetImportedKeys(decoded_cmd))
+        } else if let Some(decode_cmd) = Any::unpack::<CommandGetPrimaryKeys>(&msg)? {
+            Ok(Self::CommandGetPrimaryKeys(decode_cmd))
         } else if let Some(decode_cmd) = Any::unpack::<CommandGetTables>(&msg)? {
             Ok(Self::CommandGetTables(decode_cmd))
         } else if let Some(decoded_cmd) = Any::unpack::<CommandGetTableTypes>(&msg)? {
             Ok(Self::CommandGetTableTypes(decoded_cmd))
+        } else if let Some(decoded_cmd) = Any::unpack::<CommandGetXdbcTypeInfo>(&msg)? {
+            Ok(Self::CommandGetXdbcTypeInfo(decoded_cmd))
         } else if let Some(decoded_cmd) = Any::unpack::<ActionCreatePreparedStatementRequest>(&msg)?
         {
             Ok(Self::ActionCreatePreparedStatementRequest(decoded_cmd))
@@ -199,21 +304,26 @@ impl FlightSQLCommand {
     // Encode the command as a flightsql message (bytes)
     pub fn try_encode(self) -> Result<Bytes> {
         let msg = match self {
-            FlightSQLCommand::CommandStatementQuery(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::CommandPreparedStatementQuery(handle) => {
+            Self::CommandStatementQuery(cmd) => Any::pack(&cmd),
+            Self::CommandPreparedStatementQuery(handle) => {
                 let prepared_statement_handle = handle.encode();
                 let cmd = CommandPreparedStatementQuery {
                     prepared_statement_handle,
                 };
                 Any::pack(&cmd)
             }
-            FlightSQLCommand::CommandGetSqlInfo(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::CommandGetCatalogs(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::CommandGetDbSchemas(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::CommandGetTables(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::CommandGetTableTypes(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::ActionCreatePreparedStatementRequest(cmd) => Any::pack(&cmd),
-            FlightSQLCommand::ActionClosePreparedStatementRequest(handle) => {
+            Self::CommandGetSqlInfo(cmd) => Any::pack(&cmd),
+            Self::CommandGetCatalogs(cmd) => Any::pack(&cmd),
+            Self::CommandGetCrossReference(cmd) => Any::pack(&cmd),
+            Self::CommandGetDbSchemas(cmd) => Any::pack(&cmd),
+            Self::CommandGetExportedKeys(cmd) => Any::pack(&cmd),
+            Self::CommandGetImportedKeys(cmd) => Any::pack(&cmd),
+            Self::CommandGetPrimaryKeys(cmd) => Any::pack(&cmd),
+            Self::CommandGetTables(cmd) => Any::pack(&cmd),
+            Self::CommandGetTableTypes(cmd) => Any::pack(&cmd),
+            Self::CommandGetXdbcTypeInfo(cmd) => Any::pack(&cmd),
+            Self::ActionCreatePreparedStatementRequest(cmd) => Any::pack(&cmd),
+            Self::ActionClosePreparedStatementRequest(handle) => {
                 let prepared_statement_handle = handle.encode();
                 Any::pack(&ActionClosePreparedStatementRequest {
                     prepared_statement_handle,

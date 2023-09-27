@@ -23,8 +23,8 @@ use nom::character::complete::{alpha1, alphanumeric1};
 use nom::combinator::{map, not, recognize};
 use nom::multi::many0_count;
 use nom::sequence::{pair, preceded};
-use std::fmt;
 use std::fmt::{Display, Formatter, Write};
+use std::{fmt, mem};
 
 /// Parse an unquoted InfluxQL identifier.
 pub(crate) fn unquoted_identifier(i: &str) -> ParseResult<&str, &str> {
@@ -38,7 +38,7 @@ pub(crate) fn unquoted_identifier(i: &str) -> ParseResult<&str, &str> {
 }
 
 /// A type that represents an InfluxQL identifier.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct Identifier(pub(crate) String);
 
 impl_tuple_clause!(Identifier, String);
@@ -53,6 +53,11 @@ impl Identifier {
     /// Returns true if the identifier requires quotes.
     pub fn requires_quotes(&self) -> bool {
         nom::sequence::terminated(unquoted_identifier, nom::combinator::eof)(&self.0).is_err()
+    }
+
+    /// Takes the string value out of the identifier, leaving a default string value in its place.
+    pub fn take(&mut self) -> String {
+        mem::take(&mut self.0)
     }
 }
 
@@ -117,6 +122,8 @@ mod test {
         // quoted
         let (_, got) = identifier("\"quick draw\"").unwrap();
         assert_eq!(got, "quick draw".into());
+        // validate that `as_str` returns the unquoted string
+        assert_eq!(got.as_str(), "quick draw");
 
         // unquoted
         let (_, got) = identifier("quick_draw").unwrap();

@@ -1,15 +1,17 @@
 use super::{PruneMetrics, QuerierTable, QuerierTableArgs};
 use crate::{
-    cache::CatalogCache, create_ingester_connection_for_testing, parquet::ChunkAdapter,
-    IngesterPartition,
+    cache::CatalogCache,
+    create_ingester_connection_for_testing,
+    ingester::{IngesterChunkData, IngesterPartition},
+    parquet::ChunkAdapter,
 };
 use arrow::record_batch::RecordBatch;
-use data_types::{ChunkId, SequenceNumber, ShardIndex};
+use data_types::ChunkId;
 use iox_catalog::interface::{get_schema_by_name, SoftDeletedRows};
-use iox_tests::{TestCatalog, TestPartition, TestShard, TestTable};
+use iox_query::{chunk_statistics::ColumnRanges, util::compute_timenanosecond_min_max};
+use iox_tests::{TestCatalog, TestPartition, TestTable};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
-use schema::{sort::SortKey, Projection, Schema};
-use sharder::JumpHash;
+use schema::{Projection, Schema};
 use std::{sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 use uuid::Uuid;
@@ -25,8 +27,7 @@ pub async fn querier_table(catalog: &Arc<TestCatalog>, table: &Arc<TestTable>) -
     ));
     let chunk_adapter = Arc::new(ChunkAdapter::new(
         catalog_cache,
-        catalog.metric_registry(),
-        true,
+        Arc::new(PruneMetrics::new(&catalog.metric_registry())),
     ));
 
     let mut repos = catalog.catalog.repositories().await;
@@ -37,8 +38,8 @@ pub async fn querier_table(catalog: &Arc<TestCatalog>, table: &Arc<TestTable>) -
     )
     .await
     .unwrap();
-    let schema = catalog_schema.tables.remove(&table.table.name).unwrap();
-    let schema = Schema::try_from(schema).unwrap();
+    let table_info = catalog_schema.tables.remove(&table.table.name).unwrap();
+    let schema = Schema::try_from(table_info.columns).unwrap();
 
     let namespace_name = Arc::from(table.namespace.namespace.name.as_str());
 
@@ -48,9 +49,6 @@ pub async fn querier_table(catalog: &Arc<TestCatalog>, table: &Arc<TestTable>) -
         .retention_period_ns
         .map(|retention| Duration::from_nanos(retention as u64));
     QuerierTable::new(QuerierTableArgs {
-        sharder: Some(Arc::new(JumpHash::new(
-            (0..1).map(ShardIndex::new).map(Arc::new),
-        ))),
         namespace_id: table.namespace.namespace.id,
         namespace_name,
         namespace_retention_period,
@@ -59,7 +57,6 @@ pub async fn querier_table(catalog: &Arc<TestCatalog>, table: &Arc<TestTable>) -
         schema,
         ingester_connection: Some(create_ingester_connection_for_testing()),
         chunk_adapter,
-        exec: catalog.exec(),
         prune_metrics: Arc::new(PruneMetrics::new(&catalog.metric_registry())),
     })
 }
@@ -73,38 +70,24 @@ pub(crate) fn lp_to_record_batch(lp: &str) -> RecordBatch {
 #[derive(Debug, Clone)]
 pub(crate) struct IngesterPartitionBuilder {
     schema: Schema,
-    shard: Arc<TestShard>,
     partition: Arc<TestPartition>,
-    ingester_name: Arc<str>,
     ingester_chunk_id: u128,
 
-    partition_sort_key: Option<Arc<SortKey>>,
+    partition_column_ranges: ColumnRanges,
 
     /// Data returned from the partition, in line protocol format
     lp: Vec<String>,
 }
 
 impl IngesterPartitionBuilder {
-    pub(crate) fn new(
-        schema: Schema,
-        shard: &Arc<TestShard>,
-        partition: &Arc<TestPartition>,
-    ) -> Self {
+    pub(crate) fn new(schema: Schema, partition: &Arc<TestPartition>) -> Self {
         Self {
             schema,
-            shard: Arc::clone(shard),
             partition: Arc::clone(partition),
-            ingester_name: Arc::from("ingester1"),
-            partition_sort_key: None,
+            partition_column_ranges: Default::default(),
             ingester_chunk_id: 1,
             lp: Vec::new(),
         }
-    }
-
-    /// set the partition chunk id to use when creating partitons
-    pub(crate) fn with_ingester_chunk_id(mut self, ingester_chunk_id: u128) -> Self {
-        self.ingester_chunk_id = ingester_chunk_id;
-        self
     }
 
     /// Set the line protocol that will be present in this partition
@@ -114,39 +97,45 @@ impl IngesterPartitionBuilder {
         self
     }
 
-    /// Create a ingester partition with the specified max parquet sequence number
-    pub(crate) fn build_with_max_parquet_sequence_number(
-        &self,
-        parquet_max_sequence_number: Option<SequenceNumber>,
-    ) -> IngesterPartition {
-        let tombstone_max_sequence_number = None;
-
-        self.build(parquet_max_sequence_number, tombstone_max_sequence_number)
+    /// Set column ranges.
+    pub(crate) fn with_column_ranges(mut self, column_ranges: ColumnRanges) -> Self {
+        self.partition_column_ranges = column_ranges;
+        self
     }
 
     /// Create an ingester partition with the specified field values
-    pub(crate) fn build(
-        &self,
-        parquet_max_sequence_number: Option<SequenceNumber>,
-        tombstone_max_sequence_number: Option<SequenceNumber>,
-    ) -> IngesterPartition {
-        let data = self.lp.iter().map(|lp| lp_to_record_batch(lp)).collect();
+    pub(crate) fn build(&self) -> IngesterPartition {
+        let data = self
+            .lp
+            .iter()
+            .map(|lp| lp_to_record_batch(lp))
+            .collect::<Vec<RecordBatch>>();
 
-        IngesterPartition::new(
-            Arc::clone(&self.ingester_name),
-            Some(Uuid::new_v4()),
-            self.partition.partition.id,
-            self.shard.shard.id,
+        let ts_min_max = compute_timenanosecond_min_max(&data).expect("Should have time range");
+
+        let schema = data[0].schema();
+        assert!(data.iter().all(|b| b.schema() == schema));
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        let schema = self.schema.select_by_names(&fields).unwrap();
+
+        let mut part = IngesterPartition::new(
+            Uuid::new_v4(),
+            self.partition.partition.transition_partition_id(),
             0,
-            parquet_max_sequence_number,
-            tombstone_max_sequence_number,
-            self.partition_sort_key.clone(),
         )
-        .try_add_chunk(
+        .push_chunk(
             ChunkId::new_test(self.ingester_chunk_id),
-            self.schema.clone(),
-            data,
-        )
-        .unwrap()
+            schema,
+            IngesterChunkData::Eager(data),
+            ts_min_max,
+        );
+
+        part.set_partition_column_ranges(&self.partition_column_ranges);
+
+        part
     }
 }

@@ -1,6 +1,6 @@
 use arrow_util::assert_batches_sorted_eq;
 use futures::FutureExt;
-use generated_types::{influxdata::iox::ingester::v1 as proto, ingester::IngesterQueryRequest};
+use ingester_query_grpc::{influxdata::iox::ingester::v1 as proto, IngesterQueryRequest};
 use std::num::NonZeroUsize;
 use test_helpers_end_to_end::{
     maybe_skip_integration, MiniCluster, Step, StepTest, StepTestState, TestConfig,
@@ -12,7 +12,7 @@ async fn basic_multi_ingesters() {
     let database_url = maybe_skip_integration!();
     test_helpers::maybe_start_logging();
 
-    let ingester1_config = TestConfig::new_ingester2_never_persist(&database_url);
+    let ingester1_config = TestConfig::new_ingester_never_persist(&database_url);
     let ingester2_config = TestConfig::another_ingester(&ingester1_config);
     let ingester_configs = [ingester1_config, ingester2_config];
 
@@ -21,9 +21,9 @@ async fn basic_multi_ingesters() {
         .map(|ingester_config| ingester_config.ingester_base())
         .collect();
     let router_config =
-        TestConfig::new_router2(&ingester_configs[0]).with_ingester_addresses(&ingester_addresses);
+        TestConfig::new_router(&ingester_configs[0]).with_ingester_addresses(&ingester_addresses);
     let querier_config =
-        TestConfig::new_querier2(&ingester_configs[0]).with_ingester_addresses(&ingester_addresses);
+        TestConfig::new_querier(&ingester_configs[0]).with_ingester_addresses(&ingester_addresses);
 
     let mut cluster = MiniCluster::new();
     for ingester_config in ingester_configs {
@@ -45,7 +45,7 @@ async fn basic_multi_ingesters() {
     }
     // Persist those writes
     test_steps.push(Step::Persist);
-    test_steps.push(Step::WaitForPersisted2 {
+    test_steps.push(Step::WaitForPersisted {
         // One file from each ingester
         expected_increase: 2,
     });
@@ -95,7 +95,7 @@ async fn write_replication() {
 
     let table_name = "some_table";
 
-    let ingester1_config = TestConfig::new_ingester2_never_persist(&database_url);
+    let ingester1_config = TestConfig::new_ingester_never_persist(&database_url);
     let ingester2_config = TestConfig::another_ingester(&ingester1_config);
     let ingester_configs = [ingester1_config, ingester2_config];
 
@@ -103,12 +103,12 @@ async fn write_replication() {
         .iter()
         .map(|ingester_config| ingester_config.ingester_base())
         .collect();
-    let router_config = TestConfig::new_router2(&ingester_configs[0])
+    let router_config = TestConfig::new_router(&ingester_configs[0])
         .with_ingester_addresses(&ingester_addresses)
         // Require both ingesters to get this write to be counted as a full write
         .with_rpc_write_replicas(NonZeroUsize::new(2).unwrap());
     let querier_config =
-        TestConfig::new_querier2(&ingester_configs[0]).with_ingester_addresses(&ingester_addresses);
+        TestConfig::new_querier(&ingester_configs[0]).with_ingester_addresses(&ingester_addresses);
 
     let mut cluster = MiniCluster::new();
     for ingester_config in ingester_configs {
@@ -129,7 +129,7 @@ async fn write_replication() {
     }
     // Persist those writes
     test_steps.push(Step::Persist);
-    test_steps.push(Step::WaitForPersisted2 {
+    test_steps.push(Step::WaitForPersisted {
         // One file from each ingester
         expected_increase: 2,
     });
@@ -193,7 +193,14 @@ async fn write_replication() {
                     .await
                     .unwrap();
 
-                let ingester_uuid = ingester_response.app_metadata.ingester_uuid.clone();
+                assert_eq!(ingester_response.partitions.len(), 1);
+                let ingester_partition = ingester_response
+                    .partitions
+                    .into_iter()
+                    .next()
+                    .expect("just checked len");
+
+                let ingester_uuid = ingester_partition.app_metadata.ingester_uuid;
                 assert!(!ingester_uuid.is_empty());
 
                 let expected = [
@@ -212,7 +219,7 @@ async fn write_replication() {
                     "| A    | B    | 1970-01-01T00:00:00.000000020Z | 20  |",
                     "+------+------+--------------------------------+-----+",
                 ];
-                assert_batches_sorted_eq!(&expected, &ingester_response.record_batches);
+                assert_batches_sorted_eq!(&expected, &ingester_partition.record_batches);
             }
             .boxed()
         })));

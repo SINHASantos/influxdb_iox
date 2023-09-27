@@ -1,13 +1,9 @@
-//! Implementation of command line option for running router
-
-use crate::process_info::setup_metric_registry;
-
+//! Command line options for running a router that uses the RPC write path.
 use super::main;
-use clap_blocks::object_store::make_object_store;
-use clap_blocks::router::RouterConfig;
+use crate::process_info::setup_metric_registry;
 use clap_blocks::{
-    authz::AuthzConfig, catalog_dsn::CatalogDsnConfig, run_config::RunConfig,
-    write_buffer::WriteBufferConfig,
+    catalog_dsn::CatalogDsnConfig, object_store::make_object_store, router::RouterConfig,
+    run_config::RunConfig,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use ioxd_common::{
@@ -18,6 +14,7 @@ use ioxd_router::create_router_server_type;
 use object_store::DynObjectStore;
 use object_store_metrics::ObjectStoreMetrics;
 use observability_deps::tracing::*;
+use panic_logging::make_panics_fatal;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -38,8 +35,8 @@ pub enum Error {
     #[error("Catalog DSN error: {0}")]
     CatalogDsn(#[from] clap_blocks::catalog_dsn::Error),
 
-    #[error("Authz error: {0}")]
-    Authz(#[from] clap_blocks::authz::Error),
+    #[error("Authz service error: {0}")]
+    AuthzService(#[from] authz::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -47,7 +44,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, clap::Parser)]
 #[clap(
     name = "run",
-    about = "Runs in router mode",
+    about = "Runs in router mode using the RPC write path",
     long_about = "Run the IOx router server.\n\nThe configuration options below can be \
     set either with the command line flags or with the specified environment \
     variable. If there is a file named '.env' in the current working directory, \
@@ -61,33 +58,25 @@ Configuration is loaded from the following sources (highest precedence first):
 )]
 pub struct Config {
     #[clap(flatten)]
-    pub(crate) authz_config: AuthzConfig,
-
-    #[clap(flatten)]
     pub(crate) run_config: RunConfig,
 
     #[clap(flatten)]
     pub(crate) catalog_dsn: CatalogDsnConfig,
 
     #[clap(flatten)]
-    pub(crate) write_buffer_config: WriteBufferConfig,
-
-    #[clap(flatten)]
     pub(crate) router_config: RouterConfig,
 }
 
 pub async fn command(config: Config) -> Result<()> {
-    if std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok() {
-        panic!(
-            "`INFLUXDB_IOX_RPC_MODE` was specified but `router` was the command run. Either unset
-             `INFLUXDB_IOX_RPC_MODE` or run the `router2` command."
-        );
-    }
+    // Ensure panics (even in threads or tokio tasks) are fatal when
+    // running in this server mode.  This is done to avoid potential
+    // data corruption because there is no foolproof way to recover
+    // state after a panic.
+    make_panics_fatal();
 
     let common_state = CommonServerState::from_config(config.run_config.clone())?;
     let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
     let metrics = setup_metric_registry();
-    let authz = config.authz_config.authorizer()?;
 
     let catalog = config
         .catalog_dsn
@@ -108,9 +97,14 @@ pub async fn command(config: Config) -> Result<()> {
         Arc::clone(&metrics),
         catalog,
         object_store,
-        authz,
-        &config.write_buffer_config,
         &config.router_config,
+        &config.router_config.gossip_config,
+        config
+            .run_config
+            .tracing_config()
+            .traces_jaeger_trace_context_header_name
+            .clone(),
+        config.run_config.grpc_bind_address.port(),
     )
     .await?;
 

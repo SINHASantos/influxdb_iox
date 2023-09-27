@@ -2,11 +2,13 @@ use crate::common::{ws0, ParseError};
 use crate::expression::arithmetic::{
     arithmetic, call_expression, var_ref, ArithmeticParsers, Expr,
 };
-use crate::internal::Error as InternalError;
-use crate::internal::{expect, verify, ParseResult};
+use crate::expression::Call;
+use crate::functions::is_scalar_math_function;
+use crate::internal::{expect, verify, Error as InternalError, ParseResult};
 use crate::keywords::keyword;
 use crate::literal::{literal_no_regex, literal_regex, Literal};
 use crate::parameter::parameter;
+use crate::select::is_valid_now_call;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
@@ -63,6 +65,24 @@ impl Display for ConditionalOperator {
     }
 }
 
+/// Conditional binary operations, such as `foo = 'bar'` or `true AND false`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConditionalBinary {
+    /// Represents the left-hand side of the conditional binary expression.
+    pub lhs: Box<ConditionalExpression>,
+    /// Represents the operator to apply to the conditional binary expression.
+    pub op: ConditionalOperator,
+    /// Represents the right-hand side of the conditional binary expression.
+    pub rhs: Box<ConditionalExpression>,
+}
+
+impl Display for ConditionalBinary {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { lhs, op, rhs } = self;
+        write!(f, "{lhs} {op} {rhs}")
+    }
+}
+
 /// Represents a conditional expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConditionalExpression {
@@ -70,14 +90,7 @@ pub enum ConditionalExpression {
     Expr(Box<Expr>),
 
     /// Binary operations, such as `foo = 'bar'` or `true AND false`.
-    Binary {
-        /// Represents the left-hand side of the conditional binary expression.
-        lhs: Box<ConditionalExpression>,
-        /// Represents the operator to apply to the conditional binary expression.
-        op: ConditionalOperator,
-        /// Represents the right-hand side of the conditional binary expression.
-        rhs: Box<ConditionalExpression>,
-    },
+    Binary(ConditionalBinary),
 
     /// Represents a conditional expression enclosed in parenthesis.
     Grouped(Box<ConditionalExpression>),
@@ -92,13 +105,53 @@ impl ConditionalExpression {
             None
         }
     }
+
+    /// Return `self == other`
+    pub fn eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Eq, other)
+    }
+
+    /// Return `self != other`
+    pub fn not_eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::NotEq, other)
+    }
+
+    /// Return `self > other`
+    pub fn gt(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Gt, other)
+    }
+
+    /// Return `self >= other`
+    pub fn gt_eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::GtEq, other)
+    }
+
+    /// Return `self < other`
+    pub fn lt(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Lt, other)
+    }
+
+    /// Return `self <= other`
+    pub fn lt_eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::LtEq, other)
+    }
+
+    /// Return `self AND other`
+    pub fn and(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::And, other)
+    }
+
+    /// Return `self OR other`
+    pub fn or(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Or, other)
+    }
 }
 
 impl Display for ConditionalExpression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Expr(v) => fmt::Display::fmt(v, f),
-            Self::Binary { lhs, op, rhs } => write!(f, "{lhs} {op} {rhs}"),
+            Self::Binary(v) => fmt::Display::fmt(v, f),
             Self::Grouped(v) => write!(f, "({v})"),
         }
     }
@@ -207,10 +260,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
     let mut i: &str = input;
 
     // Consume whitespace from the input
-    i = match ws0(i) {
-        Ok((i1, _)) => i1,
-        _ => unreachable!("ws0 is infallible"),
-    };
+    (i, _) = ws0(i).expect("ws0 is infallible");
 
     if i.is_empty() {
         return Err(ParseError {
@@ -240,10 +290,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
     };
 
     // Consume remaining whitespace from the input
-    i = match ws0(i) {
-        Ok((i1, _)) => i1,
-        _ => unreachable!("ws0 is infallible"),
-    };
+    (i, _) = ws0(i).expect("ws0 is infallible");
 
     if !i.is_empty() {
         return Err(ParseError {
@@ -268,30 +315,32 @@ fn reduce_expr(
     expr: ConditionalExpression,
     remainder: Vec<(ConditionalOperator, ConditionalExpression)>,
 ) -> ConditionalExpression {
-    remainder
-        .into_iter()
-        .fold(expr, |lhs, val| ConditionalExpression::Binary {
+    remainder.into_iter().fold(expr, |lhs, val| {
+        ConditionalExpression::Binary(ConditionalBinary {
             lhs: lhs.into(),
             op: val.0,
             rhs: val.1.into(),
         })
+    })
 }
 
-/// Returns true if `expr` is a valid [`Expr::Call`] expression for the `now` function.
-pub(crate) fn is_valid_now_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call { name, args } => name.to_lowercase() == "now" && args.is_empty(),
-        _ => false,
-    }
+/// Returns true if `expr` is a valid [`Expr::Call`] expression for condtional expressions
+/// in the WHERE clause.
+pub(crate) fn is_valid_conditional_call(expr: &Expr) -> bool {
+    is_valid_now_call(expr)
+        || match expr {
+            Expr::Call(Call { name, .. }) => is_scalar_math_function(name),
+            _ => false,
+        }
 }
 
 impl ConditionalExpression {
     /// Parse the `now()` function call
     fn call(i: &str) -> ParseResult<&str, Expr> {
         verify(
-            "invalid expression, the only valid function call is 'now' with no arguments",
+            "invalid expression, the only valid function calls are 'now' with no arguments, or scalar math functions",
             call_expression::<Self>,
-            is_valid_now_call,
+            is_valid_conditional_call,
         )(i)
     }
 }
@@ -313,6 +362,19 @@ impl ArithmeticParsers for ConditionalExpression {
 /// Parse an arithmetic expression used by conditional expressions.
 pub(crate) fn arithmetic_expression(i: &str) -> ParseResult<&str, Expr> {
     arithmetic::<ConditionalExpression>(i)
+}
+
+/// Return a new conditional expression, `lhs op rhs`.
+pub fn binary_cond(
+    lhs: ConditionalExpression,
+    op: ConditionalOperator,
+    rhs: ConditionalExpression,
+) -> ConditionalExpression {
+    ConditionalExpression::Binary(ConditionalBinary {
+        lhs: Box::new(lhs),
+        op,
+        rhs: Box::new(rhs),
+    })
 }
 
 #[cfg(test)]
@@ -372,16 +434,20 @@ mod test {
         let (_, got) = arithmetic_expression("now() + 3").unwrap();
         assert_eq!(got, binary_op!(call!("now"), Add, 3));
 
+        // arithmetic functions calls are permitted
+        let (_, got) = arithmetic_expression("abs(f) + 3").unwrap();
+        assert_eq!(got, binary_op!(call!("abs", var_ref!("f")), Add, 3));
+
         // Fallible cases
 
         assert_expect_error!(
             arithmetic_expression("sum(foo)"),
-            "invalid expression, the only valid function call is 'now' with no arguments"
+            "invalid expression, the only valid function calls are 'now' with no arguments, or scalar math functions"
         );
 
         assert_expect_error!(
             arithmetic_expression("now(1)"),
-            "invalid expression, the only valid function call is 'now' with no arguments"
+            "invalid expression, the only valid function calls are 'now' with no arguments, or scalar math functions"
         );
     }
 

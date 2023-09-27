@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
 use arrow::record_batch::RecordBatch;
-use data_types::SequenceNumber;
+use data_types::{SequenceNumber, TimestampMinMax};
 use mutable_batch::MutableBatch;
 
 mod always_some;
@@ -9,10 +7,12 @@ mod mutable_buffer;
 mod state_machine;
 pub(crate) mod traits;
 
+use schema::Schema;
 pub(crate) use state_machine::*;
 
+use crate::query::projection::OwnedProjection;
+
 use self::{always_some::AlwaysSome, traits::Queryable};
-use crate::sequence_range::SequenceNumberRange;
 
 /// The current state of the [`BufferState`] state machine.
 ///
@@ -32,16 +32,6 @@ impl Default for FsmState {
     }
 }
 
-impl FsmState {
-    /// Return the current range of writes in the [`BufferState`] state machine,
-    /// if any.
-    pub(crate) fn sequence_number_range(&self) -> &SequenceNumberRange {
-        match self {
-            Self::Buffering(v) => v.sequence_number_range(),
-        }
-    }
-}
-
 /// A helper wrapper over the [`BufferState`] FSM to abstract the caller from
 /// state transitions during reads and writes from the underlying buffer.
 #[derive(Debug, Default)]
@@ -49,19 +39,8 @@ impl FsmState {
 pub(crate) struct DataBuffer(AlwaysSome<FsmState>);
 
 impl DataBuffer {
-    /// Return the range of [`SequenceNumber`] currently queryable by calling
-    /// [`Self::get_query_data()`].
-    pub(crate) fn sequence_number_range(&self) -> &SequenceNumberRange {
-        self.0.sequence_number_range()
-    }
-
     /// Buffer the given [`MutableBatch`] in memory, ordered by the specified
     /// [`SequenceNumber`].
-    ///
-    /// # Panics
-    ///
-    /// This method panics if `sequence_number` is not strictly greater than
-    /// previous calls.
     pub(crate) fn buffer_write(
         &mut self,
         mb: MutableBatch,
@@ -77,17 +56,44 @@ impl DataBuffer {
         })
     }
 
+    pub(crate) fn persist_cost_estimate(&self) -> usize {
+        match self.0.get() {
+            FsmState::Buffering(b) => b.persist_cost_estimate(),
+        }
+    }
+
     /// Return all data for this buffer, ordered by the [`SequenceNumber`] from
     /// which it was buffered with.
-    pub(crate) fn get_query_data(&mut self) -> Vec<Arc<RecordBatch>> {
+    pub(crate) fn get_query_data(&mut self, projection: &OwnedProjection) -> Vec<RecordBatch> {
         // Take ownership of the FSM and return the data within it.
         self.0.mutate(|fsm| match fsm {
             // The buffering state can return data.
             FsmState::Buffering(b) => {
-                let ret = b.get_query_data();
+                let ret = b.get_query_data(projection);
                 (FsmState::Buffering(b), ret)
             }
         })
+    }
+
+    /// Return the row count for this buffer.
+    pub(crate) fn rows(&self) -> usize {
+        match self.0.get() {
+            FsmState::Buffering(v) => v.rows(),
+        }
+    }
+
+    /// Return the timestamp min/max values, if this buffer contains data.
+    pub(crate) fn timestamp_stats(&self) -> Option<TimestampMinMax> {
+        match self.0.get() {
+            FsmState::Buffering(v) => v.timestamp_stats(),
+        }
+    }
+
+    /// Returns the [`Schema`] for the buffered data.
+    pub(crate) fn schema(&self) -> Option<Schema> {
+        match self.0.get() {
+            FsmState::Buffering(v) => v.schema(),
+        }
     }
 
     // Deconstruct the [`DataBuffer`] into the underlying FSM in a

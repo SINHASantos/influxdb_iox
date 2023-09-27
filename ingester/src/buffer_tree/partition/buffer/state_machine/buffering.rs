@@ -1,15 +1,17 @@
 //! A write buffer.
 
-use std::sync::Arc;
-
 use arrow::record_batch::RecordBatch;
-use mutable_batch::MutableBatch;
-use schema::Projection;
+use data_types::{StatValues, TimestampMinMax};
+use mutable_batch::{column::ColumnData, MutableBatch};
+use schema::{Projection, TIME_COLUMN_NAME};
 
 use super::{snapshot::Snapshot, BufferState, Transition};
-use crate::buffer_tree::partition::buffer::{
-    mutable_buffer::Buffer,
-    traits::{Queryable, Writeable},
+use crate::{
+    buffer_tree::partition::buffer::{
+        mutable_buffer::Buffer,
+        traits::{Queryable, Writeable},
+    },
+    query::projection::OwnedProjection,
 };
 
 /// The FSM starting ingest state - a mutable buffer collecting writes.
@@ -29,19 +31,40 @@ pub(crate) struct Buffering {
 /// [`Buffering`], and instead snapshots should be incrementally generated and
 /// compacted. See <https://github.com/influxdata/influxdb_iox/issues/5805> for
 /// context.
+///
+/// # Panics
+///
+/// This method panics if converting the buffered data (if any) into an Arrow
+/// [`RecordBatch`] fails (a non-transient error).
 impl Queryable for Buffering {
-    fn get_query_data(&self) -> Vec<Arc<RecordBatch>> {
-        let data = self.buffer.buffer().map(|v| {
-            Arc::new(
-                v.to_arrow(Projection::All)
-                    .expect("failed to snapshot buffer data"),
-            )
-        });
+    fn get_query_data(&self, projection: &OwnedProjection) -> Vec<RecordBatch> {
+        self.buffer
+            .buffer()
+            .map(|v| vec![projection.project_mutable_batches(v)])
+            .unwrap_or_default()
+    }
 
-        match data {
-            Some(v) => vec![v],
-            None => vec![],
-        }
+    fn rows(&self) -> usize {
+        self.buffer.buffer().map(|v| v.rows()).unwrap_or_default()
+    }
+
+    fn timestamp_stats(&self) -> Option<TimestampMinMax> {
+        self.buffer
+            .buffer()
+            .map(extract_timestamp_summary)
+            // Safety: unwrapping the timestamp bounds is safe, as any non-empty
+            // buffer must contain timestamps.
+            .map(|v| TimestampMinMax {
+                min: v.min.unwrap(),
+                max: v.max.unwrap(),
+            })
+    }
+
+    fn schema(&self) -> Option<schema::Schema> {
+        self.buffer.buffer().map(|v| {
+            v.schema(Projection::All)
+                .expect("failed to construct batch schema")
+        })
     }
 }
 
@@ -69,7 +92,23 @@ impl BufferState<Buffering> {
             .expect("snapshot of non-empty buffer should succeed");
 
         // And transition to the WithSnapshot state.
-        Transition::ok(Snapshot::new(vec![snap]), self.sequence_range)
+        Transition::ok(Snapshot::new(vec![snap]), self.sequence_numbers)
+    }
+
+    pub(crate) fn persist_cost_estimate(&self) -> usize {
+        self.state.buffer.persist_cost_estimate()
+    }
+}
+
+/// Perform an O(1) extraction of the timestamp column statistics.
+fn extract_timestamp_summary(batch: &MutableBatch) -> &StatValues<i64> {
+    let col = batch
+        .column(TIME_COLUMN_NAME)
+        .expect("timestamps must exist for non-empty buffer");
+
+    match col.data() {
+        ColumnData::I64(_data, stats) => stats,
+        _ => unreachable!(),
     }
 }
 

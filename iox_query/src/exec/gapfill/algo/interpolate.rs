@@ -2,7 +2,10 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{as_primitive_array, Array, ArrayRef, PrimitiveArray, TimestampNanosecondArray},
+    array::{
+        as_primitive_array, as_struct_array, Array, ArrayRef, PrimitiveArray, StructArray,
+        TimestampNanosecondArray,
+    },
     datatypes::{ArrowPrimitiveType, DataType, Float64Type, Int64Type, UInt64Type},
 };
 
@@ -54,6 +57,44 @@ impl Cursor {
                     input_aggr_array,
                 )
             }
+            DataType::Struct(_) => {
+                // The only struct type that is expected is the one produced by the
+                // selector_* functions. These consist of a value, a timestamp and a
+                // number of associated values selected from the same row. When
+                // interpolating it is only the value field that will be interpolated.
+                // All other columns in the structure are filled with nulls.
+
+                let input_aggr_array = as_struct_array(input_aggr_array);
+                let (fields, arrays, _) = input_aggr_array.clone().into_parts();
+                let cursors = fields
+                    .iter()
+                    .map(|f| {
+                        if f.name() == "value" {
+                            // The "value" array uses the parent cursor.
+                            Ok(None)
+                        } else {
+                            Ok(Some(self.clone_for_aggr_col(None)?))
+                        }
+                    })
+                    .collect::<Result<Vec<Option<Self>>>>()?;
+                let new_arrays = cursors
+                    .into_iter()
+                    .zip(arrays.into_iter())
+                    .map(|(cursor, a)| {
+                        if let Some(mut c) = cursor {
+                            c.build_aggr_fill_null(params, series_ends, input_time_array, &a)
+                        } else {
+                            self.build_aggr_fill_interpolate(
+                                params,
+                                series_ends,
+                                input_time_array,
+                                &a,
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(StructArray::new(fields, new_arrays, None)))
+            }
             dt => Err(DataFusionError::Execution(format!(
                 "unsupported data type {dt} for interpolation gap filling"
             ))),
@@ -90,7 +131,6 @@ impl Cursor {
             .map(|seg| Segment::<T::Native>::try_from(seg.clone()))
             .transpose()?;
         let mut builder = InterpolateBuilder {
-            params,
             values: Vec::with_capacity(self.remaining_output_batch_size),
             segment,
             input_time_array,
@@ -173,7 +213,6 @@ impl_from_segment_scalar_value!(f64);
 /// Implements [`VecBuilder`] for build aggregate columns whose gaps
 /// are being filled using linear interpolation.
 pub(super) struct InterpolateBuilder<'a, T: ArrowPrimitiveType> {
-    pub params: &'a GapFillParams,
     pub values: Vec<Option<T::Native>>,
     pub segment: Option<Segment<T::Native>>,
     pub input_time_array: &'a TimestampNanosecondArray,
@@ -193,27 +232,25 @@ where
                 offset,
                 series_end_offset,
             } => {
-                // If
-                //   we are not at the last point
-                //   and the distance to the next point is greater than the stride
-                //   and both this point and the next are not null
-                // then create a segment that will be used to fill in the missing rows.
-                if offset + 1 < series_end_offset
-                    && self.input_time_array.value(offset + 1) > ts + self.params.stride
-                    && self.input_aggr_array.is_valid(offset)
-                    && self.input_aggr_array.is_valid(offset + 1)
-                {
-                    self.segment = Some(Segment {
+                if self.input_aggr_array.is_valid(offset) {
+                    let end_offset = self.find_end_offset(offset, series_end_offset);
+                    // Find the next non-null value in this column for the series.
+                    // If there is one, start a new segment at the current value.
+                    self.segment = end_offset.map(|end_offset| Segment {
                         start_point: (ts, self.input_aggr_array.value(offset)),
                         end_point: (
-                            self.input_time_array.value(offset + 1),
-                            self.input_aggr_array.value(offset + 1),
+                            self.input_time_array.value(end_offset),
+                            self.input_aggr_array.value(end_offset),
                         ),
-                    })
+                    });
+                    self.copy_point(offset);
                 } else {
-                    self.segment = None;
+                    self.values.push(
+                        self.segment
+                            .as_ref()
+                            .map(|seg| T::Native::interpolate(seg, ts)),
+                    );
                 }
-                self.copy_point(offset);
             }
             RowStatus::Missing { ts, .. } => self.values.push(
                 self.segment
@@ -242,6 +279,17 @@ where
             .is_valid(offset)
             .then_some(self.input_aggr_array.value(offset));
         self.values.push(v)
+    }
+
+    /// Scan forward to find the endpoint for a segment that starts at `start_offset`.
+    /// Skip over any null values.
+    ///
+    /// We are guaranteed to have buffered enough input to find the next non-null point for this series,
+    /// if there is one, by the logic in [`BufferedInput`].
+    ///
+    /// [`BufferedInput`]: super::super::buffered_input::BufferedInput
+    fn find_end_offset(&self, start_offset: usize, series_end_offset: usize) -> Option<usize> {
+        ((start_offset + 1)..series_end_offset).find(|&i| self.input_aggr_array.is_valid(i))
     }
 }
 
@@ -305,6 +353,7 @@ mod test {
 
     use arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampNanosecondArray, UInt64Array};
     use hashbrown::HashMap;
+    use schema::TIME_DATA_TIMEZONE;
 
     use crate::exec::gapfill::{
         algo::tests::{array_to_lines, assert_cursor_end_state, new_cursor_with_batch_size},
@@ -356,12 +405,14 @@ mod test {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &series_ends, &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &series_ends, &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_interpolate(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
@@ -375,8 +426,8 @@ mod test {
         - "| 1970-01-01T00:00:00.000001200Z | 133  |"
         - "| 1970-01-01T00:00:00.000001300Z | 166  |"
         - "| 1970-01-01T00:00:00.000001400Z | 200  |"
-        - "| 1970-01-01T00:00:00.000001500Z |      |"
-        - "| 1970-01-01T00:00:00.000001600Z |      |"
+        - "| 1970-01-01T00:00:00.000001500Z | 466  |"
+        - "| 1970-01-01T00:00:00.000001600Z | 733  |"
         - "| 1970-01-01T00:00:00.000001700Z | 1000 |"
         - "| 1970-01-01T00:00:00.000001800Z | 500  |"
         - "| 1970-01-01T00:00:00.000001900Z | 0    |"
@@ -428,12 +479,14 @@ mod test {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &series_ends, &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &series_ends, &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_interpolate(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
@@ -447,8 +500,8 @@ mod test {
         - "| 1970-01-01T00:00:00.000001200Z | 133  |"
         - "| 1970-01-01T00:00:00.000001300Z | 166  |"
         - "| 1970-01-01T00:00:00.000001400Z | 200  |"
-        - "| 1970-01-01T00:00:00.000001500Z |      |"
-        - "| 1970-01-01T00:00:00.000001600Z |      |"
+        - "| 1970-01-01T00:00:00.000001500Z | 466  |"
+        - "| 1970-01-01T00:00:00.000001600Z | 733  |"
         - "| 1970-01-01T00:00:00.000001700Z | 1000 |"
         - "| 1970-01-01T00:00:00.000001800Z | 500  |"
         - "| 1970-01-01T00:00:00.000001900Z | 0    |"
@@ -500,12 +553,14 @@ mod test {
         let output_batch_size = 10000;
         let mut cursor = new_cursor_with_batch_size(&params, output_batch_size);
 
-        let time_arr: TimestampNanosecondArray = cursor
-            .clone_for_aggr_col(None)
-            .unwrap()
-            .build_time_vec(&params, &series_ends, &input_times)
-            .unwrap()
-            .into();
+        let time_arr = TimestampNanosecondArray::from(
+            cursor
+                .clone_for_aggr_col(None)
+                .unwrap()
+                .build_time_vec(&params, &series_ends, &input_times)
+                .unwrap(),
+        )
+        .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
             .build_aggr_fill_interpolate(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
@@ -519,8 +574,8 @@ mod test {
         - "| 1970-01-01T00:00:00.000001200Z | 200.0  |"
         - "| 1970-01-01T00:00:00.000001300Z | 300.0  |"
         - "| 1970-01-01T00:00:00.000001400Z | 400.0  |"
-        - "| 1970-01-01T00:00:00.000001500Z |        |"
-        - "| 1970-01-01T00:00:00.000001600Z |        |"
+        - "| 1970-01-01T00:00:00.000001500Z | 600.0  |"
+        - "| 1970-01-01T00:00:00.000001600Z | 800.0  |"
         - "| 1970-01-01T00:00:00.000001700Z | 1000.0 |"
         - "| 1970-01-01T00:00:00.000001800Z | 500.0  |"
         - "| 1970-01-01T00:00:00.000001900Z | 0.0    |"

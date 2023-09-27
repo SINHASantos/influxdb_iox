@@ -1,36 +1,32 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
-use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
+use crate::{statistics::DFStatsAggregator, QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
 use super::adapter::SchemaAdapterStream;
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use data_types::{ColumnSummary, InfluxDbType, TableSummary};
+use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     error::DataFusionError,
     execution::context::TaskContext,
     physical_plan::{
         expressions::{Column, PhysicalSortExpr},
-        memory::MemoryStream,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-        DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+        ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+        SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };
 use observability_deps::tracing::trace;
 use schema::sort::SortKey;
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    fmt,
-    num::NonZeroU64,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 /// Implements the DataFusion physical plan interface for [`RecordBatch`]es with automatic projection and NULL-column creation.
+///
+///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
 #[derive(Debug)]
 pub(crate) struct RecordBatchesExec {
     /// Chunks contained in this exec node.
-    chunks: Vec<(Arc<dyn QueryChunk>, Vec<RecordBatch>)>,
+    chunks: Vec<Arc<dyn QueryChunk>>,
 
     /// Overall schema.
     schema: SchemaRef,
@@ -59,70 +55,41 @@ impl RecordBatchesExec {
         schema: SchemaRef,
         output_sort_key_memo: Option<SortKey>,
     ) -> Self {
-        let has_chunk_order_col = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).is_ok();
+        let chunk_order_field = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).ok();
+        let chunk_order_only_schema =
+            chunk_order_field.map(|field| Schema::new(vec![field.clone()]));
 
-        let chunks: Vec<_> = chunks
-            .into_iter()
-            .map(|chunk| {
-                let batches = chunk
-                    .data()
-                    .into_record_batches()
-                    .expect("chunk must have record batches");
-
-                (chunk, batches)
-            })
-            .collect();
+        let chunks: Vec<_> = chunks.into_iter().collect();
 
         let statistics = chunks
             .iter()
-            .fold(
-                None,
-                |mut combined_summary: Option<TableSummary>, (chunk, _batches)| {
-                    let summary = chunk.summary();
+            .fold(DFStatsAggregator::new(&schema), |mut agg, chunk| {
+                agg.update(&chunk.stats(), chunk.schema().as_arrow().as_ref());
 
-                    let summary = if has_chunk_order_col {
-                        // add chunk order column
-                        let order = chunk.order().get();
-                        let summary = TableSummary {
-                            columns: summary
-                                .columns
-                                .iter()
-                                .cloned()
-                                .chain(std::iter::once(ColumnSummary {
-                                    name: CHUNK_ORDER_COLUMN_NAME.to_owned(),
-                                    influxdb_type: InfluxDbType::Field,
-                                    stats: data_types::Statistics::I64(data_types::StatValues {
-                                        min: Some(order),
-                                        max: Some(order),
-                                        total_count: summary.total_count(),
-                                        null_count: Some(0),
-                                        distinct_count: Some(NonZeroU64::new(1).unwrap()),
-                                    }),
-                                }))
-                                .collect(),
-                        };
+                if let Some(schema) = chunk_order_only_schema.as_ref() {
+                    let order = chunk.order().get();
+                    let order = ScalarValue::from(order);
+                    agg.update(
+                        &Statistics {
+                            num_rows: Some(0),
+                            total_byte_size: Some(0),
+                            column_statistics: Some(vec![ColumnStatistics {
+                                null_count: Some(0),
+                                max_value: Some(order.clone()),
+                                min_value: Some(order),
+                                distinct_count: Some(1),
+                            }]),
+                            is_exact: true,
+                        },
+                        schema,
+                    );
+                }
 
-                        Cow::Owned(summary)
-                    } else {
-                        Cow::Borrowed(summary.as_ref())
-                    };
+                agg
+            })
+            .build();
 
-                    match combined_summary.as_mut() {
-                        None => {
-                            combined_summary = Some(summary.into_owned());
-                        }
-                        Some(combined_summary) => {
-                            combined_summary.update_from(&summary);
-                        }
-                    }
-
-                    combined_summary
-                },
-            )
-            .map(|combined_summary| crate::statistics::df_from_iox(&schema, &combined_summary))
-            .unwrap_or_default();
-
-        let output_ordering = if has_chunk_order_col {
+        let output_ordering = if chunk_order_field.is_some() {
             Some(vec![
                 // every chunk gets its own partition, so we can claim that the output is ordered
                 PhysicalSortExpr {
@@ -149,7 +116,7 @@ impl RecordBatchesExec {
 
     /// Chunks that make up this node.
     pub fn chunks(&self) -> impl Iterator<Item = &Arc<dyn QueryChunk>> {
-        self.chunks.iter().map(|(chunk, _batches)| chunk)
+        self.chunks.iter()
     }
 
     /// Sort key that was passed to [`chunks_to_physical_nodes`].
@@ -205,73 +172,27 @@ impl ExecutionPlan for RecordBatchesExec {
 
         let schema = self.schema();
 
-        let (chunk, batches) = &self.chunks[partition];
-        let part_schema = chunk.schema().as_arrow();
+        let chunk = &self.chunks[partition];
 
-        // The output selection is all the columns in the schema.
-        //
-        // However, this chunk may not have all those columns. Thus we
-        // restrict the requested selection to the actual columns
-        // available, and use SchemaAdapterStream to pad the rest of
-        // the columns with NULLs if necessary
-        let final_output_column_names: HashSet<_> =
-            schema.fields().iter().map(|f| f.name()).collect();
-        let projection: Vec<_> = part_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_idx, field)| final_output_column_names.contains(field.name()))
-            .map(|(idx, _)| idx)
-            .collect();
-        let projection = (!((projection.len() == part_schema.fields().len())
-            && (projection.iter().enumerate().all(|(a, b)| a == *b))))
-        .then_some(projection);
-        let incomplete_output_schema = projection
-            .as_ref()
-            .map(|projection| Arc::new(part_schema.project(projection).expect("projection broken")))
-            .unwrap_or(part_schema);
-
-        let stream = Box::pin(MemoryStream::try_new(
-            batches.clone(),
-            incomplete_output_schema,
-            projection,
-        )?);
+        let stream = match chunk.data() {
+            crate::QueryChunkData::RecordBatches(stream) => stream,
+            crate::QueryChunkData::Parquet(_) => {
+                return Err(DataFusionError::Execution(String::from(
+                    "chunk must contain record batches",
+                )));
+            }
+        };
         let virtual_columns = HashMap::from([(
             CHUNK_ORDER_COLUMN_NAME,
             ScalarValue::from(chunk.order().get()),
         )]);
         let adapter = Box::pin(
             SchemaAdapterStream::try_new(stream, schema, &virtual_columns, baseline_metrics)
-                .map_err(|e| DataFusionError::Internal(e.to_string()))?,
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
         );
 
         trace!(partition, "End RecordBatchesExec::execute");
         Ok(adapter)
-    }
-
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let total_groups = self.chunks.len();
-
-        let total_batches = self
-            .chunks
-            .iter()
-            .map(|(_chunk, batches)| batches.len())
-            .sum::<usize>();
-
-        let total_rows = self
-            .chunks
-            .iter()
-            .flat_map(|(_chunk, batches)| batches.iter().map(|batch| batch.num_rows()))
-            .sum::<usize>();
-
-        match t {
-            DisplayFormatType::Default => {
-                write!(
-                    f,
-                    "RecordBatchesExec: batches_groups={total_groups} batches={total_batches} total_rows={total_rows}",
-                )
-            }
-        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -280,5 +201,15 @@ impl ExecutionPlan for RecordBatchesExec {
 
     fn statistics(&self) -> Statistics {
         self.statistics.clone()
+    }
+}
+
+impl DisplayAs for RecordBatchesExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "RecordBatchesExec: chunks={}", self.chunks.len(),)
+            }
+        }
     }
 }

@@ -1,10 +1,24 @@
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+mod scheduler_config;
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use async_trait::async_trait;
+use backoff::BackoffConfig;
 use clap_blocks::compactor::CompactorConfig;
-use compactor::{
-    handler::{CompactorHandler, CompactorHandlerImpl},
-    server::{grpc::GrpcDelegate, CompactorServer},
-};
-use data_types::ShardIndex;
+use compactor::{compactor::Compactor, config::Config};
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
@@ -18,57 +32,55 @@ use ioxd_common::{
     setup_builder,
 };
 use metric::Registry;
+use observability_deps::tracing::{info, warn};
 use parquet_file::storage::ParquetStorage;
 use std::{
     fmt::{Debug, Display},
+    fs,
     sync::Arc,
+    time::Duration,
 };
-use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use trace::TraceCollector;
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("Catalog error: {0}")]
-    Catalog(#[from] iox_catalog::interface::Error),
+use crate::scheduler_config::convert_scheduler_config;
 
-    #[error("No topic named '{topic_name}' found in the catalog")]
-    TopicCatalogLookup { topic_name: String },
-
-    #[error("shard_index_range_start must be <= shard_index_range_end")]
-    ShardIndexRange,
-
-    #[error("split_percentage must be between 1 and 100, inclusive. Was: {split_percentage}")]
-    SplitPercentageRange { split_percentage: u16 },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub struct CompactorServerType<C: CompactorHandler> {
-    server: CompactorServer<C>,
+pub struct CompactorServerType {
+    compactor: Compactor,
+    metric_registry: Arc<Registry>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 }
 
-impl<C: CompactorHandler> std::fmt::Debug for CompactorServerType<C> {
+impl std::fmt::Debug for CompactorServerType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Compactor")
     }
 }
 
-impl<C: CompactorHandler> CompactorServerType<C> {
-    pub fn new(server: CompactorServer<C>, common_state: &CommonServerState) -> Self {
+impl CompactorServerType {
+    pub fn new(
+        compactor: Compactor,
+        metric_registry: Arc<metric::Registry>,
+        common_state: &CommonServerState,
+    ) -> Self {
         Self {
-            server,
+            compactor,
+            metric_registry,
             trace_collector: common_state.trace_collector(),
         }
     }
 }
 
 #[async_trait]
-impl<C: CompactorHandler + std::fmt::Debug + 'static> ServerType for CompactorServerType<C> {
+impl ServerType for CompactorServerType {
+    /// Human name for this server type
+    fn name(&self) -> &str {
+        "compactor"
+    }
+
     /// Return the [`metric::Registry`] used by the compactor.
     fn metric_registry(&self) -> Arc<Registry> {
-        self.server.metric_registry()
+        Arc::clone(&self.metric_registry)
     }
 
     /// Returns the trace collector for compactor traces.
@@ -88,21 +100,21 @@ impl<C: CompactorHandler + std::fmt::Debug + 'static> ServerType for CompactorSe
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
 
-        add_service!(builder, self.server.grpc().compaction_service());
-        add_service!(builder, self.server.grpc().catalog_service());
-
         serve_builder!(builder);
 
         Ok(())
     }
 
     async fn join(self: Arc<Self>) {
-        self.server.join().await;
+        self.compactor
+            .join()
+            .await
+            .expect("clean compactor shutdown");
     }
 
     fn shutdown(&self, frontend: CancellationToken) {
         frontend.cancel();
-        self.server.shutdown();
+        self.compactor.shutdown();
     }
 }
 
@@ -115,7 +127,7 @@ pub enum IoxHttpError {
 impl IoxHttpError {
     fn status_code(&self) -> HttpApiErrorCode {
         match self {
-            IoxHttpError::NotFound => HttpApiErrorCode::NotFound,
+            Self::NotFound => HttpApiErrorCode::NotFound,
         }
     }
 }
@@ -134,149 +146,104 @@ impl HttpApiErrorSource for IoxHttpError {
     }
 }
 
+/// derive the compactor's DF memory pool size, favoring a percentage of the pod limit if available,
+/// and falling back to a default size if not.
+pub fn derive_mem_pool_size(
+    default_size: usize, // comes from INFLUXDB_IOX_EXEC_MEM_POOL_BYTES, if we can't compute it based on percentage
+    percent: u64,        // from INFLUXDB_IOX_EXEC_MEM_POOL_PERCENT
+) -> usize {
+    let mut mem_pool_size = default_size;
+    let pod_limit_str = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    if let Ok(pod_limit_str) = pod_limit_str {
+        let pod_limit_bytes = pod_limit_str.trim().parse::<i64>();
+        if let Ok(pod_limit_bytes) = pod_limit_bytes {
+            if (1024 * 1024 * 1024..=512 * 1024 * 1024 * 1024).contains(&pod_limit_bytes) {
+                let pod_df_limit = (pod_limit_bytes as f64 * percent as f64 / 100.0) as usize;
+
+                if (20..=90).contains(&percent) {
+                    mem_pool_size = pod_df_limit;
+                    info!(%mem_pool_size,
+                        pod_limit_bytes,
+                        percent,
+                        "computed memory pool size from the pod limit and specified percent");
+                } else {
+                    warn!("exec_mem_pool_percent set to unacceptable value ({}), using default memory pool size {}", percent, mem_pool_size);
+                }
+            } else {
+                warn!("pod_limit_bytes set to unacceptable value ({}), using default memory pool size {}", pod_limit_bytes, mem_pool_size);
+            }
+        } else {
+            warn!(
+                "could not parse pod memory limit, using default memory pool size {}",
+                mem_pool_size
+            );
+        }
+    } else {
+        warn!(
+            "could not read cgroup memory limit, using default memory pool size {}",
+            mem_pool_size
+        );
+    }
+
+    mem_pool_size
+}
+
 /// Instantiate a compactor server
-// NOTE!!! This needs to be kept in sync with `create_compactor2_server_type` until the switch to
-// the RPC write path mode is complete! See the annotations about where these two functions line up
-// and where they diverge.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_compactor_server_type(
     common_state: &CommonServerState,
     metric_registry: Arc<metric::Registry>,
     catalog: Arc<dyn Catalog>,
-    parquet_store: ParquetStorage,
+    parquet_store_real: ParquetStorage,
+    parquet_store_scratchpad: ParquetStorage,
     exec: Arc<Executor>,
     time_provider: Arc<dyn TimeProvider>,
-    // Parameter difference: this function takes a `CompactorConfig` that has a write buffer topic
-    // and requires shard indexes. All the other parameters here are the same.
     compactor_config: CompactorConfig,
-) -> Result<Arc<dyn ServerType>> {
-    let grpc_catalog = Arc::clone(&catalog);
+) -> Arc<dyn ServerType> {
+    let backoff_config = BackoffConfig::default();
 
-    // Setup difference: build a compactor instead, which expects a `CompactorConfig`.
-    let compactor = build_compactor_from_config(
-        compactor_config,
+    let compactor = Compactor::start(Config {
+        metric_registry: Arc::clone(&metric_registry),
+        trace_collector: common_state.trace_collector(),
         catalog,
-        parquet_store,
+        scheduler_config: convert_scheduler_config(
+            compactor_config.compactor_scheduler_config.clone(),
+        ),
+        parquet_store_real,
+        parquet_store_scratchpad,
         exec,
         time_provider,
-        Arc::clone(&metric_registry),
-    )
-    .await?;
+        backoff_config,
+        partition_concurrency: compactor_config.compaction_partition_concurrency,
+        df_concurrency: compactor_config.compaction_df_concurrency,
+        partition_scratchpad_concurrency: compactor_config
+            .compaction_partition_scratchpad_concurrency,
+        max_desired_file_size_bytes: compactor_config.max_desired_file_size_bytes,
+        percentage_max_file_size: compactor_config.percentage_max_file_size,
+        split_percentage: compactor_config.split_percentage,
+        partition_timeout: Duration::from_secs(compactor_config.partition_timeout_secs),
+        shadow_mode: compactor_config.shadow_mode,
+        enable_scratchpad: compactor_config.enable_scratchpad,
+        min_num_l1_files_to_compact: compactor_config.min_num_l1_files_to_compact,
+        process_once: compactor_config.process_once,
+        simulate_without_object_store: false,
+        parquet_files_sink_override: None,
+        all_errors_are_fatal: false,
+        max_num_columns_per_table: compactor_config.max_num_columns_per_table,
+        max_num_files_per_plan: compactor_config.max_num_files_per_plan,
+        max_partition_fetch_queries_per_second: compactor_config
+            .max_partition_fetch_queries_per_second,
+        gossip_seeds: compactor_config.gossip_config.seed_list,
+        gossip_bind_address: compactor_config
+            .gossip_config
+            .gossip_bind_address
+            .map(Into::into),
+    })
+    .await;
 
-    let compactor_handler = Arc::new(CompactorHandlerImpl::new(Arc::new(compactor)));
-
-    let grpc = GrpcDelegate::new(grpc_catalog, Arc::clone(&compactor_handler));
-
-    let compactor = CompactorServer::new(metric_registry, grpc, compactor_handler);
-    Ok(Arc::new(CompactorServerType::new(compactor, common_state)))
-}
-
-// NOTE!!! This needs to be kept in sync with `build_compactor2_from_config` until the switch to
-// the RPC write path mode is complete! See the annotations about where these two functions line up
-// and where they diverge.
-pub async fn build_compactor_from_config(
-    // Parameter difference: this function takes a `CompactorConfig` that has a write buffer topic
-    // and requires shard indexes. All the other parameters here are the same.
-    compactor_config: CompactorConfig,
-    catalog: Arc<dyn Catalog>,
-    parquet_store: ParquetStorage,
-    exec: Arc<Executor>,
-    time_provider: Arc<dyn TimeProvider>,
-    metric_registry: Arc<Registry>,
-) -> Result<compactor::compact::Compactor, Error> {
-    // 1. Shard index range checking
-    //    This function checks the shard index range; `compactor2` doesn't have shard indexes so
-    //    `build_compactor2_from_config` doesn't have this check.
-    if compactor_config.shard_index_range_start > compactor_config.shard_index_range_end {
-        return Err(Error::ShardIndexRange);
-    }
-
-    // 2. Split percentage value range checking
-    if compactor_config.split_percentage < 1 || compactor_config.split_percentage > 100 {
-        return Err(Error::SplitPercentageRange {
-            split_percentage: compactor_config.split_percentage,
-        });
-    }
-
-    // 3. Ensure topic and shard indexes are in the catalog
-    //    This isn't relevant to `compactor2`.
-    let mut txn = catalog.start_transaction().await?;
-    let topic = txn
-        .topics()
-        .get_by_name(&compactor_config.topic)
-        .await?
-        .ok_or(Error::TopicCatalogLookup {
-            topic_name: compactor_config.topic,
-        })?;
-
-    let shard_indexes: Vec<_> = (compactor_config.shard_index_range_start
-        ..=compactor_config.shard_index_range_end)
-        .map(ShardIndex::new)
-        .collect();
-
-    let mut shards = Vec::with_capacity(shard_indexes.len());
-    for k in shard_indexes {
-        let s = txn.shards().create_or_get(&topic, k).await?;
-        shards.push(s.id);
-    }
-    txn.commit().await?;
-    // 3. END
-
-    // 4. Convert config type to handler config type
-    let CompactorConfig {
-        max_desired_file_size_bytes,
-        percentage_max_file_size,
-        split_percentage,
-        max_number_partitions_per_shard,
-        min_number_recent_ingested_files_per_partition,
-        hot_multiple,
-        warm_multiple,
-        memory_budget_bytes,
-        min_num_rows_allocated_per_record_batch_to_datafusion_plan,
-        max_num_compacting_files,
-        max_num_compacting_files_first_in_partition,
-        minutes_without_new_writes_to_be_cold,
-        cold_partition_candidates_hours_threshold,
-        hot_compaction_hours_threshold_1,
-        hot_compaction_hours_threshold_2,
-        max_parallel_partitions,
-        warm_partition_candidates_hours_threshold,
-        warm_compaction_small_size_threshold_bytes,
-        warm_compaction_min_small_file_count,
-        ..
-    } = compactor_config;
-
-    let compactor_config = compactor::handler::CompactorConfig {
-        max_desired_file_size_bytes,
-        percentage_max_file_size,
-        split_percentage,
-        max_number_partitions_per_shard,
-        min_number_recent_ingested_files_per_partition,
-        hot_multiple,
-        warm_multiple,
-        memory_budget_bytes,
-        min_num_rows_allocated_per_record_batch_to_datafusion_plan,
-        max_num_compacting_files,
-        max_num_compacting_files_first_in_partition,
-        minutes_without_new_writes_to_be_cold,
-        cold_partition_candidates_hours_threshold,
-        hot_compaction_hours_threshold_1,
-        hot_compaction_hours_threshold_2,
-        max_parallel_partitions,
-        warm_partition_candidates_hours_threshold,
-        warm_compaction_small_size_threshold_bytes,
-        warm_compaction_min_small_file_count,
-    };
-    // 4. END
-
-    // 5. Create a new compactor: Assigned only those shards specified in the CLI args.
-    Ok(compactor::compact::Compactor::new(
-        compactor::compact::ShardAssignment::Only(shards),
-        catalog,
-        parquet_store,
-        exec,
-        time_provider,
-        backoff::BackoffConfig::default(),
-        compactor_config,
+    Arc::new(CompactorServerType::new(
+        compactor,
         metric_registry,
+        common_state,
     ))
 }

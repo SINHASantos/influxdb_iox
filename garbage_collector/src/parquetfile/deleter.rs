@@ -19,20 +19,16 @@ pub(crate) async fn perform(
             .repositories()
             .await
             .parquet_files()
-            .delete_old_ids_only(older_than)
+            .delete_old_ids_only(older_than) // read/write
             .await
             .context(DeletingSnafu)?;
         info!(delete_count = %deleted.len(), "iox_catalog::delete_old()");
 
-        if deleted.is_empty() {
-            select! {
-                _ = shutdown.cancelled() => {
-                    break
-                },
-                _ = sleep(Duration::from_secs(60 * sleep_interval_minutes)) => (),
-            }
-        } else if shutdown.is_cancelled() {
-            break;
+        select! {
+            _ = shutdown.cancelled() => {
+                break
+            },
+            _ = sleep(Duration::from_secs(60 * sleep_interval_minutes)) => (),
         }
     }
     Ok(())

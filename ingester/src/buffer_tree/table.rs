@@ -1,200 +1,96 @@
 //! Table level data buffer structures.
 
-pub(crate) mod name_resolver;
+pub(crate) mod metadata;
+pub(crate) mod metadata_resolver;
 
-use std::sync::Arc;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use data_types::{NamespaceId, PartitionId, PartitionKey, SequenceNumber, ShardId, TableId};
+use async_trait::async_trait;
+use data_types::{
+    partition_template::{build_column_values, ColumnValue, TablePartitionTemplateOverride},
+    NamespaceId, PartitionKey, SequenceNumber, TableId,
+};
+use datafusion::{prelude::Expr, scalar::ScalarValue};
+use iox_query::{
+    chunk_statistics::{create_chunk_statistics, ColumnRange},
+    pruning::prune_summaries,
+    QueryChunk,
+};
 use mutable_batch::MutableBatch;
-use parking_lot::{Mutex, RwLock};
-use write_summary::ShardProgress;
+use parking_lot::Mutex;
+use predicate::Predicate;
+use trace::span::{Span, SpanRecorder};
 
-use super::partition::{resolver::PartitionProvider, BufferError, PartitionData};
+use self::metadata::TableMetadata;
+
+use super::{
+    namespace::NamespaceName,
+    partition::{counter::PartitionCounter, resolver::PartitionProvider, PartitionData},
+    post_write::PostWriteObserver,
+    BufferWriteError,
+};
 use crate::{
-    arcmap::ArcMap, data::DmlApplyAction, deferred_load::DeferredLoad, lifecycle::LifecycleHandle,
+    arcmap::ArcMap,
+    deferred_load::DeferredLoad,
+    query::{
+        partition_response::PartitionResponse, projection::OwnedProjection,
+        response::PartitionStream, QueryError, QueryExec,
+    },
+    query_adaptor::QueryAdaptor,
 };
 
-/// A double-referenced map where [`PartitionData`] can be looked up by
-/// [`PartitionKey`], or ID.
-#[derive(Debug, Default)]
-struct DoubleRef {
-    // TODO(4880): this can be removed when IDs are sent over the wire.
-    by_key: ArcMap<PartitionKey, Mutex<PartitionData>>,
-    by_id: ArcMap<PartitionId, Mutex<PartitionData>>,
-}
-
-impl DoubleRef {
-    /// Try to insert the provided [`PartitionData`].
-    ///
-    /// Note that the partition MAY have been inserted concurrently, and the
-    /// returned [`PartitionData`] MAY be a different instance for the same
-    /// underlying partition.
-    fn try_insert(&mut self, ns: PartitionData) -> Arc<Mutex<PartitionData>> {
-        let id = ns.partition_id();
-        let key = ns.partition_key().clone();
-
-        let ns = Arc::new(Mutex::new(ns));
-        self.by_key.get_or_insert_with(&key, || Arc::clone(&ns));
-        self.by_id.get_or_insert_with(&id, || ns)
-    }
-
-    fn by_key(&self, key: &PartitionKey) -> Option<Arc<Mutex<PartitionData>>> {
-        self.by_key.get(key)
-    }
-
-    fn by_id(&self, id: PartitionId) -> Option<Arc<Mutex<PartitionData>>> {
-        self.by_id.get(&id)
-    }
-}
-
-/// The string name / identifier of a Table.
-///
-/// A reference-counted, cheap clone-able string.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TableName(Arc<str>);
-
-impl<T> From<T> for TableName
-where
-    T: AsRef<str>,
-{
-    fn from(v: T) -> Self {
-        Self(Arc::from(v.as_ref()))
-    }
-}
-
-impl From<TableName> for Arc<str> {
-    fn from(v: TableName) -> Self {
-        v.0
-    }
-}
-
-impl std::fmt::Display for TableName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::ops::Deref for TableName {
-    type Target = Arc<str>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl PartialEq<str> for TableName {
-    fn eq(&self, other: &str) -> bool {
-        &*self.0 == other
-    }
-}
-
-/// Data of a Table in a given Namesapce that belongs to a given Shard
+/// Data of a Table in a given Namespace
 #[derive(Debug)]
-pub(crate) struct TableData {
+pub(crate) struct TableData<O> {
     table_id: TableId,
-    table_name: Arc<DeferredLoad<TableName>>,
+    catalog_table: Arc<DeferredLoad<TableMetadata>>,
 
-    /// The catalog ID of the shard & namespace this table is being populated
-    /// from.
-    shard_id: ShardId,
+    /// The catalog ID of the namespace this table is being populated from.
     namespace_id: NamespaceId,
+    namespace_name: Arc<DeferredLoad<NamespaceName>>,
 
     /// An abstract constructor of [`PartitionData`] instances for a given
-    /// `(key, shard, table)` triplet.
+    /// `(key, table)` tuple.
     partition_provider: Arc<dyn PartitionProvider>,
 
     // Map of partition key to its data
-    partition_data: RwLock<DoubleRef>,
+    partition_data: ArcMap<PartitionKey, Mutex<PartitionData>>,
+
+    /// A counter tracking the number of non-empty partitions currently
+    /// buffered for the parent namespace.
+    ///
+    /// This counter is eventually consistent / relaxed when read, but strongly
+    /// consistent when enforced.
+    partition_count: Arc<PartitionCounter>,
+
+    post_write_observer: Arc<O>,
 }
 
-impl TableData {
+impl<O> TableData<O> {
     /// Initialize new table buffer identified by [`TableId`] in the catalog.
-    ///
-    /// Optionally the given tombstone max [`SequenceNumber`] identifies the
-    /// inclusive upper bound of tombstones associated with this table. Any data
-    /// greater than this value is guaranteed to not (yet) have a delete
-    /// tombstone that must be resolved.
     ///
     /// The partition provider is used to instantiate a [`PartitionData`]
     /// instance when this [`TableData`] instance observes an op for a partition
     /// for the first time.
     pub(super) fn new(
         table_id: TableId,
-        table_name: DeferredLoad<TableName>,
-        shard_id: ShardId,
+        catalog_table: Arc<DeferredLoad<TableMetadata>>,
         namespace_id: NamespaceId,
+        namespace_name: Arc<DeferredLoad<NamespaceName>>,
         partition_provider: Arc<dyn PartitionProvider>,
+        partition_count: Arc<PartitionCounter>,
+        post_write_observer: Arc<O>,
     ) -> Self {
         Self {
             table_id,
-            table_name: Arc::new(table_name),
-            shard_id,
+            catalog_table,
             namespace_id,
+            namespace_name,
             partition_data: Default::default(),
             partition_provider,
+            partition_count,
+            post_write_observer,
         }
-    }
-
-    // buffers the table write and returns true if the lifecycle manager indicates that
-    // ingest should be paused.
-    pub(super) async fn buffer_table_write(
-        &self,
-        sequence_number: SequenceNumber,
-        batch: MutableBatch,
-        partition_key: PartitionKey,
-        lifecycle_handle: &dyn LifecycleHandle,
-    ) -> Result<DmlApplyAction, crate::data::Error> {
-        let p = self.partition_data.read().by_key(&partition_key);
-        let partition_data = match p {
-            Some(p) => p,
-            None => {
-                let p = self
-                    .partition_provider
-                    .get_partition(
-                        partition_key.clone(),
-                        self.shard_id,
-                        self.namespace_id,
-                        self.table_id,
-                        Arc::clone(&self.table_name),
-                    )
-                    .await;
-                // Add the double-referenced partition to the map.
-                //
-                // This MAY return a different instance than `p` if another
-                // thread has already initialised the partition.
-                self.partition_data.write().try_insert(p)
-            }
-        };
-
-        let size = batch.size();
-        let rows = batch.rows();
-        let partition_id = {
-            let mut p = partition_data.lock();
-            match p.buffer_write(batch, sequence_number) {
-                Ok(_) => p.partition_id(),
-                Err(BufferError::SkipPersisted) => return Ok(DmlApplyAction::Skipped),
-                Err(BufferError::BufferError(e)) => {
-                    return Err(crate::data::Error::BufferWrite { source: e })
-                }
-            }
-        };
-
-        // Record the write as having been buffered.
-        //
-        // This should happen AFTER the write is applied, because buffering the
-        // op may fail which would lead to a write being recorded, but not
-        // applied.
-        let should_pause = lifecycle_handle.log_write(
-            partition_id,
-            self.shard_id,
-            self.namespace_id,
-            self.table_id,
-            sequence_number,
-            size,
-            rows,
-        );
-
-        Ok(DmlApplyAction::Applied(should_pause))
     }
 
     /// Return a mutable reference to all partitions buffered for this table.
@@ -203,38 +99,15 @@ impl TableData {
     ///
     /// The order of [`PartitionData`] in the iterator is arbitrary and should
     /// not be relied upon.
+    ///
+    /// # Snapshot
+    ///
+    /// The set of [`PartitionData`] returned is an atomic / point-in-time
+    /// snapshot of the set of [`PartitionData`] at the time this function is
+    /// invoked, but the data within them may change as they continue to buffer
+    /// DML operations.
     pub(crate) fn partitions(&self) -> Vec<Arc<Mutex<PartitionData>>> {
-        self.partition_data.read().by_key.values()
-    }
-
-    /// Return the [`PartitionData`] for the specified ID.
-    #[allow(unused)]
-    pub(crate) fn get_partition(
-        &self,
-        partition_id: PartitionId,
-    ) -> Option<Arc<Mutex<PartitionData>>> {
-        self.partition_data.read().by_id(partition_id)
-    }
-
-    /// Return the [`PartitionData`] for the specified partition key.
-    #[cfg(test)]
-    pub(crate) fn get_partition_by_key(
-        &self,
-        partition_key: &PartitionKey,
-    ) -> Option<Arc<Mutex<PartitionData>>> {
-        self.partition_data.read().by_key(partition_key)
-    }
-
-    /// Return progress from this Table
-    pub(super) fn progress(&self) -> ShardProgress {
-        self.partition_data
-            .read()
-            .by_key
-            .values()
-            .into_iter()
-            .fold(Default::default(), |progress, p| {
-                progress.combine(p.lock().progress())
-            })
+        self.partition_data.values()
     }
 
     /// Returns the table ID for this partition.
@@ -242,14 +115,9 @@ impl TableData {
         self.table_id
     }
 
-    /// Returns the name of this table.
-    pub(crate) fn table_name(&self) -> &Arc<DeferredLoad<TableName>> {
-        &self.table_name
-    }
-
-    /// Return the shard ID for this table.
-    pub(crate) fn shard_id(&self) -> ShardId {
-        self.shard_id
+    /// Returns the catalog data for this table.
+    pub(crate) fn catalog_table(&self) -> &Arc<DeferredLoad<TableMetadata>> {
+        &self.catalog_table
     }
 
     /// Return the [`NamespaceId`] this table is a part of.
@@ -258,209 +126,371 @@ impl TableData {
     }
 }
 
+impl<O> TableData<O>
+where
+    O: PostWriteObserver,
+{
+    // buffers the table write and returns true if the lifecycle manager indicates that
+    // ingest should be paused.
+    pub(super) async fn buffer_table_write(
+        &self,
+        sequence_number: SequenceNumber,
+        batch: MutableBatch,
+        partition_key: PartitionKey,
+    ) -> Result<(), BufferWriteError> {
+        let p = self.partition_data.get(&partition_key);
+        let partition_data = match p {
+            Some(p) => p,
+            None => {
+                // This namespace has may have exceeded the upper bound on
+                // non-empty partitions.
+                //
+                // As an optimisation, check if the partition will be writeable
+                // before creating it, to avoid creating many
+                // impossible-to-write-to partitions.
+                self.partition_count.is_maxed()?;
+
+                let p = self
+                    .partition_provider
+                    .get_partition(
+                        partition_key.clone(),
+                        self.namespace_id,
+                        Arc::clone(&self.namespace_name),
+                        self.table_id,
+                        Arc::clone(&self.catalog_table),
+                        Arc::clone(&self.partition_count),
+                    )
+                    .await;
+
+                // Add the partition to the map.
+                //
+                // This MAY return a different instance than `p` if another
+                // thread has already initialised the partition.
+                self.partition_data.get_or_insert_with(&partition_key, || p)
+            }
+        };
+
+        // Obtain the partition lock.
+        let mut p = partition_data.lock();
+
+        // Enqueue the write, returning any error.
+        p.buffer_write(batch, sequence_number)?;
+
+        // If successful, allow the observer to inspect the partition.
+        self.post_write_observer
+            .observe(Arc::clone(&partition_data), p);
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<O> QueryExec for TableData<O>
+where
+    O: Send + Sync + Debug,
+{
+    type Response = PartitionStream;
+
+    async fn query_exec(
+        &self,
+        namespace_id: NamespaceId,
+        table_id: TableId,
+        projection: OwnedProjection,
+        span: Option<Span>,
+        predicate: Option<Predicate>,
+    ) -> Result<Self::Response, QueryError> {
+        assert_eq!(self.table_id, table_id, "buffer tree index inconsistency");
+        assert_eq!(
+            self.namespace_id, namespace_id,
+            "buffer tree index inconsistency"
+        );
+
+        let table_partition_template = self.catalog_table.get().await.partition_template().clone();
+        let filters = predicate
+            .map(|p| p.filter_expr().into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Gather the partition data from all of the partitions in this table.
+        let span = SpanRecorder::new(span);
+        let partitions = self.partitions().into_iter().filter_map(move |p| {
+            let mut span = span.child("partition read");
+
+            let (id, completed_persistence_count, data, partition_key) = {
+                let mut p = p.lock();
+                (
+                    p.partition_id().clone(),
+                    p.completed_persistence_count(),
+                    p.get_query_data(&projection),
+                    p.partition_key().clone(),
+                )
+            };
+
+            let ret = match data {
+                Some(data) => {
+                    assert_eq!(&id, data.partition_id());
+
+                    // Potentially prune out this partition if the partition
+                    // template & derived partition key can be used to match
+                    // against the filters.
+                    if !keep_after_pruning_partition_key(
+                        &table_partition_template,
+                        &partition_key,
+                        &filters,
+                        &data,
+                    ) {
+                        // This partition will never contain any data that would
+                        // form part of the query response.
+                        //
+                        // Because this is true of buffered data, it is also
+                        // true of the persisted data, and therefore sending the
+                        // persisted file count metadata is useless because the
+                        // querier would never utilise the persisted files as
+                        // part of this query.
+                        //
+                        // This avoids sending O(n) metadata frames for queries
+                        // that may only touch one or two actual frames. The N
+                        // partition count grows over the lifetime of the
+                        // ingester as more partitions are created, and while
+                        // fast to serialise individually, the sequentially-sent
+                        // N metadata frames add up.
+                        return None;
+                    }
+
+                    PartitionResponse::new(
+                        data.into_record_batches(),
+                        id,
+                        completed_persistence_count,
+                    )
+                }
+                None => PartitionResponse::new(vec![], id, completed_persistence_count),
+            };
+
+            span.ok("read partition data");
+            Some(ret)
+        });
+
+        Ok(PartitionStream::new(futures::stream::iter(partitions)))
+    }
+}
+
+/// Return true if `data` contains one or more rows matching `predicate`,
+/// pruning based on the `partition_key` and `template`.
+///
+/// Returns false iff it can be proven that all of data does not match the
+/// predicate.
+fn keep_after_pruning_partition_key(
+    table_partition_template: &TablePartitionTemplateOverride,
+    partition_key: &PartitionKey,
+    filters: &[Expr],
+    data: &QueryAdaptor,
+) -> bool {
+    // Construct a set of per-column min/max statistics based on the partition
+    // key values.
+    let column_ranges = Arc::new(
+        build_column_values(table_partition_template, partition_key.inner())
+            .filter_map(|(col, val)| {
+                let range = match val {
+                    ColumnValue::Identity(s) => {
+                        let s = Arc::new(ScalarValue::from(s.as_ref()));
+                        ColumnRange {
+                            min_value: Arc::clone(&s),
+                            max_value: s,
+                        }
+                    }
+                    ColumnValue::Prefix(p) if p.is_empty() => return None,
+                    ColumnValue::Prefix(p) => {
+                        // If the partition only has a prefix of the tag value
+                        // (it was truncated) then form a conservative range:
+                        //
+                        // # Minimum
+                        // Use the prefix itself.
+                        //
+                        // Note that the minimum is inclusive.
+                        //
+                        // All values in the partition are either:
+                        //
+                        // - identical to the prefix, in which case they are
+                        //   included by the inclusive minimum
+                        //
+                        // - have the form `"<prefix><s>"`, and it holds that
+                        //   `"<prefix><s>" > "<prefix>"` for all strings
+                        //   `"<s>"`.
+                        //
+                        // # Maximum
+                        // Use `"<prefix_excluding_last_char><char::max>"`.
+                        //
+                        // Note that the maximum is inclusive.
+                        //
+                        // All strings in this partition must be smaller than
+                        // this constructed maximum, because string comparison
+                        // is front-to-back and the
+                        // `"<prefix_excluding_last_char><char::max>" >
+                        // "<prefix>"`.
+
+                        let min_value = Arc::new(ScalarValue::from(p.as_ref()));
+
+                        let mut chars = p.as_ref().chars().collect::<Vec<_>>();
+                        *chars.last_mut().expect("checked that prefix is not empty") =
+                            std::char::MAX;
+                        let max_value = Arc::new(ScalarValue::from(
+                            chars.into_iter().collect::<String>().as_str(),
+                        ));
+
+                        ColumnRange {
+                            min_value,
+                            max_value,
+                        }
+                    }
+                    ColumnValue::Datetime { .. } => {
+                        // not yet supported
+                        return None;
+                    }
+                };
+
+                Some((Arc::from(col), range))
+            })
+            .collect::<HashMap<_, _>>(),
+    );
+
+    let chunk_statistics = Arc::new(create_chunk_statistics(
+        Some(data.num_rows()),
+        data.schema(),
+        data.ts_min_max(),
+        Some(&column_ranges),
+    ));
+
+    prune_summaries(
+        data.schema(),
+        &[(chunk_statistics, data.schema().as_arrow())],
+        filters,
+    )
+    // Errors are logged by `iox_query` and sometimes fine, e.g. for not
+    // implemented DataFusion features or upstream bugs. The querier uses the
+    // same strategy. Pruning is a mere optimization and should not lead to
+    // crashes or unreadable data.
+    .ok()
+    .map(|vals| {
+        vals.into_iter()
+            .next()
+            .expect("one chunk in, one chunk out")
+    })
+    .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{num::NonZeroUsize, sync::Arc};
 
     use assert_matches::assert_matches;
-    use data_types::PartitionId;
-    use mutable_batch::writer;
     use mutable_batch_lp::lines_to_batches;
-    use schema::{InfluxColumnType, InfluxFieldType};
 
     use super::*;
     use crate::{
-        buffer_tree::partition::{resolver::MockPartitionProvider, PartitionData, SortKeyState},
-        data::Error,
-        lifecycle::mock_handle::{MockLifecycleCall, MockLifecycleHandle},
+        buffer_tree::{
+            partition::resolver::mock::MockPartitionProvider,
+            post_write::mock::MockPostWriteObserver,
+        },
+        test_util::{
+            defer_namespace_name_1_sec, defer_table_metadata_1_sec, PartitionDataBuilder,
+            ARBITRARY_NAMESPACE_ID, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_ID,
+            ARBITRARY_TABLE_NAME,
+        },
     };
 
-    const SHARD_ID: ShardId = ShardId::new(22);
-    const TABLE_NAME: &str = "bananas";
-    const TABLE_ID: TableId = TableId::new(44);
-    const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
-    const PARTITION_KEY: &str = "platanos";
-    const PARTITION_ID: PartitionId = PartitionId::new(0);
-
     #[tokio::test]
-    async fn test_partition_double_ref() {
-        // Configure the mock partition provider to return a partition for this
-        // table ID.
-        let partition_provider = Arc::new(MockPartitionProvider::default().with_partition(
-            PartitionData::new(
-                PARTITION_ID,
-                PARTITION_KEY.into(),
-                SHARD_ID,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
-                SortKeyState::Provided(None),
-                None,
-            ),
-        ));
+    async fn test_partition_init() {
+        let partition_counter = Arc::new(PartitionCounter::new(NonZeroUsize::new(42).unwrap()));
+
+        // Configure the mock partition provider to return a partition for a table ID.
+        let partition_provider =
+            Arc::new(MockPartitionProvider::default().with_partition(PartitionDataBuilder::new()));
 
         let table = TableData::new(
-            TABLE_ID,
-            DeferredLoad::new(Duration::from_secs(1), async {
-                TableName::from(TABLE_NAME)
-            }),
-            SHARD_ID,
-            NAMESPACE_ID,
+            ARBITRARY_TABLE_ID,
+            defer_table_metadata_1_sec(),
+            ARBITRARY_NAMESPACE_ID,
+            defer_namespace_name_1_sec(),
             partition_provider,
+            Arc::clone(&partition_counter),
+            Arc::new(MockPostWriteObserver::default()),
         );
 
-        let batch = lines_to_batches(r#"bananas,bat=man value=24 42"#, 0)
-            .unwrap()
-            .remove(TABLE_NAME)
-            .unwrap();
+        let batch = lines_to_batches(
+            &format!(r#"{},bat=man value=24 42"#, &*ARBITRARY_TABLE_NAME),
+            0,
+        )
+        .unwrap()
+        .remove(&***ARBITRARY_TABLE_NAME)
+        .unwrap();
 
         // Assert the table does not contain the test partition
-        assert!(table
-            .partition_data
-            .read()
-            .by_key(&PARTITION_KEY.into())
-            .is_none());
-        assert!(table.partition_data.read().by_id(PARTITION_ID).is_none());
+        assert!(table.partition_data.get(&ARBITRARY_PARTITION_KEY).is_none());
 
         // Write some test data
-        let action = table
+        table
             .buffer_table_write(
                 SequenceNumber::new(42),
                 batch,
-                PARTITION_KEY.into(),
-                &MockLifecycleHandle::default(),
+                ARBITRARY_PARTITION_KEY.clone(),
             )
             .await
             .expect("buffer op should succeed");
-        assert_matches!(action, DmlApplyAction::Applied(false));
 
         // Referencing the partition should succeed
-        assert!(table
-            .partition_data
-            .read()
-            .by_key(&PARTITION_KEY.into())
-            .is_some());
-        assert!(table.partition_data.read().by_id(PARTITION_ID).is_some());
+        assert!(table.partition_data.get(&ARBITRARY_PARTITION_KEY).is_some());
+
+        // The partition should have been recorded in the "non-empty" partition
+        // count.
+        assert_eq!(partition_counter.read(), 1);
     }
 
+    /// Ensure the partition limit is respected.
     #[tokio::test]
-    async fn test_bad_write_memory_counting() {
-        // Configure the mock partition provider to return a partition for this
-        // table ID.
-        let partition_provider = Arc::new(MockPartitionProvider::default().with_partition(
-            PartitionData::new(
-                PARTITION_ID,
-                PARTITION_KEY.into(),
-                SHARD_ID,
-                NAMESPACE_ID,
-                TABLE_ID,
-                Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
-                    TableName::from(TABLE_NAME)
-                })),
-                SortKeyState::Provided(None),
-                None,
-            ),
-        ));
+    async fn test_partition_limit() {
+        // Configure the mock partition provider to return a partition for a table ID.
+        let partition_provider =
+            Arc::new(MockPartitionProvider::default().with_partition(PartitionDataBuilder::new()));
+
+        const N: usize = 42;
+
+        // Configure the counter that has already exceeded the maximum limit.
+        let partition_counter = Arc::new(PartitionCounter::new(NonZeroUsize::new(N).unwrap()));
+        partition_counter.set(N);
 
         let table = TableData::new(
-            TABLE_ID,
-            DeferredLoad::new(Duration::from_secs(1), async {
-                TableName::from(TABLE_NAME)
-            }),
-            SHARD_ID,
-            NAMESPACE_ID,
+            ARBITRARY_TABLE_ID,
+            defer_table_metadata_1_sec(),
+            ARBITRARY_NAMESPACE_ID,
+            defer_namespace_name_1_sec(),
             partition_provider,
+            Arc::clone(&partition_counter),
+            Arc::new(MockPostWriteObserver::default()),
         );
 
-        let batch = lines_to_batches(r#"bananas,bat=man value=24 42"#, 0)
-            .unwrap()
-            .remove(TABLE_NAME)
-            .unwrap();
-
-        // Initialise the mock lifecycle handle and use it to inspect the calls
-        // made to the lifecycle manager during buffering.
-        let handle = MockLifecycleHandle::default();
-
-        // Assert the table does not contain the test partition
-        assert!(table
-            .partition_data
-            .read()
-            .by_key(&PARTITION_KEY.into())
-            .is_none());
+        let batch = lines_to_batches(
+            &format!(r#"{},bat=man value=24 42"#, &*ARBITRARY_TABLE_NAME),
+            0,
+        )
+        .unwrap()
+        .remove(&***ARBITRARY_TABLE_NAME)
+        .unwrap();
 
         // Write some test data
-        let action = table
-            .buffer_table_write(
-                SequenceNumber::new(42),
-                batch,
-                PARTITION_KEY.into(),
-                &handle,
-            )
-            .await
-            .expect("buffer op should succeed");
-        assert_matches!(action, DmlApplyAction::Applied(false));
-
-        // Referencing the partition should succeed
-        assert!(table
-            .partition_data
-            .read()
-            .by_key(&PARTITION_KEY.into())
-            .is_some());
-
-        // And the lifecycle handle was called with the expected values
-        assert_eq!(
-            handle.get_log_calls(),
-            &[MockLifecycleCall {
-                partition_id: PARTITION_ID,
-                shard_id: SHARD_ID,
-                namespace_id: NAMESPACE_ID,
-                table_id: TABLE_ID,
-                sequence_number: SequenceNumber::new(42),
-                bytes_written: 1283,
-                rows_written: 1,
-            }]
-        );
-
-        // Attempt to buffer the second op that contains a type conflict - this
-        // should return an error, and not make a call to the lifecycle handle
-        // (as no data was buffered)
-        //
-        // Note the type of value was numeric previously, and here it is a string.
-        let batch = lines_to_batches(r#"bananas,bat=man value="platanos" 42"#, 0)
-            .unwrap()
-            .remove(TABLE_NAME)
-            .unwrap();
-
         let err = table
             .buffer_table_write(
                 SequenceNumber::new(42),
                 batch,
-                PARTITION_KEY.into(),
-                &handle,
+                ARBITRARY_PARTITION_KEY.clone(),
             )
             .await
-            .expect_err("type conflict should error");
+            .expect_err("buffer op should hit partition limit");
 
-        // The buffer op should return a column type error
-        assert_matches!(
-            err,
-            Error::BufferWrite {
-                source: mutable_batch::Error::WriterError {
-                    source: writer::Error::TypeMismatch {
-                        existing: InfluxColumnType::Field(InfluxFieldType::Float),
-                        inserted: InfluxColumnType::Field(InfluxFieldType::String),
-                        column: col_name,
-                    }
-                },
-            } => { assert_eq!(col_name, "value") }
-        );
+        assert_matches!(err, BufferWriteError::PartitionLimit { count: N });
 
-        // And the lifecycle handle should not be called.
-        //
-        // It still contains the first call, so the desired length is 1
-        // indicating no second call was made.
-        assert_eq!(handle.get_log_calls().len(), 1);
+        // The partition should not have been created
+        assert_eq!(table.partition_data.values().len(), 0);
+
+        // The partition counter should be unchanged
+        assert_eq!(partition_counter.read(), N);
     }
 }

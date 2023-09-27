@@ -1,7 +1,8 @@
 use crate::{addrs::BindAddresses, ServerType, UdpCapture};
 use http::{header::HeaderName, HeaderValue};
+use observability_deps::tracing::info;
 use rand::Rng;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 /// Options for creating test servers (`influxdb_iox` processes)
@@ -28,60 +29,75 @@ pub struct TestConfig {
     /// WAL directory, if needed.
     wal_dir: Option<Arc<TempDir>>,
 
+    /// Catalog directory, if needed
+    catalog_dir: Option<Arc<TempDir>>,
+
     /// Which ports this server should use
     addrs: Arc<BindAddresses>,
 }
 
 impl TestConfig {
     /// Create a new TestConfig. Tests should use one of the specific
-    /// configuration setup below, such as [new_router2](Self::new_router2).
+    /// configuration setup below, such as [new_router](Self::new_router).
     fn new(
         server_type: ServerType,
         dsn: Option<String>,
         catalog_schema_name: impl Into<String>,
     ) -> Self {
+        let catalog_schema_name = catalog_schema_name.into();
+
+        let (dsn, catalog_dir) = specialize_dsn_if_needed(dsn, &catalog_schema_name);
+
         Self {
             env: HashMap::new(),
             client_headers: vec![],
             server_type,
             dsn,
-            catalog_schema_name: catalog_schema_name.into(),
+            catalog_schema_name,
             object_store_dir: None,
             wal_dir: None,
+            catalog_dir,
             addrs: Arc::new(BindAddresses::default()),
         }
     }
 
-    /// Create a minimal router2 configuration sharing configuration with the ingester2 config
-    pub fn new_router2(ingester_config: &TestConfig) -> Self {
-        assert_eq!(ingester_config.server_type(), ServerType::Ingester2);
-
+    /// Creates a new TestConfig of `server_type` with the same catalog as `other`
+    fn new_with_existing_catalog(server_type: ServerType, other: &TestConfig) -> Self {
         Self::new(
-            ServerType::Router2,
-            ingester_config.dsn().to_owned(),
-            ingester_config.catalog_schema_name(),
+            server_type,
+            other.dsn.clone(),
+            other.catalog_schema_name.clone(),
         )
-        .with_existing_object_store(ingester_config)
-        .with_env("INFLUXDB_IOX_RPC_MODE", "2")
-        .with_ingester_addresses(&[ingester_config.ingester_base()])
+        // also copy a reference to the temp dir, if any, so it isn't
+        // deleted too soon
+        .with_catalog_dir(other.catalog_dir.as_ref().map(Arc::clone))
     }
 
-    /// Create a minimal ingester2 configuration, using the dsn configuration specified. Set the
+    /// Create a minimal router2 configuration sharing configuration with the ingester2 config
+    pub fn new_router(ingester_config: &TestConfig) -> Self {
+        assert_eq!(ingester_config.server_type(), ServerType::Ingester);
+
+        Self::new_with_existing_catalog(ServerType::Router, ingester_config)
+            .with_existing_object_store(ingester_config)
+            .with_ingester_addresses(&[ingester_config.ingester_base()])
+    }
+
+    /// Create a minimal ingester configuration, using the dsn configuration specified. Set the
     /// persistence options such that it will persist as quickly as possible.
-    pub fn new_ingester2(dsn: impl Into<String>) -> Self {
+    pub fn new_ingester(dsn: impl Into<String>) -> Self {
         let dsn = Some(dsn.into());
-        Self::new(ServerType::Ingester2, dsn, random_catalog_schema_name())
+        Self::new(ServerType::Ingester, dsn, random_catalog_schema_name())
             .with_new_object_store()
             .with_new_wal()
             .with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "1")
     }
 
-    /// Create a minimal ingester2 configuration, using the dsn configuration specified. Set the
+    /// Create a minimal ingester configuration, using the dsn configuration specified. Set the
     /// persistence options such that it will likely never persist, to be able to test when data
     /// only exists in the ingester's memory.
-    pub fn new_ingester2_never_persist(dsn: impl Into<String>) -> Self {
+    pub fn new_ingester_never_persist(dsn: impl Into<String>) -> Self {
         let dsn = Some(dsn.into());
-        Self::new(ServerType::Ingester2, dsn, random_catalog_schema_name())
+        Self::new(ServerType::Ingester, dsn, random_catalog_schema_name())
             .with_new_object_store()
             .with_new_wal()
             // I didn't run my tests for a day, because that would be too long
@@ -94,54 +110,71 @@ impl TestConfig {
         Self {
             env: ingester_config.env.clone(),
             client_headers: ingester_config.client_headers.clone(),
-            server_type: ServerType::Ingester2,
+            server_type: ServerType::Ingester,
             dsn: ingester_config.dsn.clone(),
             catalog_schema_name: ingester_config.catalog_schema_name.clone(),
             object_store_dir: None,
             wal_dir: None,
+            catalog_dir: ingester_config.catalog_dir.as_ref().map(Arc::clone),
             addrs: Arc::new(BindAddresses::default()),
         }
         .with_existing_object_store(ingester_config)
         .with_new_wal()
     }
 
-    /// Create a minimal querier2 configuration from the specified ingester2 configuration, using
+    /// Create a minimal querier configuration from the specified ingester configuration, using
     /// the same dsn and object store, and pointing at the specified ingester.
-    pub fn new_querier2(ingester_config: &TestConfig) -> Self {
-        assert_eq!(ingester_config.server_type(), ServerType::Ingester2);
+    pub fn new_querier(ingester_config: &TestConfig) -> Self {
+        assert_eq!(ingester_config.server_type(), ServerType::Ingester);
 
-        Self::new_querier2_without_ingester2(ingester_config)
+        Self::new_querier_without_ingester(ingester_config)
             .with_ingester_addresses(&[ingester_config.ingester_base()])
     }
 
     /// Create a minimal compactor configuration, using the dsn configuration from other
-    pub fn new_compactor2(other: &TestConfig) -> Self {
-        Self::new(
-            ServerType::Compactor2,
-            other.dsn().to_owned(),
-            other.catalog_schema_name(),
-        )
-        .with_env("INFLUXDB_IOX_RPC_MODE", "2")
-        .with_existing_object_store(other)
+    pub fn new_compactor(other: &TestConfig) -> Self {
+        Self::new_with_existing_catalog(ServerType::Compactor, other)
+            .with_existing_object_store(other)
     }
 
-    /// Create a minimal querier2 configuration from the specified ingester2 configuration, using
-    /// the same dsn and object store, but without specifying the ingester2 addresses
-    pub fn new_querier2_without_ingester2(ingester_config: &TestConfig) -> Self {
-        Self::new(
-            ServerType::Querier2,
-            ingester_config.dsn().to_owned(),
-            ingester_config.catalog_schema_name(),
-        )
-        .with_existing_object_store(ingester_config)
-        .with_env("INFLUXDB_IOX_RPC_MODE", "2")
-        // Hard code query threads so query plans do not vary based on environment
-        .with_env("INFLUXDB_IOX_NUM_QUERY_THREADS", "4")
+    /// Create a minimal querier configuration from the specified ingester configuration, using
+    /// the same dsn and object store, but without specifying the ingester addresses
+    pub fn new_querier_without_ingester(ingester_config: &TestConfig) -> Self {
+        Self::new_with_existing_catalog(ServerType::Querier, ingester_config)
+            .with_existing_object_store(ingester_config)
+            // Hard code query threads so query plans do not vary based on environment
+            .with_env("INFLUXDB_IOX_NUM_QUERY_THREADS", "4")
+            .with_env(
+                "INFLUXDB_IOX_DATAFUSION_CONFIG",
+                "iox.influxql_metadata_cutoff:1990-01-01T00:00:00Z",
+            )
     }
 
     /// Create a minimal all in one configuration
     pub fn new_all_in_one(dsn: Option<String>) -> Self {
         Self::new(ServerType::AllInOne, dsn, random_catalog_schema_name()).with_new_object_store()
+    }
+
+    /// Create a minimal all in one configuration with the specified
+    /// data directory (`--data_dir = <data_dir>`)
+    ///
+    /// the data_dir has a file based object store and sqlite catalog
+    pub fn new_all_in_one_with_data_dir(data_dir: &Path) -> Self {
+        let dsn = None; // use default sqlite catalog in data_dir
+
+        let data_dir_str = data_dir.as_os_str().to_str().unwrap();
+        Self::new(ServerType::AllInOne, dsn, random_catalog_schema_name())
+            .with_env("INFLUXDB_IOX_DB_DIR", data_dir_str)
+    }
+
+    /// Set the number of failed ingester queries before the querier considers
+    /// the ingester to be dead.
+    pub fn with_querier_circuit_breaker_threshold(self, count: usize) -> Self {
+        assert!(count > 0);
+        self.with_env(
+            "INFLUXDB_IOX_INGESTER_CIRCUIT_BREAKER_THRESHOLD",
+            count.to_string(),
+        )
     }
 
     /// Configure tracing capture
@@ -154,6 +187,7 @@ impl TestConfig {
                 "custom-trace-header",
             )
             .with_client_header("custom-trace-header", "4:3:2:1")
+            .with_env("INFLUXDB_IOX_COMPACTION_PARTITION_TRACE", "all")
     }
 
     /// Configure a custom debug name for tracing
@@ -180,6 +214,16 @@ impl TestConfig {
         )
     }
 
+    pub fn with_ingester_never_persist(self) -> Self {
+        self.with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "86400")
+    }
+
+    /// Configure the single tenancy mode, including the authorization server.
+    pub fn with_single_tenancy(self, addr: impl Into<String>) -> Self {
+        self.with_env("INFLUXDB_IOX_AUTHZ_ADDR", addr)
+            .with_env("INFLUXDB_IOX_SINGLE_TENANCY", "true")
+    }
+
     // Get the catalog DSN URL if set.
     pub fn dsn(&self) -> &Option<String> {
         &self.dsn
@@ -188,6 +232,22 @@ impl TestConfig {
     // Get the catalog postgres schema name
     pub fn catalog_schema_name(&self) -> &str {
         &self.catalog_schema_name
+    }
+
+    /// Retrieve the directory used to write WAL files to, if set
+    pub fn wal_dir(&self) -> &Option<Arc<TempDir>> {
+        &self.wal_dir
+    }
+
+    /// Retrieve the directory used for object store, if set
+    pub fn object_store_dir(&self) -> &Option<Arc<TempDir>> {
+        &self.object_store_dir
+    }
+
+    // copy a reference to the catalog temp dir, if any
+    fn with_catalog_dir(mut self, catalog_dir: Option<Arc<TempDir>>) -> Self {
+        self.catalog_dir = catalog_dir;
+        self
     }
 
     /// add a name=value environment variable when starting the server
@@ -302,4 +362,33 @@ fn random_catalog_schema_name() -> String {
         .take(20)
         .map(char::from)
         .collect::<String>()
+}
+
+/// Rewrites the special "sqlite" catalog DSN to a new
+/// temporary sqlite filename in a new temporary directory such as
+///
+/// sqlite:///tmp/XygUWHUwBhSdIUNXblXo.sqlite
+///
+///
+/// This is needed to isolate different test runs from each other
+/// (there is no "schema" within a sqlite database, it is the name of
+/// the file).
+///
+/// returns (dsn, catalog_dir)
+fn specialize_dsn_if_needed(
+    dsn: Option<String>,
+    catalog_schema_name: &str,
+) -> (Option<String>, Option<Arc<TempDir>>) {
+    if dsn.as_deref() == Some("sqlite") {
+        let tmpdir = TempDir::new().expect("cannot create tmp dir for catalog");
+        let catalog_dir = Arc::new(tmpdir);
+        let dsn = format!(
+            "sqlite://{}/{catalog_schema_name}.sqlite",
+            catalog_dir.path().display()
+        );
+        info!(%dsn, "rewrote 'sqlite' to temporary file");
+        (Some(dsn), Some(catalog_dir))
+    } else {
+        (dsn, None)
+    }
 }

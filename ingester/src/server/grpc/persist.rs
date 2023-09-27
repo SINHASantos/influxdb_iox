@@ -1,34 +1,67 @@
-use crate::handler::IngestHandler;
+use crate::{
+    partition_iter::PartitionIter,
+    persist::{drain_buffer::persist_partitions, queue::PersistQueue},
+};
 use generated_types::influxdata::iox::ingester::v1::{
     self as proto, persist_service_server::PersistService,
 };
+use iox_catalog::interface::{Catalog, SoftDeletedRows};
 use std::sync::Arc;
 use tonic::{Request, Response};
 
 #[derive(Debug)]
-pub(crate) struct PersistHandler<I: IngestHandler> {
-    ingest_handler: Arc<I>,
+pub(crate) struct PersistHandler<T, P> {
+    buffer: T,
+    persist_handle: P,
+    catalog: Arc<dyn Catalog>,
 }
 
-impl<I: IngestHandler> PersistHandler<I> {
-    pub fn new(ingest_handler: Arc<I>) -> Self {
-        Self { ingest_handler }
+impl<T, P> PersistHandler<T, P>
+where
+    T: PartitionIter + Sync + 'static,
+    P: PersistQueue + Clone + Sync + 'static,
+{
+    pub(crate) fn new(buffer: T, persist_handle: P, catalog: Arc<dyn Catalog>) -> Self {
+        Self {
+            buffer,
+            persist_handle,
+            catalog,
+        }
     }
 }
 
 #[tonic::async_trait]
-impl<I: IngestHandler + 'static> PersistService for PersistHandler<I> {
-    /// Handle the RPC request to persist immediately. This is useful in tests asserting on
-    /// persisted data. May behave in unexpected ways if used concurrently with writes or lifecycle
-    /// persists.
+impl<T, P> PersistService for PersistHandler<T, P>
+where
+    T: PartitionIter + Sync + 'static,
+    P: PersistQueue + Clone + Sync + 'static,
+{
+    /// Handle the RPC request to persist immediately. Will block until the data has persisted,
+    /// which is useful in tests asserting on persisted data. May behave in unexpected ways if used
+    /// concurrently with writes and ingester WAL rotations.
     async fn persist(
         &self,
-        _request: Request<proto::PersistRequest>,
+        request: Request<proto::PersistRequest>,
     ) -> Result<Response<proto::PersistResponse>, tonic::Status> {
-        // Even though the request specifies the namespace, persist everything. This means tests
-        // that use this API need to be using non-shared MiniClusters in order to avoid messing
-        // with each others' states.
-        self.ingest_handler.persist_all().await;
+        let request = request.into_inner();
+
+        let namespace = self
+            .catalog
+            .repositories()
+            .await
+            .namespaces()
+            .get_by_name(&request.namespace, SoftDeletedRows::AllRows)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?
+            .ok_or_else(|| tonic::Status::not_found(&request.namespace))?;
+
+        persist_partitions(
+            self.buffer
+                .partition_iter()
+                .filter(|p| p.lock().namespace_id() == namespace.id),
+            &self.persist_handle,
+        )
+        .await;
 
         Ok(Response::new(proto::PersistResponse {}))
     }

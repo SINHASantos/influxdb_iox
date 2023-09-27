@@ -1,4 +1,13 @@
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
+#![deny(
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro,
+    clippy::clone_on_ref_ptr,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::bare_urls,
+    rust_2018_idioms,
+    unused_crate_dependencies
+)]
 #![allow(clippy::clone_on_ref_ptr)]
 
 //! This module contains various DataFusion utility functions.
@@ -10,6 +19,10 @@
 //! [datafusion_optimizer::utils](https://docs.rs/datafusion-optimizer/13.0.0/datafusion_optimizer/utils/index.html)
 //! for expression manipulation functions.
 
+use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 pub mod config;
 pub mod sender;
 pub mod watch;
@@ -19,17 +32,14 @@ use std::task::{Context, Poll};
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::compute::filter_record_batch;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Fields};
 use datafusion::common::{DataFusionError, ToDFSchema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::TaskContext;
-use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::logical_expr::expr::Sort;
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
-use datafusion::physical_plan::common::SizedRecordBatchStream;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MemTrackingMetrics};
 use datafusion::physical_plan::{collect, EmptyRecordBatchStream, ExecutionPlan};
 use datafusion::prelude::{lit, Column, Expr, SessionContext};
 use datafusion::{
@@ -41,6 +51,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{Stream, StreamExt};
+use schema::TIME_DATA_TIMEZONE;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use watch::WatchedTask;
@@ -103,8 +114,8 @@ pub fn lit_dict(value: &str) -> Expr {
 pub fn make_range_expr(start: i64, end: i64, time: impl AsRef<str>) -> Expr {
     // We need to cast the start and end values to timestamps
     // the equivalent of:
-    let ts_start = ScalarValue::TimestampNanosecond(Some(start), None);
-    let ts_end = ScalarValue::TimestampNanosecond(Some(end), None);
+    let ts_start = ScalarValue::TimestampNanosecond(Some(start), TIME_DATA_TIMEZONE());
+    let ts_end = ScalarValue::TimestampNanosecond(Some(end), TIME_DATA_TIMEZONE());
 
     let time_col = time.as_ref().as_expr();
     let ts_low = lit(ts_start).lt_eq(time_col.clone());
@@ -245,24 +256,18 @@ where
 
 /// Create a SendableRecordBatchStream a RecordBatch
 pub fn stream_from_batch(schema: SchemaRef, batch: RecordBatch) -> SendableRecordBatchStream {
-    stream_from_batches(schema, vec![Arc::new(batch)])
+    stream_from_batches(schema, vec![batch])
 }
 
 /// Create a SendableRecordBatchStream from Vec of RecordBatches with the same schema
 pub fn stream_from_batches(
     schema: SchemaRef,
-    batches: Vec<Arc<RecordBatch>>,
+    batches: Vec<RecordBatch>,
 ) -> SendableRecordBatchStream {
     if batches.is_empty() {
         return Box::pin(EmptyRecordBatchStream::new(schema));
     }
-
-    // TODO should track this memory properly
-    let dummy_pool = Arc::new(UnboundedMemoryPool::default()) as _;
-    let dummy_metrics = ExecutionPlanMetricsSet::new();
-    let mem_metrics = MemTrackingMetrics::new(&dummy_metrics, &dummy_pool, 0);
-    let stream = SizedRecordBatchStream::new(batches[0].schema(), batches, mem_metrics);
-    Box::pin(stream)
+    Box::pin(MemoryStream::new_with_schema(batches, schema))
 }
 
 /// Create a SendableRecordBatchStream that sends back no RecordBatches with a specific schema
@@ -353,12 +358,12 @@ pub fn nullable_schema(schema: SchemaRef) -> SchemaRef {
         schema
     } else {
         // make a new schema with all nullable fields
-        let new_fields = schema
+        let new_fields: Fields = schema
             .fields()
             .iter()
             .map(|f| {
                 // make a copy of the field, but allow it to be nullable
-                f.clone().with_nullable(true)
+                f.as_ref().clone().with_nullable(true)
             })
             .collect();
 
@@ -389,6 +394,11 @@ pub fn create_pruning_predicate(
     PruningPredicate::try_new(expr, Arc::clone(schema))
 }
 
+/// Create a memory pool that has no limit
+pub fn unbounded_memory_pool() -> Arc<dyn MemoryPool> {
+    Arc::new(UnboundedMemoryPool::default())
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field};
@@ -401,9 +411,13 @@ mod tests {
         // Test that the generated predicate is correct
 
         let ts_predicate_expr = make_range_expr(101, 202, "time");
+        let expected_timezone = match TIME_DATA_TIMEZONE() {
+            Some(tz) => format!("Some(\"{tz}\")"),
+            None => "None".into(),
+        };
         let expected_string =
-            "TimestampNanosecond(101, None) <= time AND time < TimestampNanosecond(202, None)";
-        let actual_string = format!("{ts_predicate_expr:?}");
+            format!("TimestampNanosecond(101, {expected_timezone}) <= time AND time < TimestampNanosecond(202, {expected_timezone})");
+        let actual_string = format!("{ts_predicate_expr}");
 
         assert_eq!(actual_string, expected_string);
     }

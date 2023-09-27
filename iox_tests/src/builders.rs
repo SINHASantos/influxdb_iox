@@ -1,6 +1,7 @@
 use data_types::{
-    ColumnSet, CompactionLevel, NamespaceId, ParquetFile, ParquetFileId, Partition, PartitionId,
-    PartitionKey, SequenceNumber, ShardId, SkippedCompaction, Table, TableId, Timestamp,
+    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, NamespaceId, ParquetFile,
+    ParquetFileId, Partition, PartitionId, PartitionKey, SkippedCompaction, Table, TableId,
+    Timestamp, TransitionPartitionId,
 };
 use uuid::Uuid;
 
@@ -14,15 +15,17 @@ impl ParquetFileBuilder {
     /// Create a builder that will create a parquet file with
     /// `parquet_id` of `id`
     pub fn new(id: i64) -> Self {
+        let table_id = TableId::new(0);
         Self {
             file: ParquetFile {
                 id: ParquetFileId::new(id),
-                shard_id: ShardId::new(0),
                 namespace_id: NamespaceId::new(0),
-                table_id: TableId::new(0),
-                partition_id: PartitionId::new(0),
+                table_id,
+                partition_id: TransitionPartitionId::new(
+                    table_id,
+                    &PartitionKey::from("arbitrary"),
+                ),
                 object_store_id: Uuid::from_u128(id.try_into().expect("invalid id")),
-                max_sequence_number: SequenceNumber::new(0),
                 min_time: Timestamp::new(0),
                 max_time: Timestamp::new(0),
                 to_delete: None,
@@ -36,11 +39,11 @@ impl ParquetFileBuilder {
         }
     }
 
-    /// Set the partition id
-    pub fn with_partition(self, id: i64) -> Self {
+    /// Set the partition identifier
+    pub fn with_partition(self, partition_id: TransitionPartitionId) -> Self {
         Self {
             file: ParquetFile {
-                partition_id: PartitionId::new(id),
+                partition_id,
                 ..self.file
             },
         }
@@ -110,6 +113,51 @@ impl From<ParquetFile> for ParquetFileBuilder {
 }
 
 #[derive(Debug)]
+/// Build  [`Column`]s for testing
+pub struct ColumnBuilder {
+    column: Column,
+}
+
+impl ColumnBuilder {
+    /// Create a builder to create a column with `table_id` `id`
+    pub fn new(id: i64, table_id: i64) -> Self {
+        Self {
+            column: Column {
+                id: ColumnId::new(id),
+                table_id: TableId::new(table_id),
+                name: "column".to_string(),
+                column_type: ColumnType::Tag,
+            },
+        }
+    }
+
+    /// Set the column name
+    pub fn with_name(self, name: &str) -> Self {
+        Self {
+            column: Column {
+                name: name.to_string(),
+                ..self.column
+            },
+        }
+    }
+
+    /// Set column type
+    pub fn with_column_type(self, column_type: ColumnType) -> Self {
+        Self {
+            column: Column {
+                column_type,
+                ..self.column
+            },
+        }
+    }
+
+    /// Create the table
+    pub fn build(self) -> Column {
+        self.column
+    }
+}
+
+#[derive(Debug)]
 /// Build  [`Table`]s for testing
 pub struct TableBuilder {
     table: Table,
@@ -123,6 +171,7 @@ impl TableBuilder {
                 id: TableId::new(id),
                 namespace_id: NamespaceId::new(0),
                 name: "table".to_string(),
+                partition_template: Default::default(),
             },
         }
     }
@@ -144,7 +193,7 @@ impl TableBuilder {
 }
 
 #[derive(Debug)]
-/// Builds  [`Partition`]s for testing
+/// Builds [`Partition`]s for testing
 pub struct PartitionBuilder {
     partition: Partition,
 }
@@ -153,16 +202,22 @@ impl PartitionBuilder {
     /// Create a builder to create a partition with `partition_id` `id`
     pub fn new(id: i64) -> Self {
         Self {
-            partition: Partition {
-                id: PartitionId::new(id),
-                shard_id: ShardId::new(0),
-                table_id: TableId::new(0),
-                partition_key: PartitionKey::from("key"),
-                sort_key: vec![],
-                persisted_sequence_number: None,
-                new_file_at: None,
-            },
+            partition: Partition::new_in_memory_only(
+                PartitionId::new(id),
+                TableId::new(0),
+                PartitionKey::from("key"),
+                Some(vec![]),
+                Default::default(),
+                None,
+            ),
         }
+    }
+
+    /// Set the `new_file_at` attribute, without needing to actually create Parquet files for this
+    /// partition
+    pub fn with_new_file_at(mut self, time: Timestamp) -> Self {
+        self.partition.new_file_at = Some(time);
+        self
     }
 
     /// Create the partition

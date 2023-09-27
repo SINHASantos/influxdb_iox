@@ -1,6 +1,7 @@
+use arrow::record_batch::RecordBatch;
 use clap::ValueEnum;
 use futures::TryStreamExt;
-use influxdb_iox_client::format::influxql::write_columnar;
+use influxdb_iox_client::format::influxql::{write_columnar, Options};
 use influxdb_iox_client::{connection::Connection, flight, format::QueryOutputFormat};
 use thiserror::Error;
 
@@ -83,18 +84,28 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
         query_lang,
     } = config;
 
-    let query_results = match query_lang {
+    let mut query_results = match query_lang {
         QueryLanguage::Sql => client.sql(namespace, query).await,
         QueryLanguage::InfluxQL => client.influxql(namespace, query).await,
     }?;
 
     // It might be nice to do some sort of streaming write
     // rather than buffering the whole thing.
-    let batches: Vec<_> = query_results.try_collect().await?;
+    let mut batches: Vec<_> = (&mut query_results).try_collect().await?;
+
+    // read schema AFTER collection, otherwise the stream does not have the schema data yet
+    let schema = query_results
+        .inner()
+        .schema()
+        .cloned()
+        .ok_or(influxdb_iox_client::flight::Error::NoSchema)?;
+
+    // preserve schema so we print table headers even for empty results
+    batches.push(RecordBatch::new_empty(schema));
 
     match (query_lang, &format) {
         (QueryLanguage::InfluxQL, OutputFormat::Pretty) => {
-            write_columnar(std::io::stdout(), &batches)?
+            write_columnar(std::io::stdout(), &batches, Options::default())?
         }
         _ => {
             let format: QueryOutputFormat = format.into();
